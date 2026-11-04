@@ -1148,8 +1148,12 @@ void TunnelServer::HandlePublic(TcpConn::Ptr conn) {
                      "tunnel '" + route.subdomain + "' is offline\n");
         return;
     }
-    if (entry->session && entry->session->streams_active() >=
-                               m_config.max_streams_per_tunnel) {
+    // mux 流与 raw 流共用同一上限：raw 不建 MuxStream，streams_active() 不增长，
+    // 必须把 entry->raw_active 一起算进来，否则 raw 流可无限并发。
+    if (entry->session &&
+        entry->session->streams_active() +
+                entry->raw_active.load(std::memory_order_relaxed) >=
+            m_config.max_streams_per_tunnel) {
         SendResponse(conn, 503, "Service Unavailable",
                      "text/plain; charset=utf-8",
                      "tunnel '" + route.subdomain + "' is at stream limit\n");
@@ -1163,6 +1167,15 @@ void TunnelServer::HandlePublic(TcpConn::Ptr conn) {
         return;
     }
     if (RawStreamEnabledFromEnv()) {
+        // 上面的检查只是快速失败；并发抢占必须靠原子预留，否则多个请求可以
+        // 同时通过检查、一起超过上限。
+        if (!TryAcquireRawSlot(entry)) {
+            SendResponse(conn, 503, "Service Unavailable",
+                         "text/plain; charset=utf-8",
+                         "tunnel '" + route.subdomain +
+                             "' is at raw stream limit\n");
+            return;
+        }
         std::string raw_prefix = RewriteRequestHead(
             head, route.path, peer_ip_only, route.prefix,
             m_config.strip_prefix && !route.host_mode);
@@ -1219,9 +1232,64 @@ void TunnelServer::HandlePublic(TcpConn::Ptr conn) {
     conn->Shutdown();
 }
 
+/**
+ * @brief 为 raw 流原子预留一格并发额度（mux 流 + raw 流共用上限）。
+ *
+ * @param entry [in] 目标隧道记录；可为空（为空返回 false）。借用，不转移所有权。
+ * @return
+ * - true：`entry->raw_active` 已加 1，调用方**必须**在流结束时减回；
+ * - false：已到 `max_streams_per_tunnel`，调用方应返回 503，不要建流。
+ *
+ * ## 定位
+ * raw 路径的唯一并发闸门：raw 不建 MuxStream，`streams_active()` 不增长，
+ * 缺了它单隧道可以无限并发裸 TCP 流，把 fd / 线程打满。
+ *
+ * ## 步骤
+ * step1. 读取当前 raw 计数作为 CAS 的期望值；
+ * step2. 若已到上限（或 mux 流数已占满剩余额度）直接失败；
+ * step3. CAS 抢占一格，失败说明其它线程先占，回到 step1 重试。
+ *
+ * ## 并发/失败语义
+ * - 任意线程可调；CAS 保证 raw 计数精确不超限，不需要外部锁。
+ * - 不抛异常；失败时计数保持原值。
+ * - 不变量：返回 true 后 `raw_active` 至少为旧值 + 1，直到调用方归还。
+ */
+bool TunnelServer::TryAcquireRawSlot(const std::shared_ptr<Entry>& entry) {
+    if (!entry) {
+        return false;
+    }
+    const std::size_t limit = m_config.max_streams_per_tunnel;
+    std::size_t active = entry->raw_active.load(std::memory_order_relaxed);
+    for (;;) {
+        // step2: active < limit 才可能还有剩余；mux 流数占满剩余额度同样失败。
+        if (active >= limit) {
+            return false;
+        }
+        const std::size_t mux_active =
+            entry->session ? entry->session->streams_active() : 0;
+        if (mux_active >= limit - active) {
+            return false;
+        }
+        // step3: 抢占一格；失败时 active 被刷新成最新值，直接重试。
+        if (entry->raw_active.compare_exchange_weak(active, active + 1,
+                                                    std::memory_order_acq_rel,
+                                                    std::memory_order_relaxed)) {
+            return true;
+        }
+    }
+}
+
 void TunnelServer::ServeRawStream(const TcpConn::Ptr& conn,
                                  const std::shared_ptr<Entry>& entry,
                                  std::string prefix) {
+    // 额度由 HandlePublic 通过 TryAcquireRawSlot 预留；RAII 保证所有返回路径
+    // （含早期错误）都归还，否则一次失败就把上限永久占掉一格。
+    struct RawSlotLease {
+        std::atomic<std::size_t>* active = nullptr;
+        ~RawSlotLease() {
+            if (active != nullptr) active->fetch_sub(1, std::memory_order_acq_rel);
+        }
+    } lease{entry ? &entry->raw_active : nullptr};
     MuxSession::Ptr control = entry ? entry->session : nullptr;
     if (!control || !control->alive()) {
         SendResponse(conn, 502, "Bad Gateway", "text/plain; charset=utf-8",

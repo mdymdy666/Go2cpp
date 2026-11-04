@@ -35,6 +35,23 @@
  * - `default_scheduler()` 返回**裸引用**，`shutdown_default_scheduler()` 之后
  *   立即失效（对象可能已销毁）。需要跨关闭持有请用
  *   `default_scheduler_handle()` 的 `shared_ptr`。
+ *
+ * ## 调用方契约（必须判空）
+ *
+ * `go()` / `Go()` / `go(scheduler, fn)` 在调度器已关闭、或与
+ * `shutdown()` 并发时返回**空句柄**（`nullptr`）。把空句柄交给
+ * `wait()`/`cancel()` 是空指针解引用；若任务负责完成 Promise，则表现为
+ * 永不完成（调用方永久挂起）。全仓曾有多处 `auto task = go(...)` 直接使用，
+ * 无一处判空——这是本文件明确要求的下游义务，`go()` 自身无法替调用方决定
+ * 降级策略。
+ *
+ * 所有调用点必须二选一：
+ * - 判空并降级：`if (!task) { ...就地执行 / 关闭连接 / 上报... }`；
+ * - 或在「调度器生命周期明确覆盖本次调用」的短生命周期场景下
+ *   `assert(task != nullptr)` 后再使用（Release 下 assert 失效，仅作意图说明）。
+ *
+ * 关键路径（MCP 的 tool-call / server / transport）已就地判空降级；本文件
+ * 不把失败升级成异常，以保持「空 = 未提交」这一唯一返回契约。
  */
 
 #include "go2cpp/log.hpp"
@@ -278,12 +295,44 @@ inline std::shared_ptr<Task> go(Scheduler& scheduler, Task::Function function) {
 // 新手入口：先隐式取得默认调度器，再提交一个 Fiber 任务。
 /**
  * @brief 使用默认调度器提交一个 Fiber 任务。
- * @param function 任务入口函数。
- * @return 任务句柄；提交失败返回空指针。
+ * @param function [in] 任务入口函数，无参数、无返回值；所有权移交给新 Task。
+ * @return
+ * - 非空句柄：任务已入队，可 `wait()`/`cancel()`/查询状态；
+ * - 空句柄：**任务未提交**——默认调度器在提交窗口内被 `shutdown()` 时出现；
+ *   调用方必须按失败处理，**不要**对空句柄等待。
+ *
+ * ## 定位
+ * 新手入口，也是 `Go()` 的唯一实现；契约与显式 `go(Scheduler&, fn)` 对齐：
+ * 两者都返回「已提交」或空，绝不返回一个已取消、永不运行的句柄。
+ * 写错会怎样：调用方把空句柄当作已提交并 `wait()`，任务被静默丢弃。
+ *
+ * ## 步骤
+ * step1. 取得默认调度器；已 `shutdown()` 时 `ensure_default_scheduler()`
+ *        会重建新实例，因此正常关闭后再次调用仍能提交；
+ * step2. 若取到的实例在提交前已进入终态（与另一线程的
+ *        `shutdown_default_scheduler()` 竞态），直接返回空——`spawn()` 此时
+ *        只会产出一个已取消、永不运行的 Task；
+ * step3. 委托显式重载完成 `start()` 检查、`spawn()` 与「已取消句柄归一成空」。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：任意线程可调；与 `shutdown_default_scheduler()` 并发时可能拿空；
+ * - 失败语义：不抛异常（入队失败就地取消），返回空即代表未提交；
+ * - 不变量：返回非空时任务要么在运行队列中，要么已完成。
  */
 inline std::shared_ptr<Task> go(Task::Function function) {
+    // step1: 取默认调度器；shutdown 后 ensure 会重建，旧实例不会被复用。
     auto scheduler = detail::ensure_default_scheduler();
-    return scheduler->spawn(std::move(function));
+    // step2: 关闭与重建之间存在窄窗口，终态实例不能 spawn：spawn 会返回一个
+    // 已取消、永不运行的 Task，与显式重载的「空 = 未提交」契约不一致。
+    if (!scheduler || !scheduler->is_running()) {
+        auto logger = GO2CPP_LOG_NAME("Go");
+        GO2CPP_LOG_WARN(logger)
+            << "go(fn): 默认 Scheduler 已 shutdown（终态，无法重启），任务未提交"
+               "并返回空句柄；如需继续提交请再次调用 go(fn)（会重建默认调度器）";
+        return {};
+    }
+    // step3: 复用显式重载的 start 检查与取消归一化，保持两条入口契约一致。
+    return go(*scheduler, std::move(function));
 }
 
 // 让 lambda、函数指针等可调用对象无需手动构造 std::function。

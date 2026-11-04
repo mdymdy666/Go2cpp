@@ -201,6 +201,9 @@ private:
         std::mutex mutex;                              ///< 保护下面两个容器。
         std::vector<MuxSession::Ptr> data_sessions;    ///< 数据连接池。
         std::map<std::uint32_t, std::shared_ptr<RawWaiter>> raw_waiters;
+        /// raw 流并发数：raw 不建 MuxStream，`session->streams_active()` 不增长，
+        /// 必须在此单独计数才能与 mux 流共用 `max_streams_per_tunnel` 上限。
+        std::atomic<std::size_t> raw_active{0};
         std::atomic<std::size_t> round_robin{0};       ///< 轮询下标。
         std::atomic<bool> draining{false};             ///< 正在 drain。
     };
@@ -232,6 +235,29 @@ private:
 
     /// 选一条会话开流：优先数据连接池，否则回落到控制连接。
     MuxSession::Ptr PickSession(const std::shared_ptr<Entry>& entry);
+    /**
+     * @brief 为一条 raw 流预留并发额度——raw 流不建 MuxStream，必须单独计数。
+     *
+     * @param entry [in] 目标隧道记录；可为空（为空时直接失败）。所有权不转移，
+     *              调用期间由 shared_ptr 保证存活。
+     * @return
+     * - true：额度已预留，调用方**必须**在流结束时对 `entry->raw_active`
+     *   执行 `fetch_sub(1)`（`ServeRawStream` 用 RAII 租约完成）；
+     * - false：已达 `max_streams_per_tunnel`（mux 流 + raw 流合计），调用方
+     *   应返回 503，**不要**继续建流。
+     *
+     * ## 定位
+     * raw 流的唯一并发闸门。少了它，raw 路径绕过 `streams_active()`，单隧道
+     * 可以无限并发裸 TCP 流，把服务端的 fd 与工作线程打满。
+     *
+     * ## 并发/失败语义
+     * - 调用约束：任意线程；内部用 CAS 循环预留，不需要外部锁。
+     * - 原子性：raw 计数精确不超限；与 mux 流数之和是瞬时快照，并发建 mux
+     *   流时可能短暂超出 1 条（与原有 `streams_active()` 检查同级）。
+     * - 失败语义：不抛异常；返回 false 时计数未改变。
+     * - 不变量：返回 true 后 `raw_active` 至少加 1，直到调用方归还。
+     */
+    bool TryAcquireRawSlot(const std::shared_ptr<Entry>& entry);
     /// 子域名是否在最近 5 分钟内上线过（用于把 404 变成更明确的 502）。
     bool WasRecentlyOffline(const std::string& subdomain) const;
     /// 生成 `/__tunnel__/status` 的 JSON。

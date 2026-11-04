@@ -62,10 +62,16 @@ int Server::Serve(ITransport& transport) {
         if (!message) {
             break;
         }
-        std::string raw = std::move(*message);
-        tasks.push_back(go2cpp::go(scheduler, [this, raw = std::move(raw)]() mutable {
-            ProcessMessage(raw);
-        }));
+        // 空句柄 = 任务未提交（调度器终态 / 与 shutdown 并发）。原实现直接
+        // push_back，循环末尾的 task->wait() 会解引用空指针。
+        auto payload = std::make_shared<std::string>(std::move(*message));
+        auto task = go2cpp::go(scheduler, [this, payload] { ProcessMessage(*payload); });
+        if (task) {
+            tasks.push_back(std::move(task));
+        } else {
+            // 降级为就地处理：请求不能丢，也不把空句柄放进队列。
+            ProcessMessage(*payload);
+        }
 
         // 有界积压：任务过多时等待最老的一批完成再继续读，避免内存无界增长。
         if (tasks.size() >= kMaxInflight) {

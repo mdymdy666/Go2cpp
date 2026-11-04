@@ -95,7 +95,7 @@ double Spsc(std::size_t capacity, std::uint64_t total,
   std::thread producer([&] {
     gate.Wait();
     for (std::uint64_t i = 0; i < total; ++i) {
-      channel->Send(i);
+      (void)channel->Send(i);  // 基准热路径：通道不关闭，Send 恒成功
     }
   });
   std::thread consumer([&] {
@@ -142,14 +142,14 @@ double PingPong(std::size_t capacity, std::uint64_t rounds,
       if (!got.ok || *got.value != i) {
         ++local_violations;
       }
-      to_a->Send(i);
+      (void)to_a->Send(i);  // 基准热路径：通道不关闭，Send 恒成功
     }
     violations.store(local_violations, std::memory_order_relaxed);
   });
   std::uint64_t local_violations = 0;
   const auto started = Clock::now();
   for (std::uint64_t i = 0; i < rounds; ++i) {
-    to_b->Send(i);
+    (void)to_b->Send(i);  // 基准热路径：通道不关闭，Send 恒成功
     const auto got = to_a->Recv();
     if (!got.ok || *got.value != i) {
       ++local_violations;
@@ -169,12 +169,12 @@ double PingPong(std::size_t capacity, std::uint64_t rounds,
 double MicroPair(std::size_t capacity, std::uint64_t total,
                  std::atomic<std::uint64_t>* order_violations) {
   auto channel = go2cpp::MakeChannel<std::uint64_t>(capacity);
-  channel->Send(0);
+  (void)channel->Send(0);  // 种子填充：通道刚创建、未关闭
   std::uint64_t violations = 0;
   std::uint64_t checksum = 0;
   const auto started = Clock::now();
   for (std::uint64_t i = 1; i <= total; ++i) {
-    channel->Send(i);
+    (void)channel->Send(i);  // 基准热路径：通道不关闭，Send 恒成功
     const auto got = channel->Recv();
     if (!got.ok || *got.value != i - 1) {
       ++violations;
@@ -341,7 +341,7 @@ double FullTrySend(std::size_t capacity, std::uint64_t iterations,
                    std::atomic<std::uint64_t>* order_violations) {
   auto channel = go2cpp::MakeChannel<std::uint64_t>(capacity);
   for (std::size_t i = 0; i < capacity; ++i) {
-    channel->Send(0);
+    (void)channel->Send(0);  // 预填充到容量上限
   }
   std::uint64_t hits = 0;
   const auto started = Clock::now();

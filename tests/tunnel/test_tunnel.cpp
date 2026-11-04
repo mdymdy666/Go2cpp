@@ -967,6 +967,169 @@ void TestRawAckNoPreread() {
     server.join();
 }
 
+/**
+ * @brief raw 流并发上限实测：上限 2、并发 3 条时第 3 条必须 503，释放后恢复。
+ *
+ * @details raw 流不建 MuxStream，`streams_active()` 不增长；本用例专门守住
+ *          `Entry::raw_active` 这条独立计数路径。本地服务故意「响应后不关
+ *          连接」，让前两条 raw 流把两个额度占住。
+ */
+void TestRawStreamLimit() {
+    std::printf("[test] 10. raw 流并发上限（上限 2、并发 3）\n");
+    setenv("GO2CPP_TUNNEL_RAW_STREAM", "1", 1);
+    std::string error;
+    TcpListener::Ptr slow = TcpListener::Listen("127.0.0.1", 0, &error);
+    TUNNEL_CHECK(slow != nullptr);
+    if (!slow) {
+        return;
+    }
+    std::atomic<bool> stopping{false};
+    std::mutex workers_mutex;
+    std::vector<std::thread> workers;
+    std::thread accept_thread([&] {
+        while (!stopping.load()) {
+            TcpConn::Ptr conn = slow->Accept(100);
+            if (!conn) {
+                continue;
+            }
+            std::lock_guard<std::mutex> lock(workers_mutex);
+            workers.emplace_back([conn] {
+                std::vector<char> buffer(4096);
+                std::string data;
+                while (data.find("\r\n\r\n") == std::string::npos) {
+                    const go2cpp::tunnel::IoResult result =
+                        conn->Read(buffer.data(), buffer.size(), 3000);
+                    if (!result.ok()) {
+                        conn->Shutdown();
+                        return;
+                    }
+                    data.append(buffer.data(), result.count);
+                }
+                const std::string response =
+                    BuildHttpResponse(200, "text/plain", "slow-ok");
+                (void)conn->WriteAll(response.data(), response.size(), 3000,
+                                     nullptr);
+                // 不主动关闭：splice 一直挂着，raw 额度在前两条流上保持占用。
+                for (;;) {
+                    const go2cpp::tunnel::IoResult result =
+                        conn->Read(buffer.data(), buffer.size(), 1000);
+                    if (!result.ok()) {
+                        break;
+                    }
+                }
+                conn->Shutdown();
+            });
+        }
+    });
+
+    TunnelServerConfig server_config;
+    server_config.control_port = 0;
+    server_config.public_port = 0;
+    server_config.display_host = "127.0.0.1";
+    server_config.token = "raw-limit";
+    server_config.recv_queue_cap = 4U * 1024U * 1024U;
+    server_config.drain_timeout_ms = 2000;
+    server_config.max_streams_per_tunnel = 2;
+    auto server = std::make_unique<TunnelServer>(server_config);
+    go2cpp::ErrorPtr server_error;
+    TUNNEL_CHECK(server->Start(&server_error));
+
+    TunnelClientConfig client_config;
+    client_config.server_host = "127.0.0.1";
+    client_config.server_port = server->control_port();
+    client_config.local_host = "127.0.0.1";
+    client_config.local_port = slow->BoundPort();
+    client_config.subdomain = "shop";
+    client_config.token = "raw-limit";
+    client_config.reconnect_min_ms = 200;
+    client_config.reconnect_max_ms = 1000;
+    client_config.hello_timeout_ms = 5000;
+    auto client = std::make_unique<TunnelClient>(client_config);
+    TUNNEL_CHECK(client->Start(&server_error));
+    TUNNEL_CHECK(client->WaitOnline(8000));
+
+    const std::uint16_t public_port = server->public_port();
+    const std::string request =
+        "GET /shop/small HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
+    auto dial_and_send = [public_port, &request](TcpConn::Ptr* out) -> bool {
+        std::string dial_error;
+        TcpConn::Ptr conn =
+            TcpConn::Dial("127.0.0.1", public_port, 3000, &dial_error);
+        if (!conn) {
+            std::fprintf(stderr, "dial failed: %s\n", dial_error.c_str());
+            return false;
+        }
+        if (!conn->WriteAll(request.data(), request.size(), 3000, nullptr)) {
+            return false;
+        }
+        *out = std::move(conn);
+        return true;
+    };
+    auto read_head = [](const TcpConn::Ptr& conn) -> std::string {
+        std::string data;
+        std::vector<char> buffer(4096);
+        while (data.find("\r\n\r\n") == std::string::npos &&
+               data.size() < 65536) {
+            const go2cpp::tunnel::IoResult result =
+                conn->Read(buffer.data(), buffer.size(), 5000);
+            if (!result.ok()) {
+                break;
+            }
+            data.append(buffer.data(), result.count);
+        }
+        return data;
+    };
+    auto status_of = [](const std::string& head) -> int {
+        const std::size_t space = head.find(' ');
+        if (space == std::string::npos) {
+            return 0;
+        }
+        return std::atoi(head.c_str() + space + 1);
+    };
+
+    TcpConn::Ptr first;
+    TcpConn::Ptr second;
+    TUNNEL_CHECK(dial_and_send(&first));
+    TUNNEL_CHECK(dial_and_send(&second));
+    TUNNEL_CHECK_EQ(status_of(read_head(first)), 200);
+    TUNNEL_CHECK_EQ(status_of(read_head(second)), 200);
+
+    TcpConn::Ptr third;
+    TUNNEL_CHECK(dial_and_send(&third));
+    const int third_status = status_of(read_head(third));
+    std::printf("  并发 3 条 / 上限 2：第 3 条状态码=%d（期望 503）\n",
+                third_status);
+    TUNNEL_CHECK_EQ(third_status, 503);
+
+    // 释放一个额度后，下一条 raw 流必须重新成功（租约归还路径）。
+    first->Shutdown();
+    std::this_thread::sleep_for(std::chrono::milliseconds(800));
+    TcpConn::Ptr fourth;
+    if (dial_and_send(&fourth)) {
+        const int fourth_status = status_of(read_head(fourth));
+        std::printf("  释放 1 个额度后新流状态码=%d（期望 200）\n",
+                    fourth_status);
+        TUNNEL_CHECK_EQ(fourth_status, 200);
+        fourth->Shutdown();
+    }
+    second->Shutdown();
+    third->Shutdown();
+    client->Stop();
+    server->Stop();
+    stopping.store(true);
+    slow->Close();
+    accept_thread.join();
+    {
+        std::lock_guard<std::mutex> lock(workers_mutex);
+        for (std::thread& worker : workers) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+    }
+    setenv("GO2CPP_TUNNEL_RAW_STREAM", "0", 1);
+}
+
 }  // namespace
 
 int main() {
@@ -981,6 +1144,7 @@ int main() {
     TestConcurrency();
     TestPerformance();
     TestRawAckNoPreread();
+    TestRawStreamLimit();
 
     std::printf("\n[summary] checks=%d failures=%d\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

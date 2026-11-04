@@ -139,9 +139,14 @@ std::string Agent::Run(const std::string& user_prompt, std::vector<AgentStep>* t
                 // std::function 要求目标可拷贝，Promise 只能移动——用 shared_ptr 包一层。
                 auto promise = std::make_shared<go2cpp::Promise<std::string>>();
                 futures.push_back(promise->GetFuture());
-                go2cpp::go([this, call, promise]() mutable {
+                // 调度器关闭/与 shutdown 并发时 go() 返回空句柄：任务不会运行，
+                // promise 永远不会 SetValue，下面的 GetResult() 会永久挂起。
+                // 降级为就地执行，保证每个 Future 一定能完成。
+                if (!go2cpp::go([this, call, promise]() mutable {
+                        promise->SetValue(ExecuteTool(call));
+                    })) {
                     promise->SetValue(ExecuteTool(call));
-                });
+                }
             }
 
             for (std::size_t index = 0; index < response.tool_calls.size(); ++index) {

@@ -499,7 +499,7 @@ TcpConn::Ptr MuxSession::DetachConn() {
 
 bool MuxSession::SendPayload(FrameType type,
                              const std::vector<std::uint8_t>& payload) {
-    if (!alive() || !m_conn) {
+    if (!alive()) {
         return false;
     }
     frame::Frame frame;
@@ -509,11 +509,21 @@ bool MuxSession::SendPayload(FrameType type,
     std::vector<std::uint8_t> wire;
     frame::Error frame_error;
     std::lock_guard<std::mutex> lock(m_send_mutex);
+    // `m_conn` 由 `m_conn_mutex` 保护（`DetachConn` 会并发清空它）：持锁取一份
+    // 快照，既消除数据竞争，也保证 WriteAll 期间连接不会被摘走。
+    TcpConn::Ptr conn;
+    {
+        std::lock_guard<std::mutex> conn_lock(m_conn_mutex);
+        conn = m_conn;
+    }
+    if (!conn) {
+        return false;
+    }
     if (!m_encoder || !m_encoder->Encode(frame, &wire, &frame_error)) {
         return false;
     }
     std::string write_error;
-    if (!m_conn->WriteAll(wire.data(), wire.size(), 30000, &write_error)) {
+    if (!conn->WriteAll(wire.data(), wire.size(), 30000, &write_error)) {
         LogFrameWriteFailure(static_cast<int>(type), wire.size(), write_error);
         return false;
     }
@@ -526,7 +536,7 @@ bool MuxSession::SendData(std::uint32_t stream_id, const char* data,
     if (size == 0) {
         return true;
     }
-    if (data == nullptr || !alive() || !m_conn) {
+    if (data == nullptr || !alive()) {
         return false;
     }
     // 启用帧尾 CRC 时无法用 iovec 直写（校验和覆盖帧头 + 载荷），
@@ -558,7 +568,13 @@ bool MuxSession::SendData(std::uint32_t stream_id, const char* data,
     std::size_t offset = 0;
     std::lock_guard<std::mutex> lock(m_send_mutex);
     while (offset < size) {
-        if (!alive() || !m_conn) {
+        // 每批重新取连接快照：`DetachConn` 摘走连接后必须立刻停止写入。
+        TcpConn::Ptr conn;
+        {
+            std::lock_guard<std::mutex> conn_lock(m_conn_mutex);
+            conn = m_conn;
+        }
+        if (!alive() || !conn) {
             return false;
         }
         std::size_t frames = 0;
@@ -586,7 +602,7 @@ bool MuxSession::SendData(std::uint32_t stream_id, const char* data,
             ++frames;
         }
         std::string write_error;
-        if (!m_conn->WriteV(vectors, static_cast<int>(frames * 2U), 30000,
+        if (!conn->WriteV(vectors, static_cast<int>(frames * 2U), 30000,
                             &write_error)) {
             LogFrameWriteFailure(static_cast<int>(FrameType::kData), batch_bytes,
                                  write_error);

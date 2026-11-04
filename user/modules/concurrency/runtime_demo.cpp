@@ -81,7 +81,7 @@ int main() {
     auto select_channel = MakeChannel<int>(1);
     auto send_view = AsSendOnly(select_channel);
     auto recv_view = AsRecvOnly(select_channel);
-    send_view.Send(7);
+    (void)send_view.Send(7);  // 容量 1 的空通道，投递必然成功
     const auto select_result = Select({RecvCase(select_channel), DefaultCase()});
     const auto direction_probe = recv_view.TryRecv();
     std::cout << "select_index=" << select_result.index

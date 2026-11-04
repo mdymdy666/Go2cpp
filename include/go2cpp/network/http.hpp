@@ -94,6 +94,8 @@ public:
     void clear() noexcept { m_entries.clear(); }
     /// 预留头容量：解析器按 CRLF 计数一次性预留，避免逐头扩容搬移。
     void reserve(std::size_t count) { m_entries.reserve(count); }
+    /// 头字段是否为空（0 条）：解析器用它在快路径识别「换了消息对象续 feed」。
+    bool empty() const noexcept { return m_entries.empty(); }
 
 private:
     static bool equal_name(std::string_view left, std::string_view right) noexcept;
@@ -268,13 +270,38 @@ public:
      * ## 失败语义
      * 冲突的 CL/TE、超限、非法行都返回 `Error`；`error` 字段带中文原因。
      * 已 `Complete` 后未重置再次 feed 也返回 `Error`，不会静默吞掉新字节。
+     *
+     * ## 契约（必须遵守）
+     * 同一条消息的多次 `feed()` **必须**传入同一个 `Request`/`Response`
+     * 对象：头部只在第一次成功解析时写进该对象，后续 feed 走快路径只收
+     * body。换一个对象续 feed 会得到「body 正确、header 为空、status 默认
+     * 200」的假成功——Parser 在快路径检测到目标 header 为空时会返回
+     * `Error`，而不会把无头 body 当成功交付。
      */
     ParseResult feed(std::string_view bytes, Request& request);
     ParseResult feed(std::string_view bytes, Response& response);
     /** @brief 通知响应输入流已到 EOF，完成仅以连接关闭定界的响应。 */
     ParseResult finish(Response& response);
-    /** @brief 指明当前响应对应 HEAD 请求，因此响应头后不读取 body。 */
+    /**
+     * @brief 指明当前响应对应 HEAD 请求，因此响应头后不读取 body。
+     *
+     * @param value [in] true = 跳过响应 body；false = 正常读取。
+     * @note 这是**连接级**配置：`take_remaining()` 会保留它（流水线里下一条
+     *       消息仍服务同一个 HEAD 请求），只有 `reset()` 才清零。
+     */
     void set_response_to_head(bool value) noexcept { m_response_to_head = value; }
+    /**
+     * @brief 取走未消费字节并复位消息级解析状态，供同一连接的下一条消息复用。
+     *
+     * @return 缓冲区里尚未消费的字节——下一条消息的开头；调用方**必须**把它
+     *         作为下一次 `feed()` 的输入，不要丢弃（丢了就是粘包丢字节）。
+     *
+     * @note 与 `reset()` 的差异：`take_remaining()` 保留
+     *       `set_response_to_head()` 设置的连接级标志，因为流水线里的后续响应
+     *       仍服务同一个 HEAD 请求；`reset()` 把它清零。原实现隐式清零，
+     *       调用方（`Client::do_request`）必须手动补设，漏设会把 HEAD 响应
+     *       的 body 当成报文读走。
+     */
     std::string take_remaining();
     bool finished() const noexcept { return m_finished; }
     const ParserLimits& limits() const noexcept { return m_limits; }
@@ -289,6 +316,8 @@ private:
     /// 头部是否已解析（true 时后续 feed 跳过头部重解析，直接进 body 阶段）。
     /// 只在同一条消息的 NeedMore 期间为 true；消息 Complete 时清零，避免复用
     /// 时把上一条的 framing 快照带进下一条。
+    /// 快路径要求后续 feed 传入**同一个**消息对象：换对象时目标 header 为空，
+    /// `feed_impl` 会判 `Error`，而不是交出「无头 body」。
     bool m_header_parsed{false};
     /// 头部解析结果快照：body 起始偏移 / Content-Length / chunked / 是否无 body。
     std::size_t m_body_start_offset{0};

@@ -298,9 +298,13 @@ void HttpTransport::Run() {
         }
         // 服务自身接入连接同样排除：它们由本传输拥有，不属于业务 socket。
         tools::ExcludeSocketFromAutoRegister(connection->fd());
-        go2cpp::go(scheduler, [this, connection]() mutable {
+        // 空句柄 = 任务未提交（调度器终态）；连接必须就地处理，否则既没人读
+        // 也没人 shutdown，会泄漏一个已 accept 的 fd。
+        if (!go2cpp::go(scheduler, [this, connection]() mutable {
+                HandleConnection(std::move(connection));
+            })) {
             HandleConnection(std::move(connection));
-        });
+        }
     }
     scheduler.shutdown();
 }

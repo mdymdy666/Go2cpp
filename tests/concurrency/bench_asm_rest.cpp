@@ -271,7 +271,7 @@ void BenchChannelSpsc(std::uint64_t total, std::size_t capacity) {
       Relax();
     }
     for (std::uint64_t i = 0; i < total; ++i) {
-      channel->Send(i);
+      (void)channel->Send(i);  // 基准热路径：通道不关闭，Send 恒成功
     }
   });
   std::thread consumer([&] {

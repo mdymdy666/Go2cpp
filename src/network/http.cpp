@@ -414,7 +414,17 @@ ParseResult Parser::finish(Response& response) {
     m_finished = true;
     return {ParseState::Complete, consumed, {}};
 }
-std::string Parser::take_remaining() { std::string result; result.swap(m_buffer); reset(); return result; }
+std::string Parser::take_remaining() {
+    std::string result;
+    result.swap(m_buffer);
+    // `m_response_to_head` 是连接级配置（流水线里后续响应仍服务同一个 HEAD
+    // 请求），这里只复位消息级状态；否则调用方每次取剩余字节后都要手动补设，
+    // 漏设会把 HEAD 响应的 body 当报文解析。`reset()` 仍然清零它。
+    const bool response_to_head = m_response_to_head;
+    reset();
+    m_response_to_head = response_to_head;
+    return result;
+}
 /**
  * @brief HTTP 增量解析核心：把新到的字节并入缓冲，推进请求行/头部/消息体状态机，产出解析结果。
  *
@@ -481,6 +491,21 @@ ParseResult Parser::feed_impl(std::string_view bytes, bool response, Request* re
     bool has_length = false;
     bool no_body = false;
     if (m_header_parsed) {
+        // 快路径复用上一条 feed 解析出的头部快照，不会再往目标对象回填头部。
+        // 若调用方换了 Request/Response 对象续 feed，body 会写进新对象而
+        // header/status 留在旧对象里，表现为「body 对、header 0 条、status
+        // 默认 200」的假成功。这里用「目标 header 为空」精确识别误用：
+        // 仍在 NeedMore 的消息至少带一条 CL/TE 头；无头响应（1xx/204/304）
+        // 在解析头部的那一次 feed 里就已 Complete，不会停在快路径上。
+        if (response ? result->header.entries().empty()
+                     : request->header.entries().empty()) {
+            m_error = response
+                          ? "response object mismatch: continue feeding the "
+                            "same Response instance"
+                          : "request object mismatch: continue feeding the "
+                            "same Request instance";
+            return {ParseState::Error, bytes.size(), m_error};
+        }
         body_start = m_body_start_offset;
         content_length = m_content_length;
         chunked = m_chunked;
