@@ -11,7 +11,9 @@
 #include <cctype>
 #include <cerrno>
 #include <charconv>
+#include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <exception>
 #include <sstream>
@@ -970,18 +972,54 @@ bool ResponseWriter::close() {
 
 namespace {
 
+/// 计算距绝对 deadline 的剩余预算（毫秒，向下取整）。
+/// 已过期或不足 1ms 返回 Duration(0)——Socket 把它解释为「不再等待」。
+net::Socket::Duration budget_left(std::chrono::steady_clock::time_point deadline) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) return net::Socket::Duration(0);
+    const auto left =
+        std::chrono::duration_cast<net::Socket::Duration>(deadline - now);
+    return left.count() > 0 ? left : net::Socket::Duration(0);
+}
+
+/// 连接级超时规范化：<=0 属配置错误，回落默认并告警一次（H-05）。
+/// 不静默把 0 当成「立即超时」——那会让所有连接在 accept 后秒断。
+net::Socket::Duration sanitize_timeout(net::Socket::Duration value,
+                                       net::Socket::Duration fallback,
+                                       const char* name) {
+    if (value.count() > 0) return value;
+    static std::atomic<bool> warned{false};
+    if (!warned.exchange(true, std::memory_order_relaxed)) {
+        std::fprintf(stderr,
+                     "[HttpServer] %s 非法（%lld ms），已回落到默认 %lld ms\n",
+                     name, static_cast<long long>(value.count()),
+                     static_cast<long long>(fallback.count()));
+        std::fflush(stderr);
+    }
+    return fallback;
+}
+
 /// 文件体发送：open + sendfile 循环；返回 false 表示连接已不可继续。
+/// @param timeout [in] 整个文件体的发送总预算；按绝对 deadline 计算，
+///        整个循环共用一份预算（不是每段重置），过期即失败。
 /// @note `Socket::send_file` 内部已处理 EINTR/EAGAIN 与部分写，这里只累计进度。
-bool send_file_body(const net::Socket::Ptr& socket, const FileBody& file) {
+bool send_file_body(const net::Socket::Ptr& socket, const FileBody& file,
+                    net::Socket::Duration timeout) {
     if (file.length == 0) return true;
     const int fd = ::open(file.path.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd < 0) return false;
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
     off_t offset = static_cast<off_t>(file.offset);
     std::uint64_t remaining = file.length;
     bool ok = true;
     while (remaining > 0) {
-        const auto written =
-            socket->send_file(fd, &offset, static_cast<std::size_t>(remaining));
+        const auto left = budget_left(deadline);
+        if (left.count() <= 0) {
+            ok = false;
+            break;
+        }
+        const auto written = socket->send_file(
+            fd, &offset, static_cast<std::size_t>(remaining), left);
         if (written.transferred <= 0) {
             ok = false;
             break;
@@ -1552,7 +1590,18 @@ bool ServeStaticFile(const Request& request, const StaticFilesOptions& options,
     return StaticFiles(options).serve(request, response);
 }
 
-Server::Server(net::Socket::Ptr listener) : m_listener(std::move(listener)) {}
+Server::Server(net::Socket::Ptr listener, ServerOptions options)
+    : m_listener(std::move(listener)), m_options(options) {}
+bool Server::set_options(ServerOptions options) {
+    // 非正值是配置错误而不是「禁用超时」：保留原配置并返回 false，
+    // 调用方能立刻发现，而不是让服务端悄悄退回无超时。
+    if (options.read_timeout.count() <= 0 ||
+        options.write_timeout.count() <= 0) {
+        return false;
+    }
+    m_options = options;
+    return true;
+}
 void Server::route(Method method, std::string path, Handler handler) {
     m_router.add(method, std::move(path), std::move(handler));
 }
@@ -1596,19 +1645,36 @@ void Server::set_fallback(Handler handler) { m_fallback = std::move(handler); }
  * - `m_stopped` 是原子标志，`Server::stop()` 置位后本循环在下一轮退出。
  */
 void Server::serve_connection(net::Socket::Ptr connection, std::size_t max_requests) {
-    // step1: 空连接直接返回；准备解析器与流水线剩余缓冲。
+    // step1: 空连接直接返回；准备解析器与流水线剩余缓冲，解析连接级超时。
     if (!connection) return;
+    // H-05：服务端默认必须有超时（Client 是 30s，Server 不应无限）。
+    // 非法配置回落到默认并告警一次，绝不静默变成「立即超时」或「无限」。
+    const auto read_timeout = sanitize_timeout(
+        m_options.read_timeout, net::Socket::Duration(std::chrono::seconds(10)),
+        "read_timeout");
+    const auto write_timeout = sanitize_timeout(
+        m_options.write_timeout, net::Socket::Duration(std::chrono::seconds(10)),
+        "write_timeout");
     Parser parser; std::string pending;
     // 接收缓冲移出循环且不做零初始化：recv 会覆盖 [0, transferred)，
     // 只有这段会被读取。原来每请求一次 8 KB 栈清零（rep stos）。
     std::array<char, 8192> buffer;
     // step2: keep-alive 主循环，单连接串行处理，上限 max_requests。
     for (std::size_t i = 0; i < max_requests && !m_stopped.load(std::memory_order_acquire); ++i) {
+        // 每个请求一份读预算：覆盖 keep-alive 空闲 + 半包重试，不是每次 recv 重置。
+        const auto request_deadline =
+            std::chrono::steady_clock::now() + read_timeout;
         Request request; ParseResult parsed;
         // 读出一个完整请求：NeedMore 时继续 recv。
         do {
             if (!pending.empty()) { parsed = parser.feed(pending, request); pending.clear(); }
-            else { auto count = connection->recv(buffer.data(), buffer.size()); if (count.transferred <= 0) return; parsed = parser.feed(std::string_view(buffer.data(), static_cast<std::size_t>(count.transferred)), request); }
+            else {
+                const auto left = budget_left(request_deadline);
+                if (left.count() <= 0) return;  // 慢连接：整个请求读完前预算耗尽
+                auto count = connection->recv(buffer.data(), buffer.size(), 0, left);
+                if (count.transferred <= 0) return;
+                parsed = parser.feed(std::string_view(buffer.data(), static_cast<std::size_t>(count.transferred)), request);
+            }
             if (parsed.state == ParseState::Error) return;
         } while (parsed.state == ParseState::NeedMore);
         // step3: 同一 recv 里可能还有下一个请求，留给下一轮。
@@ -1630,10 +1696,18 @@ void Server::serve_connection(net::Socket::Ptr connection, std::size_t max_reque
         } else response.status = Status::NotFound;
         // step5: 写响应头；文件体走 sendfile(2)（HEAD 只回头）。
         const auto wire = response.to_string(request.method == Method::Head);
-        net::SocketStream stream(connection, false);
-        if (!stream.write_all(wire.data(), wire.size())) return;
+        const auto write_deadline =
+            std::chrono::steady_clock::now() + write_timeout;
+        const auto sent = connection->SendAll(wire.data(), wire.size(), 0,
+                                              budget_left(write_deadline));
+        if (!sent.ok() || static_cast<std::size_t>(sent.transferred) != wire.size()) {
+            return;  // 写超时/对端断开：连接不可继续
+        }
         if (request.method != Method::Head && response.has_file()) {
-            if (!send_file_body(connection, *response.file)) return;
+            if (!send_file_body(connection, *response.file,
+                                budget_left(write_deadline))) {
+                return;  // sendfile 超出同一份写预算
+            }
         }
         if (request.close || response.close) return;
     }

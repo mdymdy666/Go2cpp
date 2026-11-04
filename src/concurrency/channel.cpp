@@ -36,6 +36,7 @@
 #include "go2cpp/channel.hpp"
 
 #include "go2cpp/fiber.hpp"
+#include "go2cpp/logging/log.hpp"
 #include "go2cpp/scheduler.hpp"
 
 #include <atomic>
@@ -57,6 +58,32 @@
 
 namespace go2cpp {
 namespace {
+
+// H-10：普通线程上的阻塞 Channel 最终走 FUTEX_WAIT，会真的把整条 OS 线程
+// 停住；在 worker 的非受管回调里调用还会占死一台 M。这个状态此前只能靠
+// gdb 栈（WaitNative）发现。首次真正入睡前告警一次（每线程一次）：
+// - 在 Fiber 中调用会在 ChannelBindManaged 里 park，不会走到这里；
+// - 若阻塞确属有意，用 Scheduler::BlockingRegion 包住即可抑制告警。
+void WarnNativeBlockingOnce() noexcept {
+  static thread_local bool warned = false;
+  if (warned || Scheduler::InBlockingRegion()) {
+    return;
+  }
+  warned = true;
+  // stderr 兜底：日志系统未初始化（单测、示例、早期 main）时 WARN 会静默
+  // 丢弃，而这条告警的全部价值就是「在卡住之前看见」。
+  std::fprintf(stderr,
+               "[Channel] WARN: 在非 Scheduler 线程上阻塞等待（futex），"
+               "会卡住当前线程；在 Fiber 中调用可让出执行权，或改用 "
+               "TrySend/TryRecv/带超时的接口；若确属有意阻塞，请用 "
+               "Scheduler::BlockingRegion 声明\n");
+  std::fflush(stderr);
+  auto logger = GO2CPP_LOG_NAME("Channel");
+  GO2CPP_LOG_WARN(logger)
+      << "Channel 在非 Scheduler 线程上阻塞等待（futex），会卡住当前线程；"
+         "在 Fiber 中调用可让出执行权，或改用 TrySend/TryRecv/带超时的接口；"
+         "若确属有意阻塞，请用 Scheduler::BlockingRegion 声明";
+}
 
 ErrorPtr make_channel_error(const char* message) noexcept {
   try {
@@ -195,6 +222,8 @@ void ChannelWaitNative(WaitNodeBase* node,
     if (node->signal.load(std::memory_order_acquire) != 0) {
       return;
     }
+    // H-10：真正入睡前告警（自旋命中/已就绪的路径不会误报）。
+    WarnNativeBlockingOnce();
     node->parked.store(1, std::memory_order_relaxed);
     if (node->signal.load(std::memory_order_acquire) != 0) {
       node->parked.store(0, std::memory_order_relaxed);

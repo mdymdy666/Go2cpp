@@ -38,6 +38,7 @@
 - 症状：`Channel<int> ch;` / `Channel<int>::Create()` 默认无缓冲。在普通线程里 `ch.Send(1)` 会一直阻塞到有接收者；如果紧接着在同一个线程 `ch.Recv()`，**永久死锁**。在 worker 线程的非受管回调里调用，会占死一台 M。
 - 为什么：Go 的 `make(chan T)` 也是 0 容量，但 Go 的 send 阻塞时 runtime 会切到别的 goroutine；C++ 普通线程没有「别的 G」。`ParkingCondition` 的 native 路径是忠实的 `futex` 等待，不会让出任何调度单位。
 - 建议：保留 0 容量（Go 一致），但把「在 native 上下文调用会阻塞线程」变成显式选择：`Send` 在 `FiberWaitUnsupported()` 为真时返回统一错误码；新增 `SendBlocking()` 表示「我知道会阻塞线程」；编译期/运行期提供 `ExecutionContext::Current()` 诊断。
+- **状态（2026-11-04，P1 H-10）：可观测性已修。** `ChannelWaitNative` 在原生线程首次真正 futex 入睡前打一条 WARN（每线程一次），提示「会卡住当前线程」及 Fiber/Try*/超时替代方案；新增 `Scheduler::InBlockingRegion()`，显式 `BlockingRegion`（普通线程也计入）内的阻塞不告警。`SendBlocking` 与统一错误码属 API 变更，未做。
 
 **D2 [高] `channel.hpp:2780-2782` + `channel.hpp:468-484`（无 `[[nodiscard]]`）**
 - 症状：`ch.Close(); ch.Send(v);` 不抛、不终止，只返回 `{kClosed, ChannelClosedError()}`；调用方写 `ch.Send(v);` 不接返回值，消息**静默丢失**。Go 在这里是 `panic: send on closed channel`。

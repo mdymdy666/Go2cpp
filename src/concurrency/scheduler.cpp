@@ -307,6 +307,10 @@ GId allocate_g_id() noexcept {
 // machine id is retained so a misuse that lets a Fiber migrate before its
 // region is destroyed can still clear the original M's state.
 thread_local MId t_blocking_machine_id GO2CPP_SCHED_HOT_TLS = 0;
+// H-10：普通线程上 enter_blocking() 会因缺少 current_task() 而失败，
+// 但调用方仍然用 BlockingRegion 表达了「这次阻塞是有意的」。用独立计数
+// 记录区域嵌套深度，让 InBlockingRegion() 在普通线程上也可用。
+thread_local int t_blocking_region_depth GO2CPP_SCHED_HOT_TLS = 0;
 
 /// @brief 当前线程是否正处在 worker 的 IO 空闲轮询里。
 /// @details poll 内部会处理就绪事件并把 G 投回本 P；投递者随后立刻 `continue`
@@ -5235,6 +5239,7 @@ bool Scheduler::cancel(const std::shared_ptr<Task>& task) {
 Scheduler::BlockingRegion::BlockingRegion(Scheduler* scheduler) noexcept
     : m_scheduler(scheduler != nullptr ? scheduler
                                        : Scheduler::current_scheduler()) {
+    ++t_blocking_region_depth;
     if (m_scheduler == nullptr ||
         m_scheduler != Scheduler::current_scheduler()) {
         return;
@@ -5246,6 +5251,9 @@ Scheduler::BlockingRegion::BlockingRegion(Scheduler* scheduler) noexcept
 }
 
 Scheduler::BlockingRegion::~BlockingRegion() noexcept {
+    if (t_blocking_region_depth > 0) {
+        --t_blocking_region_depth;
+    }
     if (m_active && m_scheduler != nullptr) {
         Scheduler::leave_blocking_for(m_scheduler, m_machine_id);
         if (t_blocking_machine_id == m_machine_id) {
@@ -5253,6 +5261,10 @@ Scheduler::BlockingRegion::~BlockingRegion() noexcept {
         }
         m_active = false;
     }
+}
+
+bool Scheduler::InBlockingRegion() noexcept {
+    return t_blocking_region_depth > 0 || t_blocking_machine_id != 0;
 }
 
 // 进入 BlockingRegion：把当前 M 从 kRunning 标到 kBlocking，记录起始时间

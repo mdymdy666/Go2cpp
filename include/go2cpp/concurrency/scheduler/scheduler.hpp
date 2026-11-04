@@ -1261,6 +1261,15 @@ public:
     // 优先使用 RAII 形式的 BlockingRegion。
     static bool enter_blocking() noexcept;
     static void leave_blocking() noexcept;
+    /**
+     * @brief 当前线程是否已用 `BlockingRegion` 声明「这里阻塞是有意的」。
+     * @details 与 `BlockingRegion::active()` 不同：后者只反映「本区域是否
+     *          成功接管了一台 M」，在普通线程上恒为 false。本接口用线程局部
+     *          计数登记区域，普通线程同样有效，供 Channel/Mutex 等原生阻塞
+     *          路径判断是否应当告警。
+     * @return 处于任何 BlockingRegion 内（含嵌套）返回 true。
+     */
+    static bool InBlockingRegion() noexcept;
     static MId CurrentMachineId() noexcept { return current_machine_id(); }
     static PId CurrentProcessorId() noexcept { return current_processor_id(); }
 

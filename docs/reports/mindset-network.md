@@ -40,12 +40,14 @@
 - 症状：为了「清除超时」写 `sock->set_recv_timeout(0ms)` 或 `recv(..., 0ms)`，结果每次读立刻返回 `ETIMEDOUT`，连接看起来「秒断」。
 - 为什么会踩：与两个最常被类比的系统相反——POSIX `SO_RCVTIMEO = {0,0}` 表示**永不超时**；Go 的 `SetReadDeadline(time.Time{})` 也是**清除**。我们的 `0` 是「预算已耗尽」。而且 `Duration::max()` 才表示无限，这个三态（0 / 有限 / max）没有类型保护。
 - 改造建议：`set_recv_timeout` 增加 `ClearTimeout()` 或接受 `std::optional<Duration>`（`nullopt` = 无限）；`0` 改为非法值返回 false；文档在头文件显式写「0 = 立即超时」。
+- **状态（2026-11-04，P1 H-02）：已修。** `set_recv_timeout/set_send_timeout` 现在拒绝 `0` 与负数（返回 false、不改变配置），新增 `clear_recv_timeout()/clear_send_timeout()`；`recv()` 与两个 setter 的三态语义（0 / 有限 / max）写进头文件，并用 `static_assert(std::is_signed<Duration::rep>)` 保证负值可被检测。
 
 **H-03 [高] `Duration::max()` 不是「无限」，会被 Socket 级配置静默覆盖**
 - 位置：`src/network/socket.cpp:888-890`、`src/network/socket.cpp:906-908`、`include/go2cpp/network/socket.hpp:266-269`
 - 症状：`recv(buf, n)`（默认 max）本来想无限等，但之前某处调过 `set_recv_timeout(5s)`，于是 5 秒后 `ETIMEDOUT`；调用点看不出来。
 - 为什么会踩：「默认参数 = 无限」是大多数人的第一直觉，但实现里 `max` 是**哨兵**，表示「回落到 socket 配置」，只有 socket 配置也是 max 才是无限。这层回落不可见，且 `set_recv_timeout` 是**持久状态**，一次设置影响之后所有调用。
 - 改造建议：去掉回落，让 `max` 真正等于无限；要配置默认超时就放进 `SocketConfig`（见 §3），调用点显式传。或者在 API 上区分 `recv()` 与 `recv_with_timeout()`。
+- **状态（2026-11-04，P1 H-03）：文档已修，行为保留。** `recv()` 文档明确写出「`max()` = 回落到 `recv_timeout()` 配置，只有配置也是 max 才无限」，`set_*_timeout()` 同样把三态列成表；彻底去掉回落属 API 破坏性变更，留到下一轮。
 
 **H-04 [高] `Address::LookupAny` 的阻塞 DNS 会卡住整个 M**
 - 位置：`src/network/address.cpp:134-136`（`::getaddrinfo` 直接调用）、`src/network/address.cpp:153-156`、`src/network/hook.cpp:183-240`（`Originals` 里**没有** `getaddrinfo`）
@@ -58,6 +60,7 @@
 - 症状：一个只发半个请求头的客户端可以让 handler 永久挂住；1000 个慢连接 = 1000 个 Fiber 常驻 + 1000 个 socket；压测时表现为「连接数只涨不降」。
 - 为什么会踩：`Client` 有 30s 默认超时（http.hpp:358），`Server` 没有——同一模块内默认值不一致，用户按 Client 的经验推理 Server 必然错。
 - 改造建议：`Server` 增加 `ServerOptions{ read_timeout, write_timeout, idle_timeout, max_requests }`，默认 `read_timeout = 30s`、`idle = 60s`；`serve_connection` 内用绝对 deadline 而不是每次调用重置。
+- **状态（2026-11-04，P1 H-05）：已修。** 新增 `http::ServerOptions{read_timeout = 10s, write_timeout = 10s}` 与 `Server::set_options()`；`serve_connection` 为每个请求建一份绝对读 deadline（覆盖 keep-alive 空闲与半包重试），响应头与 sendfile 文件体共用一份写 deadline；非法配置（<=0）回落默认并告警，不会静默变成无限。
 
 **H-06 [高] `Socket::send/recv` 是「单次系统调用」语义，部分成功即返回**
 - 位置：`src/network/socket.cpp:835-836`、`src/network/socket.cpp:860-861`、`include/go2cpp/network/socket.hpp:147-158`

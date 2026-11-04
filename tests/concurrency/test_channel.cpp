@@ -608,6 +608,22 @@ void run_channel_tests() {
     // `case <-time.After(d)`）专项：场景、泄漏与大数据量。放在最后执行，
     // 避免统计 TimerService 待处理数时受到前面用例残留定时器的干扰。
     RunSelectHelperCaseTests();
+
+    // P1 H-10：普通线程上的阻塞 Channel 仍是「真的 futex 等待」（跨线程能
+    // 工作），但首次阻塞会打一条 WARN，便于发现「这里会卡住整条线程」。
+    // 本用例验证告警不改变语义：另一个线程 Send 后 1s 内必须收到。
+    {
+        auto native = MakeChannel<int>(0);
+        std::atomic<int> received{0};
+        std::thread consumer([&] {
+            received.store(native->Recv().ValueOrDefault(),
+                           std::memory_order_release);
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        GO2CPP_CHECK(native->Send(42).Ok());
+        GO2CPP_JOIN_WITH_WATCHDOG(consumer, std::chrono::seconds(2));
+        GO2CPP_CHECK(received.load(std::memory_order_acquire) == 42);
+    }
 }
 
 namespace {

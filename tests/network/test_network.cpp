@@ -1437,6 +1437,73 @@ void run_network_tests() {
         peer->close();
         scheduler.shutdown();
     }
+
+    // P1 H-02/H-03：超时三态必须是「0/负数非法、正数有效、max 才是无限」，
+    // 且 0 不再被静默接受成「默认值」。单次 recv(0) 仍是合法的「不等待」。
+    {
+        int pair[2]{};
+        GO2CPP_REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+        auto reader = go2cpp::net::Socket::FromFd(pair[0], AF_UNIX, SOCK_STREAM);
+        auto writer = go2cpp::net::Socket::FromFd(pair[1], AF_UNIX, SOCK_STREAM);
+        GO2CPP_REQUIRE(reader && writer);
+        using Duration = go2cpp::net::Socket::Duration;
+        GO2CPP_CHECK(!reader->set_recv_timeout(Duration(0)));
+        GO2CPP_CHECK(!reader->set_recv_timeout(Duration(-5)));
+        GO2CPP_CHECK(!reader->set_send_timeout(Duration(0)));
+        GO2CPP_CHECK(reader->set_recv_timeout(Duration(1)));
+        GO2CPP_CHECK(reader->recv_timeout() == Duration(1));
+        GO2CPP_CHECK(reader->set_recv_timeout(Duration::max()));
+        GO2CPP_CHECK(reader->recv_timeout() == Duration::max());
+        GO2CPP_CHECK(reader->set_recv_timeout(Duration(50)));
+        GO2CPP_CHECK(reader->clear_recv_timeout());
+        GO2CPP_CHECK(reader->recv_timeout() == Duration::max());
+        // 单次 recv 传 0：立即 ETIMEDOUT（不是「无限等」）。
+        char byte{};
+        const auto started = std::chrono::steady_clock::now();
+        const auto result = reader->recv(&byte, 1, 0, Duration(0));
+        const auto elapsed = std::chrono::steady_clock::now() - started;
+        GO2CPP_CHECK(result.transferred == -1);
+        GO2CPP_CHECK(result.error == ETIMEDOUT);
+        GO2CPP_CHECK(elapsed < std::chrono::milliseconds(200));
+        reader->close();
+        writer->close();
+    }
+
+    // P1 H-05：Server 默认读/写各 10s（旧实现无限），且非法配置被拒绝。
+    {
+        go2cpp::http::ServerOptions defaults;
+        GO2CPP_CHECK(defaults.read_timeout == std::chrono::seconds(10));
+        GO2CPP_CHECK(defaults.write_timeout == std::chrono::seconds(10));
+        auto listener = go2cpp::net::Socket::CreateTCP(AF_INET);
+        GO2CPP_REQUIRE(listener != nullptr);
+        go2cpp::http::Server server(listener);
+        GO2CPP_CHECK(server.options().read_timeout == std::chrono::seconds(10));
+        GO2CPP_CHECK(!server.set_options({std::chrono::milliseconds(0),
+                                          std::chrono::milliseconds(1000)}));
+        GO2CPP_CHECK(!server.set_options({std::chrono::milliseconds(-1),
+                                          std::chrono::milliseconds(1000)}));
+        GO2CPP_CHECK(server.options().read_timeout == std::chrono::seconds(10));
+
+        int pair[2]{};
+        GO2CPP_REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+        auto connection = go2cpp::net::Socket::FromFd(pair[0], AF_UNIX, SOCK_STREAM);
+        auto peer = go2cpp::net::Socket::FromFd(pair[1], AF_UNIX, SOCK_STREAM);
+        GO2CPP_REQUIRE(connection && peer);
+        GO2CPP_CHECK(server.set_options({std::chrono::milliseconds(100),
+                                         std::chrono::milliseconds(100)}));
+        // 只发半个请求头：旧实现会永久阻塞在 recv，新实现 100ms 后返回。
+        const std::string half = "GET / HTTP/1.1\r\nHost: example";
+        const auto sent = peer->SendAll(half.data(), half.size());
+        GO2CPP_CHECK(sent.ok());
+        const auto began = std::chrono::steady_clock::now();
+        std::thread serving([&] { server.serve_connection(connection); });
+        serving.join();
+        const auto spent = std::chrono::steady_clock::now() - began;
+        GO2CPP_CHECK(spent < std::chrono::seconds(3));
+        GO2CPP_CHECK(spent >= std::chrono::milliseconds(50));
+        connection->close();
+        peer->close();
+    }
 }
 
 // ---------------------------------------------------------------------------

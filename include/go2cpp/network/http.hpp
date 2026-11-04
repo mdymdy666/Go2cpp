@@ -555,9 +555,23 @@ bool ServeStaticFile(const Request& request, const StaticFilesOptions& options,
  * - 路由 = `Router`（精确哈希 + 参数/通配 trie）；未命中走 `m_fallback`；
  * - 响应带 `Response::file` 时走 `sendfile(2)`，不把文件读进内存。
  */
+/// @brief HTTP 服务端连接级超时（H-05）。服务端默认必须有限，否则慢连接
+///        会永久占用 Fiber + socket。
+struct ServerOptions {
+    /// 读取一个完整请求（含 keep-alive 空闲等待）的总预算，默认 10s。
+    std::chrono::milliseconds read_timeout{std::chrono::seconds(10)};
+    /// 写出一个完整响应（含 sendfile 文件体）的总预算，默认 10s。
+    std::chrono::milliseconds write_timeout{std::chrono::seconds(10)};
+};
+
 class Server final {
 public:
-    explicit Server(net::Socket::Ptr listener);
+    /**
+     * @param listener 监听 socket（不做 accept，由调用方负责）。
+     * @param options 连接级超时；非法值（<=0）在 serve_connection 中回落到
+     *        默认值并告警一次，不会被静默当成「立即超时」。
+     */
+    explicit Server(net::Socket::Ptr listener, ServerOptions options = {});
 
     /**
      * @brief 注册路由。
@@ -575,6 +589,9 @@ public:
      */
     void serve_connection(net::Socket::Ptr connection,
                           std::size_t max_requests = 100);
+    /// @brief 替换连接级超时；任一字段 <=0 返回 false 且保持原配置。
+    bool set_options(ServerOptions options);
+    const ServerOptions& options() const noexcept { return m_options; }
     void stop() noexcept { m_stopped = true; }
 
 private:
@@ -584,6 +601,8 @@ private:
     Router m_router;
     /// 兜底 handler；未命中路由时调用，`set_fallback()` 设置。
     Handler m_fallback;
+    /// 连接级超时；`set_options()` 替换，默认读/写各 10s。
+    ServerOptions m_options;
     /// 停止标记；`stop()` 置位，服务循环据此退出（原子量支持跨线程停止）。
     std::atomic<bool> m_stopped{false};
 };

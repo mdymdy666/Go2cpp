@@ -77,6 +77,11 @@ class Socket final : public std::enable_shared_from_this<Socket> {
 public:
     using Ptr = std::shared_ptr<Socket>;
     using Duration = std::chrono::milliseconds;
+    // H-02/H-03：超时是三态（0 / 有限 / max），靠运行期检查拒绝非法值。
+    // 该检查成立的前提是 rep 有符号，否则 `count() < 0` 永远为假。
+    static_assert(std::is_signed<Duration::rep>::value,
+                  "Socket::Duration 的 rep 必须是有符号数，否则无法识别负超时");
+
     /// @brief 单次批量收发允许的最大条数（与内核 UIO_MAXIOV 对齐）。
     static constexpr std::size_t kMaxBatch = 1024;
     static Ptr CreateTCP(int family = AF_INET);
@@ -202,6 +207,28 @@ public:
      */
     SocketResult SendAll(const void* data, std::size_t length, int flags = 0,
                          Duration timeout = Duration::max());
+    /**
+     * @brief 单次读：最多读 length 字节，短读合法（与 Go Read 不同）。
+     *
+     * @param data [in] 接收缓冲区首地址；length > 0 时不可为 nullptr；
+     *        仅调用期间借用。
+     * @param length [in] 缓冲区字节数；0 表示空读，直接返回 {0, 0}。
+     * @param flags [in] 透传给 recvmsg(2) 的 flags。
+     * @param timeout [in] 本次等待上限（毫秒）。**三态**：
+     *        - `Duration::max()`（默认）：**不是**「无限」，而是「回落到
+     *          `recv_timeout()` 配置」；只有配置也是 max 时才真正无限（H-03）；
+     *        - 有限正数：本次最多等这么久；
+     *        - `Duration(0)`：**合法的「不等待」**——预算已耗尽，socket 不可读
+     *          时立即返回 `{-1, ETIMEDOUT}`。这不是「清除超时」，POSIX
+     *          `SO_RCVTIMEO={0,0}` 与本 API 语义相反（H-02）；
+     *        - 负数：非法，返回 `{-1, EINVAL}`。
+     *
+     * @return transferred >= 0 为本次读到的字节数；-1 且 error 非 0 为错误。
+     *
+     * ## 定位
+     * 读路径的单次提交点；协议层需要「恰好 n 字节」时必须自己循环。
+     * 用 0 当「无限」会得到秒断，用 max 当「无限」会被 socket 配置截断。
+     */
     SocketResult recv(void* data, std::size_t length, int flags = 0,
                       Duration timeout = Duration::max());
     SocketResult sendv(const iovec* buffers, std::size_t count, int flags = 0,
@@ -259,9 +286,37 @@ public:
 
     AddressPtr local_address() const;
     AddressPtr remote_address() const;
+    /**
+     * @brief 设置本 socket 的默认读超时（`recv()` 未显式传 timeout 时生效）。
+     *
+     * @param timeout [in] 读等待上限，单位毫秒（`Duration = milliseconds`）。
+     *        **只接受正数或 `Duration::max()`**：
+     *        - `Duration(0)` 与负数**非法**，返回 false 且不改变当前配置；
+     *        - `Duration::max()` 表示无限等待（清空默认超时）。
+     *
+     * @return true 表示已写入并同步到 FdManager；false 表示参数非法或 socket
+     *         已进入关闭流程——调用方**必须**检查返回值。
+     *
+     * ## 语义（H-02 的核心：与 POSIX/Go 相反）
+     * POSIX `SO_RCVTIMEO = {0,0}` 与 Go `SetReadDeadline(time.Time{})` 都表示
+     * **清除超时**；本 API 的 `0` 若被接受只会表示「预算已耗尽、立即超时」。
+     * 因此这里把 `0` 定为非法，清除请显式调用 `clear_recv_timeout()`。
+     * 这是**持久配置**：一次设置影响该 socket 之后所有 recv。
+     */
     bool set_recv_timeout(Duration timeout);
+    /**
+     * @brief 设置本 socket 的默认写超时（`send()`/`SendAll()` 未显式传参时生效）。
+     * @param timeout [in] 同上：只接受正数或 `Duration::max()`；0 与负数返回 false。
+     * @return true 写入成功；false 参数非法或 socket 已关闭。
+     */
     bool set_send_timeout(Duration timeout);
+    /// @brief 清除读超时（等价于 `set_recv_timeout(Duration::max())`）。
+    bool clear_recv_timeout() { return set_recv_timeout(Duration::max()); }
+    /// @brief 清除写超时（等价于 `set_send_timeout(Duration::max())`）。
+    bool clear_send_timeout() { return set_send_timeout(Duration::max()); }
+    /// @brief 当前默认读超时；`Duration::max()` 表示无限。
     Duration recv_timeout() const noexcept;
+    /// @brief 当前默认写超时；`Duration::max()` 表示无限。
     Duration send_timeout() const noexcept;
     bool set_option(int level, int option, const void* value, socklen_t length);
     bool get_option(int level, int option, void* value, socklen_t* length) const;

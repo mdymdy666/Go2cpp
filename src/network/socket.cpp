@@ -1263,7 +1263,10 @@ AddressPtr Socket::remote_address() const {
     return address;
 }
 bool Socket::set_recv_timeout(Duration timeout) {
-    if (timeout.count() < 0) return false;
+    // H-02：0 是「预算已耗尽」而不是「不限」。拒绝 0，逼调用方显式选择
+    // clear_recv_timeout()（= max = 无限），避免把 POSIX/Go 的 0=清除习惯
+    // 带进来后得到「每次读立即 ETIMEDOUT」的秒断。
+    if (timeout.count() <= 0) return false;
     int fd = -1; if (!begin_operation(fd)) return false;
     m_recv_timeout.store(timeout.count(), std::memory_order_relaxed);
     FdManager::instance().set_timeout(fd, true, timeout);
@@ -1271,7 +1274,8 @@ bool Socket::set_recv_timeout(Duration timeout) {
     return true;
 }
 bool Socket::set_send_timeout(Duration timeout) {
-    if (timeout.count() < 0) return false;
+    // H-02：同 set_recv_timeout，0 与负数都拒绝；清除用 clear_send_timeout()。
+    if (timeout.count() <= 0) return false;
     int fd = -1; if (!begin_operation(fd)) return false;
     m_send_timeout.store(timeout.count(), std::memory_order_relaxed);
     FdManager::instance().set_timeout(fd, false, timeout);
