@@ -1,5 +1,6 @@
 #include "go2cpp/fiber.hpp"
 #include "go2cpp/scheduler.hpp"
+#include "go2cpp/tools/go.hpp"
 #include "go2cpp/sync.hpp"
 
 #include <atomic>
@@ -15,7 +16,7 @@
 int main() {
     using namespace std::chrono_literals;
     std::clog << "[fiber-sync][场景1] Fiber 生产者/消费者共享 Mutex、ConditionVariable、WaitGroup\n";
-    go2cpp::Scheduler scheduler(1);
+    auto& scheduler = go2cpp::default_scheduler(1);
     go2cpp::sync::Mutex mutex;
     go2cpp::sync::ConditionVariable condition;
     go2cpp::sync::WaitGroup group;
@@ -23,7 +24,6 @@ int main() {
     int counter = 0;
     std::atomic<bool> success{true};
     group.Add(2);
-    scheduler.Start();
     auto consumer = scheduler.Go([&] {
         if (!mutex.Lock()) {
             success.store(false);
@@ -82,7 +82,7 @@ int main() {
     std::clog << "[fiber-sync][场景2] joined=" << timeout_joined
               << " timed_out=" << timeout_observed.load() << '\n';
 
-    scheduler.Shutdown();
+    go2cpp::shutdown_default_scheduler();
 
     std::clog << "[fiber-sync][场景3] 手动 Fiber Suspend/Resume 保留局部变量\n";
     int continuation = 0;

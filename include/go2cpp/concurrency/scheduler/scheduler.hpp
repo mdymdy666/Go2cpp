@@ -861,6 +861,28 @@ private:
  * @brief Go2Cpp 的 GMP 调度器。
  * @details 维护 G、M、P 的绑定和队列，提供 Fiber/线程混合的 park/wake、
  *          work stealing、阻塞区段和 sysmon 观测接口。
+ *
+ * ## 进程级唯一性（默认契约）
+ *
+ * 一个进程内**同一时刻只应有一个处于运行状态的 Scheduler**：调度器拥有全局
+ * worker 线程组、P 队列与 sysmon，多实例并存会让「任务在哪个运行时上执行」
+ * 取决于调用点，取消与排空语义都难以推理。
+ *
+ * - **推荐入口**：`go2cpp::go(fn)` / `go2cpp::after()` / `go2cpp::every()`
+ *   内部使用进程级默认调度器；需要显式引用时用 `go2cpp::default_scheduler()`，
+ *   结束前用 `go2cpp::shutdown_default_scheduler()`；
+ * - `default_scheduler()` 首次调用时自动 `start()`；`shutdown` 之后再次调用会
+ *   **重建新实例**（`shutdown()` 是终态，不能对旧实例重新 `start()`）；
+ * - 直接构造 `Scheduler` 仍允许，但属于高级用法（测试、自定义
+ *   `SchedulerConfig`、生命周期教学）。若已有运行中的实例时再 `start()`
+ *   第二个实例，`start()` 会输出 `GO2CPP_LOG_WARN`，提示违反唯一性契约；
+ * - 构建时定义 `GO2CPP_ALLOW_MULTI_SCHEDULER` 可关闭该告警，供确实需要
+ *   多调度器并存的测试/基准使用（约束仍是「默认唯一」，不是物理禁止）。
+ *
+ * ## 所有权
+ *
+ * `Scheduler` 是值类型：构造它的代码负责在 worker 全部退出后再析构它；
+ * 它不接管调用方保存的 `Task` 句柄，也不接管其他调度器的任务。
  */
 class Scheduler {
 public:
@@ -896,6 +918,26 @@ public:
     Scheduler(const Scheduler&) = delete;
     Scheduler& operator=(const Scheduler&) = delete;
 
+    /**
+     * @brief 启动 worker 线程组与 sysmon；重复调用或停止中调用为空操作。
+     *
+     * ## 定位
+     * 进程级唯一性的**观测点**：本函数在成功启动后把实例计入进程级活动计数，
+     * 若已存在其它运行中的实例则输出 `GO2CPP_LOG_WARN`。这是诊断，不改变
+     * 启动语义——第二个实例仍会启动，便于旧代码渐进迁移。
+     *
+     * ## 步骤
+     * step1. 持 `Impl::mutex`，已启动或停止中则直接返回（幂等）；
+     * step2. 置 started/accepting，创建 `min_workers` 个 worker 与 sysmon；
+     * step3. 失败时回滚计数并 `shutdown()` 回收已建线程，再抛出异常；
+     * step4. 释放锁后唤醒 worker、发布 kStarted 事件，并做唯一性诊断。
+     *
+     * ## 并发/失败语义
+     * - 调用约束：任意线程可调；并发调用由 `Impl::mutex` 串行化；
+     * - 失败语义：线程创建失败会回滚到未启动状态并抛出原异常；
+     * - 不变量：返回后 `started` 为真或抛出异常；活动计数与
+     *   `counted_active` 一一对应，`shutdown_for` 成功回收时归还。
+     */
     void start();
     /**
      * @brief 把当前线程当作 m0，执行一个可被调度的 main G（Go 的 main
@@ -930,6 +972,18 @@ public:
     // 使用无界 shutdown() 完成最终回收。
     bool shutdown_for(std::chrono::steady_clock::duration timeout);
     bool is_running() const noexcept;
+
+    /**
+     * @brief 返回进程内当前处于运行状态的 Scheduler 数量。
+     *
+     * @return 已 `start()` 且尚未被 `shutdown_for()` 成功回收的实例数；
+     *         0 表示当前没有运行中的调度器。调用方**不要**把它当作锁或用
+     *         它做同步决策，它只用于诊断与测试断言。
+     * @note 计数在 `start()` 成功路径递增、在 `shutdown_for()` 返回 true
+     *       时递减，二者都使用 acq_rel 序；`shutdown_for` 超时（返回 false）
+     *       时保持计数，因此该值可能大于实际可调度实例数。
+     */
+    static std::size_t active_instance_count() noexcept;
 
     void Start() { start(); }
     void Shutdown() { shutdown(); }

@@ -12,8 +12,7 @@
 int main() {
     using namespace go2cpp;
 
-    Scheduler scheduler(4);
-    scheduler.start();
+    auto& scheduler = default_scheduler(4);
     bool ok = true;
 
     // ① Mutex 保护共享状态：8 个 Fiber 各加 1000 次，结果必须是 8000
@@ -71,7 +70,7 @@ int main() {
               << "（预期 3 0）\n";
     ok = ok && finished.load() == 3 && group.Count() == 0;
 
-    scheduler.shutdown();
+    go2cpp::shutdown_default_scheduler();
     std::clog << (ok ? "[sync] 全部通过\n" : "[sync] 有失败\n");
     return ok ? 0 : 1;
 }

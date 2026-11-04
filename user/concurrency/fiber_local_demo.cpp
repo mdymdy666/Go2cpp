@@ -14,8 +14,7 @@
 int main() {
     using namespace go2cpp;
 
-    Scheduler scheduler(2);
-    scheduler.start();
+    auto& scheduler = default_scheduler(2);
     bool ok = true;
 
     // 本示例的键；放在 main 作用域，确保在所有 Fiber 结束前一直存活。
@@ -55,7 +54,7 @@ int main() {
               << "（预期 nullptr）\n";
     ok = ok && after_reset == nullptr;
 
-    scheduler.shutdown();
+    go2cpp::shutdown_default_scheduler();
     std::clog << (ok ? "[fiber_local] 全部通过\n" : "[fiber_local] 有失败\n");
     return ok ? 0 : 1;
 }

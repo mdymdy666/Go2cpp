@@ -75,6 +75,10 @@ std::atomic<std::uint64_t> g_lock_hold_ns{0};
 
 namespace {
 
+/// 进程内处于运行状态（已 start、未 shutdown）的 Scheduler 计数。
+/// 只用于唯一性诊断与 active_instance_count()，不参与任何调度决策。
+std::atomic<std::size_t> g_active_schedulers{0};
+
 // ---------------------------------------------------------------------------
 // 持锁 park 契约检查
 // ---------------------------------------------------------------------------
@@ -3041,6 +3045,8 @@ public:
     // appends records; snapshots and BlockingRegion lookup never observe a
     // vector relocation of an existing shared_ptr slot.
     std::deque<std::shared_ptr<Machine>> machines;
+    /// 本实例是否已计入 g_active_schedulers；用于 shutdown 幂等归还。
+    std::atomic<bool> counted_active{false};
     std::atomic<bool> started{false};
     // ------------------------------------------------------------------
     // 生命周期标志合并（park/wake 热路径只读一次）
@@ -3340,6 +3346,30 @@ void Scheduler::start() {
     lock.unlock();
     m_impl->notify_all_workers();
     m_impl->emit_event(SchedulerEvent{SchedulerEventType::kStarted});
+
+    // 唯一性诊断：只统计「已 start 且未 shutdown」的实例，不阻止启动。
+    // 默认契约是进程级唯一；多实例并存时给一次可见告警，便于定位无意中
+    // 重复创建调度器的代码。测试/基准用 GO2CPP_ALLOW_MULTI_SCHEDULER 关闭。
+    m_impl->counted_active.store(true, std::memory_order_release);
+    const std::size_t active_instances =
+        g_active_schedulers.fetch_add(1, std::memory_order_acq_rel) + 1;
+#ifndef GO2CPP_ALLOW_MULTI_SCHEDULER
+    if (active_instances > 1) {
+        // stderr 兜底：唯一性告警必须在日志系统未初始化（示例、单测、早期
+        // main）时也可见；日志系统已初始化时会再记录一条带时间戳的记录。
+        std::fprintf(stderr,
+                     "[Scheduler] 检测到 %zu 个同时运行的 Scheduler；默认契约"
+                     "要求进程级唯一，请优先使用 go2cpp::default_scheduler()/"
+                     "go2cpp::go()\n",
+                     active_instances);
+        std::fflush(stderr);
+        auto logger = GO2CPP_LOG_NAME("Scheduler");
+        GO2CPP_LOG_WARN(logger)
+            << "检测到 " << active_instances
+            << " 个同时运行的 Scheduler；默认契约要求进程级唯一，请优先使用"
+               " go2cpp::default_scheduler()/go2cpp::go()";
+    }
+#endif
 }
 
 bool Scheduler::run_main(Task::Function function) {
@@ -3638,6 +3668,11 @@ bool Scheduler::shutdown_for(
     }
     deferred_destruction.clear();
     completion_notifications.clear();
+    // 唯一性计数与 start() 对称：只有真正回收完成的实例才退出计数；
+    // shutdown_for 超时返回 false 时保持计数，避免低估并存实例数。
+    if (m_impl->counted_active.exchange(false, std::memory_order_acq_rel)) {
+        g_active_schedulers.fetch_sub(1, std::memory_order_acq_rel);
+    }
     return true;
 }
 
@@ -3649,6 +3684,10 @@ bool Scheduler::is_running() const noexcept {
     return m_impl && m_impl->started.load(std::memory_order_acquire) &&
            !m_impl->draining() &&
            !m_impl->stopping();
+}
+
+std::size_t Scheduler::active_instance_count() noexcept {
+    return g_active_schedulers.load(std::memory_order_acquire);
 }
 
 

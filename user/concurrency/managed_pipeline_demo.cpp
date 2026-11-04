@@ -1,6 +1,7 @@
 #include "go2cpp/channel.hpp"
 #include "go2cpp/context.hpp"
 #include "go2cpp/scheduler.hpp"
+#include "go2cpp/tools/go.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -15,12 +16,11 @@
 int main() {
     using namespace std::chrono_literals;
     std::clog << "[pipeline][场景1] 无缓冲 Channel 成功传递并在关闭后结束\n";
-    go2cpp::Scheduler scheduler(1);
+    auto& scheduler = go2cpp::default_scheduler(1);
     auto context = go2cpp::WithTimeout(go2cpp::Background(), 2s);
     auto channel = go2cpp::MakeChannel<int>(0);
     std::atomic<int> sum{0};
     std::atomic<bool> success{true};
-    scheduler.Start();
     auto consumer = scheduler.Go([&] {
         for (;;) {
             const auto result = channel->Recv(context.first);
@@ -80,7 +80,7 @@ int main() {
     std::clog << "[pipeline][场景3] send_after_close status="
               << static_cast<int>(closed_send.status) << '\n';
 
-    scheduler.Shutdown();
+    go2cpp::shutdown_default_scheduler();
     std::cout << "P=1 unbuffered pipeline sum=" << sum.load()
               << " success=" << success_path
               << " cancel=" << cancel_path

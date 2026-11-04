@@ -16,8 +16,7 @@ int main() {
 
     std::clog << "[beginner][场景1] 显式 Scheduler + go() + Channel\n";
     // 只需一个 Scheduler，就可以用 go() 提交 Fiber；等待仍然是可回收的。
-    Scheduler scheduler(2);
-    scheduler.start();
+    auto& scheduler = default_scheduler(2);
     auto task = go(scheduler, [] {
         std::clog << "[beginner][场景1] Fiber 已在 Scheduler 中执行\n";
     });
@@ -55,12 +54,12 @@ int main() {
               << " status=" << static_cast<int>(nil_result.status)
               << "（预期 kNil）\n";
 
-    scheduler.shutdown();
+    go2cpp::shutdown_default_scheduler();
 
     // 不想管理 Scheduler 时可以使用进程级默认调度器；结束前显式关闭它。
     std::clog << "[beginner][场景4] 进程级默认 Scheduler 的 go() 入口\n";
     auto default_task = go([] { std::clog << "[beginner][场景4] 默认任务完成\n"; });
     default_task->wait();
-    shutdown_default_scheduler();
+    go2cpp::shutdown_default_scheduler();
     return timeout_ok && nil_ok ? 0 : 1;
 }

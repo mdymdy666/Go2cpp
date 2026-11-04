@@ -21,8 +21,7 @@ int main() {
 
     // ① Scheduler + go
     std::clog << "[runtime][场景1] Scheduler + go\n";
-    Scheduler scheduler(2);
-    scheduler.start();
+    auto& scheduler = default_scheduler(2);
     std::atomic<int> ran{0};
     auto task = go(scheduler, [&ran] { ran.fetch_add(1); });
     ok = task->wait() && ok;
@@ -49,7 +48,7 @@ int main() {
               << "（预期 1 1）\n";
     ok = ok && done && deadline;
 
-    scheduler.shutdown();
+    go2cpp::shutdown_default_scheduler();
     std::clog << (ok ? "[runtime] 全部通过\n" : "[runtime] 有失败\n");
     return ok ? 0 : 1;
 }

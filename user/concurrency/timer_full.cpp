@@ -108,8 +108,7 @@ bool scenario_run_count() {
 bool scenario_with_wait_group() {
     using namespace go2cpp;
     std::clog << "[full][场景5] 与 WaitGroup 配合：等一批定时任务完成\n";
-    Scheduler scheduler(3);
-    scheduler.start();
+    (void)default_scheduler(3);  // 指定 3 个 P；任务统一走 go() 提交
     sync::WaitGroup group;
     std::atomic<int> finished{0};
     constexpr int kTimers = 4;
@@ -124,7 +123,7 @@ bool scenario_with_wait_group() {
         }));
     }
     const bool waited = group.WaitFor(Ms(2000));
-    scheduler.shutdown();
+    go2cpp::shutdown_default_scheduler();
     std::cout << "  WaitFor 成功=" << waited
               << " 完成数=" << finished.load() << "（预期 1 " << kTimers << "）\n";
     return waited && finished.load() == kTimers;

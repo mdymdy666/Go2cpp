@@ -174,9 +174,7 @@ bool scenario_multiple_instances(go2cpp::Scheduler& scheduler) {
 int main() {
     using namespace go2cpp;
 
-    Scheduler scheduler(4);
-    scheduler.start();
-
+    auto& scheduler = default_scheduler(4);
     bool ok = true;
     ok = scenario_get_or_create() && ok;
     ok = scenario_two_fibers_isolated(scheduler) && ok;
@@ -186,7 +184,7 @@ int main() {
     ok = scenario_key_uniqueness() && ok;
     ok = scenario_multiple_instances(scheduler) && ok;
 
-    scheduler.shutdown();
+    go2cpp::shutdown_default_scheduler();
     std::clog << (ok ? "[full] 7 个场景全部通过\n" : "[full] 存在失败场景\n");
     return ok ? 0 : 1;
 }

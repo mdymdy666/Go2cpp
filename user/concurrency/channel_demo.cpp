@@ -13,8 +13,7 @@
 int main() {
     using namespace go2cpp;
 
-    Scheduler scheduler(2);
-    scheduler.start();
+    auto& scheduler = default_scheduler(2);
     bool ok = true;
 
     // ① 无缓冲：发送与接收必须"对上"才算完成
@@ -57,7 +56,7 @@ int main() {
     std::cout << "  关闭前累计: " << sum << "（预期 15）\n";
     ok = ok && (sum == 15);
 
-    scheduler.shutdown();
+    go2cpp::shutdown_default_scheduler();
     std::clog << (ok ? "[channel] 全部通过\n" : "[channel] 有失败\n");
     return ok ? 0 : 1;
 }

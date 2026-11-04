@@ -132,9 +132,7 @@ int main() {
     using namespace go2cpp;
     using namespace std::chrono_literals;
 
-    Scheduler scheduler(4);
-    scheduler.start();
-
+    auto& scheduler = default_scheduler(4);
     bool ok = true;
     ok = scenario_unbuffered(scheduler) && ok;
     ok = scenario_buffered_pipeline(scheduler) && ok;
@@ -143,7 +141,7 @@ int main() {
     ok = scenario_select_timeout() && ok;
     ok = scenario_cancellation(scheduler) && ok;
 
-    scheduler.shutdown();
+    go2cpp::shutdown_default_scheduler();
     std::clog << (ok ? "[full] 6 个场景全部通过\n" : "[full] 存在失败场景\n");
     return ok ? 0 : 1;
 }

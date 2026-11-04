@@ -1,5 +1,6 @@
 #include "go2cpp/core/timer.hpp"
 #include "go2cpp/scheduler.hpp"
+#include "go2cpp/tools/go.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -151,8 +152,7 @@ int main() {
     print_result("弱引用生命周期", weak_ok);
 
     // 场景五：调度器接收执行后端，把到期回调变成 Fiber。
-    go2cpp::Scheduler scheduler(1);
-    scheduler.start();
+    auto& scheduler = go2cpp::default_scheduler(1);
     std::atomic<int> fiber_count{0};
     Timer fiber_timer = scheduler.schedule_after(10ms, [&] {
         ++fiber_count;
@@ -179,7 +179,7 @@ int main() {
     const bool error_ok = exception_seen && failure_recorded && invalid_rejected;
     print_result("异常隔离", error_ok);
 
-    scheduler.shutdown();
+    go2cpp::shutdown_default_scheduler();
     const bool success = once_ok && cancel_ok && early_ok && repeat_ok &&
                          reconnect_ok && weak_ok && fiber_ok && error_ok;
     std::cout << "[timer] success=" << (success ? "true" : "false")

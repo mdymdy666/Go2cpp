@@ -168,9 +168,7 @@ bool scenario_broken_promise() {
 int main() {
     using namespace go2cpp;
 
-    Scheduler scheduler(4);
-    scheduler.start();
-
+    auto& scheduler = default_scheduler(4);
     bool ok = true;
     ok = scenario_basic_value(scheduler) && ok;
     ok = scenario_error(scheduler) && ok;
@@ -179,7 +177,7 @@ int main() {
     ok = scenario_context_cancel(scheduler) && ok;
     ok = scenario_broken_promise() && ok;
 
-    scheduler.shutdown();
+    go2cpp::shutdown_default_scheduler();
     std::clog << (ok ? "[full] 6 个场景全部通过\n" : "[full] 存在失败场景\n");
     return ok ? 0 : 1;
 }

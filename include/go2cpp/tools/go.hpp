@@ -30,6 +30,7 @@
  * 之后再次 `go()` 会创建新实例，旧引用不能继续提交任务。
  */
 
+#include "go2cpp/log.hpp"
 #include "go2cpp/scheduler/scheduler.hpp"
 
 #include <chrono>
@@ -68,28 +69,47 @@ inline DefaultSchedulerState& default_scheduler_state() {
 }
 
 /**
- * @brief 取得默认调度器；不存在或已停止时创建并启动新实例。
+ * @brief 取得进程级默认调度器；不存在或已停止时按给定配置创建并启动。
+ *
+ * @param config [in] 首次创建时使用的配置；`processor_count==0` 表示沿用
+ *        `SchedulerConfig` 的默认值（硬件并发度）。实例已存在时该参数被
+ *        忽略——重建会打断已在运行的任务，所以只提示配置不一致。
+ * @return 默认调度器的共享句柄，调用方共享所有权；不返回空指针。
  *
  * ## 步骤
  * step1. 取进程级状态并加锁；
- * step2. 句柄为空或 `is_running()` 为假时新建 `Scheduler` 并 `start()`；
- * step3. 返回共享句柄（调用方共享所有权）。
+ * step2. 句柄为空或 `is_running()` 为假时按 config 新建 `Scheduler` 并
+ *        `start()`（`shutdown()` 是终态，关闭后必须换新实例）；
+ * step3. 已存在且配置的 P 数不同时输出一次警告，避免静默忽略；
+ * step4. 返回共享句柄（调用方共享所有权）。
  *
- * @note `Scheduler::shutdown()` 是终态，不能对同一实例再次 `start`，
- *       因此关闭后必须换新实例。
+ * ## 并发/失败语义
+ * - 调用约束：任意线程可调；`state.mutex` 串行化创建与关闭；
+ * - 失败语义：`make_shared`/`start` 抛异常时不发布半初始化句柄；
+ * - 不变量：返回的句柄非空且 `is_running()` 为真（若启动成功）。
  */
-inline std::shared_ptr<Scheduler> ensure_default_scheduler() {
+inline std::shared_ptr<Scheduler> ensure_default_scheduler(
+    const SchedulerConfig& config = {}) {
     // step1: 取状态并加锁
     auto& state = default_scheduler_state();
     std::lock_guard<std::mutex> lock(state.mutex);
-    // step2: 空或已停止则重建
+    // step2: 空或已停止则按配置重建
     if (!state.scheduler || !state.scheduler->is_running()) {
         // Scheduler::shutdown() 是终态，不能对同一个实例再次 start。关闭后
         // 创建新的句柄，旧句柄继续由持有者负责等待/释放。
-        state.scheduler = std::make_shared<Scheduler>();
+        state.scheduler = std::make_shared<Scheduler>(config);
         state.scheduler->start();
+    } else if (config.processor_count != 0 &&
+               state.scheduler->processor_count() != config.processor_count) {
+        // step3: 配置只在创建时生效；已运行实例不重建，只提示一次差异。
+        auto logger = GO2CPP_LOG_NAME("DefaultScheduler");
+        GO2CPP_LOG_WARN(logger)
+            << "default_scheduler() 已按首次配置启动（processor_count="
+            << state.scheduler->processor_count() << "），本次请求的 "
+            << config.processor_count << " 被忽略；如需换配置请先调用 "
+               "shutdown_default_scheduler()";
     }
-    // step3: 返回共享句柄
+    // step4: 返回共享句柄
     return state.scheduler;
 }
 
@@ -102,9 +122,42 @@ inline std::shared_ptr<Scheduler> default_scheduler_handle() {
     return detail::ensure_default_scheduler();
 }
 
+/**
+ * @brief 获取默认调度器的共享句柄，并在首次创建时应用给定配置。
+ * @param config [in] 首次创建时的配置；已存在实例时忽略（保持首次配置）。
+ * @return 默认调度器的共享句柄；调用方共享所有权，不返回空指针。
+ * @note 要换配置先 `shutdown_default_scheduler()`，否则请求会被忽略。
+ */
+inline std::shared_ptr<Scheduler> default_scheduler_handle(
+    const SchedulerConfig& config) {
+    return detail::ensure_default_scheduler(config);
+}
+
 /** @brief 获取默认调度器引用；调用者不负责释放返回对象。 */
 inline Scheduler& default_scheduler() {
     return *detail::ensure_default_scheduler();
+}
+
+/**
+ * @brief 获取默认调度器引用，并在首次创建时应用给定配置。
+ * @param config [in] 首次创建时的配置；已存在实例时忽略（保持首次配置）。
+ * @return 默认调度器引用；调用者不负责释放。
+ * @note 配置只在创建时生效；要换配置先 `shutdown_default_scheduler()`。
+ */
+inline Scheduler& default_scheduler(const SchedulerConfig& config) {
+    return *detail::ensure_default_scheduler(config);
+}
+
+/**
+ * @brief 获取默认调度器引用，并在首次创建时指定 P 数量。
+ * @param processor_count [in] 逻辑处理器数量；0 表示按硬件并发度自动选择。
+ * @return 默认调度器引用；调用者不负责释放。
+ * @note 已存在实例时忽略该参数；要换 P 数量先 `shutdown_default_scheduler()`。
+ */
+inline Scheduler& default_scheduler(std::size_t processor_count) {
+    SchedulerConfig config;
+    config.processor_count = processor_count;
+    return *detail::ensure_default_scheduler(config);
 }
 
 // 停止默认调度器中的工作线程；已提交任务仍遵守 Scheduler 的排空规则。

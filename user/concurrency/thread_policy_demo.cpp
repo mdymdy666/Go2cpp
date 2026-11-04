@@ -30,7 +30,7 @@ int main() {
 
     // ② 作用域内绑定调度器并标记为可参与 GMP
     std::clog << "[thread_policy][场景2] ScopedThreadParticipation\n";
-    Scheduler scheduler(1);
+    auto& scheduler = default_scheduler(1);
     {
         // ★ 该守卫必须传入调度器身份（指针或引用）：
         //   participates_in_gmp() 要求 scheduler != nullptr，
@@ -65,6 +65,8 @@ int main() {
     std::cout << "  作用域后 hook=" << static_cast<int>(restored)
               << "（应恢复到进入前的 " << static_cast<int>(before) << "）\n";
     ok = ok && restored == before;
+
+    go2cpp::shutdown_default_scheduler();
 
     std::clog << (ok ? "[thread_policy] 全部通过\n" : "[thread_policy] 有失败\n");
     return ok ? 0 : 1;

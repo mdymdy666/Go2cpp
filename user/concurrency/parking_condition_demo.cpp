@@ -16,8 +16,7 @@ int main() {
     using namespace go2cpp;
     using Ms = std::chrono::milliseconds;
 
-    Scheduler scheduler(2);
-    scheduler.start();
+    auto& scheduler = default_scheduler(2);
     bool ok = true;
 
     // ① 等待 / 通知：一个 Fiber 等，另一个 Fiber 通知
@@ -61,7 +60,7 @@ int main() {
               << " CancellationRequested=" << cancelled << "（预期 0 0）\n";
     ok = ok && !unsupported && !cancelled;
 
-    scheduler.shutdown();
+    go2cpp::shutdown_default_scheduler();
     std::clog << (ok ? "[parking] 全部通过\n" : "[parking] 有失败\n");
     return ok ? 0 : 1;
 }
