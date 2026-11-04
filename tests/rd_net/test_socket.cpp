@@ -5,24 +5,57 @@
 /// @file test_socket.cpp
 /// @brief REQ-006 验收：四态可分（kClosed / kReset / kTruncated / kWouldBlock）
 ///        + 1e4 无泄漏 + 100 socket 不串包 + 10 万次压测。
+///
+/// @note Windows 兼容（REQ-010）：本文件原来是纯 POSIX 写法（arpa/inet.h、poll.h、
+///       unistd.h、dirent.h）。平台差异全部收口在下面的 `tsock` 命名空间里：
+///       - `poll`            → `select`（Win7 SP1 可用；测试只等「可读」，不用
+///                             WSAPoll——它对非阻塞 connect/UDP 的语义与 poll 有差异）；
+///       - `close`           → `closesocket`；
+///       - `errno`           → `WSAGetLastError()`（EINTR→WSAEINTR 等一一对应）；
+///       - `/proc/self/fd`   → `GetProcessHandleCount`（口径是进程全部句柄，含非
+///                             socket 的，比 Linux fd 计数宽，但仍能抓每轮泄漏）；
+///       - `/proc/self/status` → `GetProcessMemoryInfo().WorkingSetSize`。
+///       断言条数与 POSIX 分支完全一致：平台层只替换系统调用，不动任何 CHECK_*。
 
-#include <arpa/inet.h>
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <random>
+#include <utility>
+#include <vector>
+
+#if defined(_WIN32)
+// winsock2.h 必须先于 windows.h；WIN32_LEAN_AND_MEAN 阻止 windows.h 再拉 winsock.h。
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef WIN32_EXTRA_LEAN
+#define WIN32_EXTRA_LEAN
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+// NOMINMAX：windows.h 默认定义 min/max 宏，会破坏 std::min / std::max。
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <psapi.h>
+#if defined(_MSC_VER)
+#pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "psapi.lib")
+#endif
+#else
+#include <arpa/inet.h>
 #include <dirent.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
-#include <random>
 #include <sys/socket.h>
 #include <unistd.h>
-
-#include <algorithm>
-#include <cstdint>
-#include <utility>
-#include <vector>
+#endif
 
 namespace {
 
@@ -52,14 +85,262 @@ int g_failures = 0;
         }                                                                       \
     } while (0)
 
-long ReadVmRssKb() {
-    std::FILE* f = std::fopen("/proc/self/status", "r");
-    if (f == nullptr) {
+/// @brief 测试侧的平台抽象层：只做「POSIX 调用 → 等价 Winsock 调用」的一对一映射。
+/// @note 每个函数的返回值语义与 POSIX 原调用保持一致，所以上层断言
+///       （406 条 checks）一字不改。
+namespace tsock {
+
+/// @brief 跨平台 socket 句柄。
+/// @note 存 `std::uintptr_t`：Windows 的 SOCKET 是 UINT_PTR（64 位），
+///       塞进 int 会被截断并触发 /W4 C4244；POSIX 的 fd 也放得下。
+using Handle = std::uintptr_t;
+/// @brief 无效句柄：POSIX 的 -1 与 Windows 的 INVALID_SOCKET 转 uintptr_t 后都是全 1。
+constexpr Handle kInvalidHandle = ~static_cast<Handle>(0);
+
+/// @brief 句柄是否有效（POSIX: fd>=0；Windows: SOCKET != INVALID_SOCKET）。
+inline bool Valid(Handle handle) { return handle != kInvalidHandle; }
+
+#if defined(_WIN32)
+using NativeSocket = SOCKET;
+constexpr NativeSocket kInvalidNative = INVALID_SOCKET;
+constexpr int kConnReset = WSAECONNRESET;
+constexpr int kMsgSize = WSAEMSGSIZE;
+#else
+using NativeSocket = int;
+constexpr NativeSocket kInvalidNative = -1;
+constexpr int kConnReset = ECONNRESET;
+constexpr int kMsgSize = EMSGSIZE;
+#endif
+
+/// @brief 句柄 → 原生类型（POSIX: int；Windows: SOCKET）。
+inline NativeSocket Native(Handle handle) { return static_cast<NativeSocket>(handle); }
+
+/// @brief 原生类型 → 句柄。
+inline Handle FromNative(NativeSocket native) { return static_cast<Handle>(native); }
+
+/// @brief 最近一次 socket 系统调用的错误码（POSIX: errno；Windows: WSA*）。
+inline int LastError() {
+#if defined(_WIN32)
+    return ::WSAGetLastError();
+#else
+    return errno;
+#endif
+}
+
+/// @brief 是否被中断（应重试）。POSIX 是 EINTR，Windows 是 WSAEINTR。
+inline bool IsInterrupted(int error) {
+#if defined(_WIN32)
+    return error == WSAEINTR;
+#else
+    return error == EINTR;
+#endif
+}
+
+/// @brief 初始化平台 socket 运行时（POSIX 空操作）。失败返回 false。
+inline bool Init() {
+#if defined(_WIN32)
+    WSADATA data{};
+    return ::WSAStartup(MAKEWORD(2, 2), &data) == 0;
+#else
+    return true;
+#endif
+}
+
+/// @brief 新建 TCP socket；失败返回 kInvalidHandle。
+inline Handle TcpSocket() {
+    return FromNative(::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP));
+}
+
+/// @brief bind 到给定地址；成功返回 0。
+inline int Bind(Handle fd, const sockaddr_in& addr) {
+#if defined(_WIN32)
+    return ::bind(Native(fd), reinterpret_cast<const sockaddr*>(&addr),
+                  static_cast<int>(sizeof(addr)));
+#else
+    return ::bind(Native(fd), reinterpret_cast<const sockaddr*>(&addr),
+                  static_cast<socklen_t>(sizeof(addr)));
+#endif
+}
+
+/// @brief listen；成功返回 0。
+inline int Listen(Handle fd, int backlog) { return ::listen(Native(fd), backlog); }
+
+/// @brief accept；被信号/中断打断时重试，失败返回 kInvalidHandle。
+inline Handle Accept(Handle listen_fd) {
+    for (;;) {
+        const NativeSocket accepted = ::accept(Native(listen_fd), nullptr, nullptr);
+        if (accepted != kInvalidNative) {
+            return FromNative(accepted);
+        }
+        if (!IsInterrupted(LastError())) {
+            return kInvalidHandle;
+        }
+    }
+}
+
+/// @brief 取本地绑定地址；成功返回 0。
+inline int GetSockName(Handle fd, sockaddr_in& addr) {
+#if defined(_WIN32)
+    int len = static_cast<int>(sizeof(addr));
+    return ::getsockname(Native(fd), reinterpret_cast<sockaddr*>(&addr), &len);
+#else
+    socklen_t len = static_cast<socklen_t>(sizeof(addr));
+    return ::getsockname(Native(fd), reinterpret_cast<sockaddr*>(&addr), &len);
+#endif
+}
+
+/// @brief setsockopt；成功返回 0。长度统一由本函数转成平台类型。
+inline int SetOpt(Handle fd, int level, int name, const void* value, std::size_t len) {
+#if defined(_WIN32)
+    return ::setsockopt(Native(fd), level, name, static_cast<const char*>(value),
+                        static_cast<int>(len));
+#else
+    return ::setsockopt(Native(fd), level, name, value, static_cast<socklen_t>(len));
+#endif
+}
+
+/// @brief 关闭写方向（POSIX SHUT_WR / Windows SD_SEND）。
+inline int ShutdownWrite(Handle fd) {
+#if defined(_WIN32)
+    return ::shutdown(Native(fd), SD_SEND);
+#else
+    return ::shutdown(Native(fd), SHUT_WR);
+#endif
+}
+
+/// @brief 关闭句柄（POSIX close / Windows closesocket）。
+inline int Close(Handle fd) {
+#if defined(_WIN32)
+    return ::closesocket(Native(fd));
+#else
+    return ::close(Native(fd));
+#endif
+}
+
+/// @brief 等待句柄可读（有数据或 EOF）。返回 >0 可读、0 超时、<0 错误。
+/// @note POSIX 用 poll(POLLIN)；Windows 用 select（等价「可读」语义，且不会像
+///       WSAPoll 那样在连接重置/非阻塞 connect 上给出与 poll 不同的 revents）。
+inline int WaitReadable(Handle fd, int timeout_ms) {
+#if defined(_WIN32)
+    for (;;) {
+        fd_set read_set;
+        FD_ZERO(&read_set);
+        FD_SET(Native(fd), &read_set);
+        timeval timeout{};
+        timeout.tv_sec = timeout_ms / 1000;
+        timeout.tv_usec = static_cast<long>((timeout_ms % 1000) * 1000);
+        const int rc = ::select(0, &read_set, nullptr, nullptr, &timeout);
+        if (rc < 0 && IsInterrupted(LastError())) {
+            continue;
+        }
+        return rc;
+    }
+#else
+    pollfd pfd{};
+    pfd.fd = Native(fd);
+    pfd.events = POLLIN;
+    for (;;) {
+        const int rc = ::poll(&pfd, 1, timeout_ms);
+        if (rc > 0) {
+            return rc;
+        }
+        if (rc < 0 && IsInterrupted(LastError())) {
+            continue;
+        }
+        return rc;
+    }
+#endif
+}
+
+/// @brief 非阻塞接收一段数据（不消费未就绪的数据）。
+/// @return >0 字节数；0 对端关闭；-1 无数据可读或出错（LastError 给出原因）。
+/// @note Windows 没有 MSG_DONTWAIT：先用零超时 select 探测，未就绪时按
+///       WSAEWOULDBLOCK 返回，保持与 POSIX MSG_DONTWAIT 相同的调用约定。
+///       注意这里**不**把 socket 改成非阻塞模式——同一条连接后面还要被阻塞读
+///       （ReadSome）使用。
+inline std::ptrdiff_t RecvNonBlocking(Handle fd, void* buf, std::size_t len) {
+#if defined(_WIN32)
+    fd_set read_set;
+    FD_ZERO(&read_set);
+    FD_SET(Native(fd), &read_set);
+    timeval timeout{0, 0};
+    const int ready = ::select(0, &read_set, nullptr, nullptr, &timeout);
+    if (ready == 0) {
+        ::WSASetLastError(WSAEWOULDBLOCK);
+        return -1;
+    }
+    if (ready < 0) {
+        return -1;
+    }
+    return ::recv(Native(fd), static_cast<char*>(buf), static_cast<int>(len), 0);
+#else
+    return ::recv(Native(fd), buf, len, MSG_DONTWAIT);
+#endif
+}
+
+/// @brief 阻塞读一段数据（TCP 字节流）。返回 >0 字节数；0 对端关闭；<0 错误。
+inline std::ptrdiff_t ReadSome(Handle fd, void* buf, std::size_t len) {
+#if defined(_WIN32)
+    return ::recv(Native(fd), static_cast<char*>(buf), static_cast<int>(len), 0);
+#else
+    return ::read(Native(fd), buf, len);
+#endif
+}
+
+/// @brief 休眠指定毫秒（POSIX: usleep；Windows: Sleep）。
+inline void SleepMs(int ms) {
+#if defined(_WIN32)
+    ::Sleep(static_cast<DWORD>(ms));
+#else
+    ::usleep(static_cast<useconds_t>(ms) * 1000u);
+#endif
+}
+
+/// @brief 当前进程打开的句柄数（只用于「前后不变」比较）。失败返回 -1。
+/// @note Windows 没有 /proc/self/fd，改用 GetProcessHandleCount（Vista+，Win7 可用）。
+///       口径是**进程全部句柄**（含非 socket），比 Linux 的 fd 计数宽；
+///       对「每轮泄漏一个句柄」的检测能力一致。
+inline int CountOpenHandles() {
+#if defined(_WIN32)
+    DWORD count = 0;
+    if (::GetProcessHandleCount(::GetCurrentProcess(), &count) == 0) {
+        return -1;
+    }
+    return static_cast<int>(count);
+#else
+    DIR* dir = ::opendir("/proc/self/fd");
+    if (dir == nullptr) {
+        return -1;
+    }
+    int count = 0;
+    while (dirent* entry = ::readdir(dir)) {
+        if (std::strcmp(entry->d_name, ".") != 0 &&
+            std::strcmp(entry->d_name, "..") != 0) {
+            ++count;
+        }
+    }
+    ::closedir(dir);
+    return count;
+#endif
+}
+
+/// @brief 当前进程常驻内存（KB）。无可用接口时返回 -1。
+inline long ProcessRssKb() {
+#if defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS counters{};
+    if (::GetProcessMemoryInfo(::GetCurrentProcess(), &counters,
+                               static_cast<DWORD>(sizeof(counters))) == 0) {
+        return -1;
+    }
+    return static_cast<long>(counters.WorkingSetSize / 1024u);
+#else
+    std::FILE* file = std::fopen("/proc/self/status", "r");
+    if (file == nullptr) {
         return -1;
     }
     char line[256];
     long kb = -1;
-    while (std::fgets(line, sizeof(line), f) != nullptr) {
+    while (std::fgets(line, sizeof(line), file) != nullptr) {
         if (std::strncmp(line, "VmRSS:", 6) == 0) {
             if (std::sscanf(line + 6, "%ld", &kb) != 1) {
                 kb = -1;
@@ -67,80 +348,54 @@ long ReadVmRssKb() {
             break;
         }
     }
-    std::fclose(f);
+    std::fclose(file);
     return kb;
+#endif
 }
 
-int CountOpenFds() {
-    DIR* d = ::opendir("/proc/self/fd");
-    if (d == nullptr) {
-        return -1;
-    }
-    int n = 0;
-    while (dirent* ent = ::readdir(d)) {
-        if (std::strcmp(ent->d_name, ".") != 0 && std::strcmp(ent->d_name, "..") != 0) {
-            ++n;
-        }
-    }
-    ::closedir(d);
-    return n;
+}  // namespace tsock
+
+/// @brief 常驻内存（KB），名字沿用 Linux 口径；Windows 走 WorkingSetSize。
+long ReadVmRssKb() { return tsock::ProcessRssKb(); }
+
+/// @brief 打开句柄数，名字沿用 Linux 口径；Windows 走 GetProcessHandleCount。
+int CountOpenFds() { return tsock::CountOpenHandles(); }
+
+/// @brief 等句柄可读。原先是 poll(POLLIN)，Windows 分支用 select 等价实现。
+int WaitEvents(tsock::Handle fd, int timeout_ms) {
+    return tsock::WaitReadable(fd, timeout_ms);
 }
 
-int WaitEvents(int fd, short events, int timeout_ms) {
-    pollfd pfd{};
-    pfd.fd = fd;
-    pfd.events = events;
-    for (;;) {
-        const int rc = ::poll(&pfd, 1, timeout_ms);
-        if (rc > 0) {
-            return pfd.revents;
-        }
-        if (rc < 0 && errno == EINTR) {
-            continue;
-        }
-        return rc;
-    }
-}
-
-int MakeListener(std::uint16_t* port_out) {
-    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) {
-        return -1;
+/// @brief 建一个只监听 127.0.0.1 的 TCP listener（端口由内核分配）。失败返回无效句柄。
+tsock::Handle MakeListener(std::uint16_t* port_out) {
+    const tsock::Handle fd = tsock::TcpSocket();
+    if (!tsock::Valid(fd)) {
+        return tsock::kInvalidHandle;
     }
     const int one = 1;
-    ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    tsock::SetOpt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = 0;
-    if (::bind(fd, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) != 0) {
-        ::close(fd);
-        return -1;
+    if (tsock::Bind(fd, addr) != 0) {
+        tsock::Close(fd);
+        return tsock::kInvalidHandle;
     }
-    if (::listen(fd, 4) != 0) {
-        ::close(fd);
-        return -1;
+    if (tsock::Listen(fd, 4) != 0) {
+        tsock::Close(fd);
+        return tsock::kInvalidHandle;
     }
-    socklen_t len = sizeof(addr);
-    if (::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
-        ::close(fd);
-        return -1;
+    if (tsock::GetSockName(fd, addr) != 0) {
+        tsock::Close(fd);
+        return tsock::kInvalidHandle;
     }
     *port_out = ntohs(addr.sin_port);
     return fd;
 }
 
-int AcceptOne(int listen_fd) {
-    for (;;) {
-        const int fd = ::accept(listen_fd, nullptr, nullptr);
-        if (fd >= 0) {
-            return fd;
-        }
-        if (errno != EINTR) {
-            return -1;
-        }
-    }
-}
+/// @brief accept 一个连接（EINTR 重试）。失败返回无效句柄。
+tsock::Handle AcceptOne(tsock::Handle listen_fd) { return tsock::Accept(listen_fd); }
 
 /// @brief 可校验的确定性字节模式，用于「不丢数据」比对。
 void FillPattern(std::uint8_t* dst, std::size_t n, std::size_t offset) {
@@ -167,28 +422,28 @@ bool VerifyPattern(const std::uint8_t* src, std::size_t n, std::size_t offset,
 void Scenario1Fin() {
     std::printf("\n== 场景 1: TCP 对端 shutdown(SHUT_WR) -> kClosed ==\n");
     std::uint16_t port = 0;
-    const int listen_fd = MakeListener(&port);
-    CHECK_TRUE(listen_fd >= 0);
-    if (listen_fd < 0) {
+    const tsock::Handle listen_fd = MakeListener(&port);
+    CHECK_TRUE(tsock::Valid(listen_fd));
+    if (!tsock::Valid(listen_fd)) {
         return;
     }
     auto opened = rd::net::StreamSocket::Open(rd::net::Endpoint{"127.0.0.1", port});
     CHECK_TRUE(opened.ok());
     if (!opened.ok()) {
-        ::close(listen_fd);
+        tsock::Close(listen_fd);
         return;
     }
     rd::net::StreamSocket client = std::move(*opened);
     const int peer = AcceptOne(listen_fd);
-    ::close(listen_fd);
-    CHECK_TRUE(peer >= 0);
-    if (peer < 0) {
+    tsock::Close(listen_fd);
+    CHECK_TRUE(tsock::Valid(peer));
+    if (!tsock::Valid(peer)) {
         return;
     }
 
     // 对端有序关闭写方向：本端应收到 FIN，而不是 RST。
-    CHECK_TRUE(::shutdown(peer, SHUT_WR) == 0);
-    const int revents = WaitEvents(client.fd(), POLLIN, 1000);
+    CHECK_TRUE(tsock::ShutdownWrite(peer) == 0);
+    const int revents = WaitEvents(client.native_handle(), 1000);
     std::printf("  poll revents=0x%x\n", static_cast<unsigned>(revents));
     CHECK_TRUE(revents > 0);
 
@@ -200,44 +455,44 @@ void Scenario1Fin() {
                 rd::net::IoStatusName(status), got, client.last_system_error());
     CHECK_STATUS(status, rd::net::IoStatus::kClosed);
     CHECK_TRUE(got == 0);
-    ::close(peer);
+    tsock::Close(peer);
 }
 
 // ---------------------------------------------------------------- 场景 2：RST
 void Scenario2Reset() {
     std::printf("\n== 场景 2: TCP 对端 SO_LINGER{1,0}+close -> kReset ==\n");
     std::uint16_t port = 0;
-    const int listen_fd = MakeListener(&port);
-    CHECK_TRUE(listen_fd >= 0);
-    if (listen_fd < 0) {
+    const tsock::Handle listen_fd = MakeListener(&port);
+    CHECK_TRUE(tsock::Valid(listen_fd));
+    if (!tsock::Valid(listen_fd)) {
         return;
     }
     auto opened = rd::net::StreamSocket::Open(rd::net::Endpoint{"127.0.0.1", port});
     CHECK_TRUE(opened.ok());
     if (!opened.ok()) {
-        ::close(listen_fd);
+        tsock::Close(listen_fd);
         return;
     }
     rd::net::StreamSocket client = std::move(*opened);
     const int peer = AcceptOne(listen_fd);
-    ::close(listen_fd);
-    CHECK_TRUE(peer >= 0);
-    if (peer < 0) {
+    tsock::Close(listen_fd);
+    CHECK_TRUE(tsock::Valid(peer));
+    if (!tsock::Valid(peer)) {
         return;
     }
 
     linger lg{};
     lg.l_onoff = 1;
     lg.l_linger = 0;  // 关闭时发 RST，而非 FIN
-    CHECK_TRUE(::setsockopt(peer, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg)) == 0);
-    ::close(peer);
+    CHECK_TRUE(tsock::SetOpt(peer, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg)) == 0);
+    tsock::Close(peer);
 
     std::uint8_t buf[64];
     std::size_t got = 0;
     rd::net::IoStatus status = rd::net::IoStatus::kWouldBlock;
     int revents = 0;
     for (int i = 0; i < 50; ++i) {
-        revents = WaitEvents(client.fd(), POLLIN, 100);
+        revents = WaitEvents(client.native_handle(), 100);
         if (revents == 0) {
             continue;
         }
@@ -252,7 +507,7 @@ void Scenario2Reset() {
                 rd::net::IoStatusName(status), got, client.last_system_error());
     CHECK_STATUS(status, rd::net::IoStatus::kReset);
     CHECK_TRUE(status != rd::net::IoStatus::kClosed);
-    CHECK_TRUE(client.last_system_error() == ECONNRESET);
+    CHECK_TRUE(client.last_system_error() == tsock::kConnReset);
 }
 
 // ---------------------------------------------------------------- 场景 3：UDP 截断
@@ -283,7 +538,7 @@ void Scenario3Truncated() {
                 rd::net::IoStatusName(status), sender.last_system_error(),
                 std::strerror(sender.last_system_error()));
     CHECK_STATUS(status, rd::net::IoStatus::kIoError);
-    CHECK_TRUE(sender.last_system_error() == EMSGSIZE);
+    CHECK_TRUE(sender.last_system_error() == tsock::kMsgSize);
 
     // 用合法上限 65507 触发接收侧截断：缓冲 1024 < 报文 65507。
     std::vector<std::uint8_t> max_payload(65507);
@@ -299,7 +554,7 @@ void Scenario3Truncated() {
     std::uint8_t small[1024];
     std::size_t got = 0;
     rd::net::Endpoint from{};
-    CHECK_TRUE(WaitEvents(receiver.fd(), POLLIN, 1000) > 0);
+    CHECK_TRUE(WaitEvents(receiver.native_handle(), 1000) > 0);
     status = receiver.RecvFrom(rd::net::MutableByteView{small, sizeof(small)}, &from,
                                &got);
     std::printf("  RecvFrom(1024) -> %s, actual=%zu (buffer=1024), from=%s:%u\n",
@@ -316,7 +571,7 @@ void Scenario3Truncated() {
     status = sender.SendTo(rd::net::ByteView{tiny.data(), tiny.size()},
                            receiver.local_endpoint(), &sr);
     CHECK_STATUS(status, rd::net::IoStatus::kOk);
-    CHECK_TRUE(WaitEvents(receiver.fd(), POLLIN, 1000) > 0);
+    CHECK_TRUE(WaitEvents(receiver.native_handle(), 1000) > 0);
     got = 0;
     status = receiver.RecvFrom(rd::net::MutableByteView{small, sizeof(small)}, &from,
                                &got);
@@ -330,13 +585,13 @@ void Scenario3Truncated() {
 void Scenario4WouldBlock() {
     std::printf("\n== 场景 4: TCP 非阻塞发送塞满对端缓冲 -> kWouldBlock，重试不丢数据 ==\n");
     std::uint16_t port = 0;
-    const int listen_fd = MakeListener(&port);
-    CHECK_TRUE(listen_fd >= 0);
-    if (listen_fd < 0) {
+    const tsock::Handle listen_fd = MakeListener(&port);
+    CHECK_TRUE(tsock::Valid(listen_fd));
+    if (!tsock::Valid(listen_fd)) {
         return;
     }
     int listen_rcvbuf = 8192;
-    ::setsockopt(listen_fd, SOL_SOCKET, SO_RCVBUF, &listen_rcvbuf,
+    tsock::SetOpt(listen_fd, SOL_SOCKET, SO_RCVBUF, &listen_rcvbuf,
                  sizeof(listen_rcvbuf));
     rd::net::DialOptions dopts;
     dopts.send_buffer_bytes = 16384;
@@ -345,18 +600,18 @@ void Scenario4WouldBlock() {
                                               dopts);
     CHECK_TRUE(opened.ok());
     if (!opened.ok()) {
-        ::close(listen_fd);
+        tsock::Close(listen_fd);
         return;
     }
     rd::net::StreamSocket client = std::move(*opened);
     const int peer = AcceptOne(listen_fd);
-    ::close(listen_fd);
-    CHECK_TRUE(peer >= 0);
-    if (peer < 0) {
+    tsock::Close(listen_fd);
+    CHECK_TRUE(tsock::Valid(peer));
+    if (!tsock::Valid(peer)) {
         return;
     }
     int peer_rcvbuf = 8192;
-    ::setsockopt(peer, SOL_SOCKET, SO_RCVBUF, &peer_rcvbuf, sizeof(peer_rcvbuf));
+    tsock::SetOpt(peer, SOL_SOCKET, SO_RCVBUF, &peer_rcvbuf, sizeof(peer_rcvbuf));
 
     constexpr std::size_t kChunk = 16384;
     constexpr std::size_t kTotal = 512 * 1024;
@@ -371,7 +626,7 @@ void Scenario4WouldBlock() {
 
     auto drain_peer = [&]() {
         for (;;) {
-            const ssize_t n = ::recv(peer, rbuf.data(), rbuf.size(), MSG_DONTWAIT);
+            const std::ptrdiff_t n = tsock::RecvNonBlocking(peer, rbuf.data(), rbuf.size());
             if (n > 0) {
                 std::size_t bad = 0;
                 if (!VerifyPattern(rbuf.data(), static_cast<std::size_t>(n), received,
@@ -382,7 +637,7 @@ void Scenario4WouldBlock() {
                 received += static_cast<std::size_t>(n);
                 continue;
             }
-            if (n < 0 && errno == EINTR) {
+            if (n < 0 && tsock::IsInterrupted(tsock::LastError())) {
                 continue;
             }
             break;
@@ -438,7 +693,7 @@ void Scenario4WouldBlock() {
 
     // 阶段 3：把对端缓冲区里剩余的数据读干净。
     while (received < kTotal) {
-        const int revents = WaitEvents(peer, POLLIN, 2000);
+        const int revents = WaitEvents(peer, 2000);
         if (revents <= 0) {
             break;
         }
@@ -456,7 +711,7 @@ void Scenario4WouldBlock() {
     CHECK_TRUE(data_ok);
     CHECK_TRUE(token_monotonic);
     CHECK_TRUE(last_token > 0);
-    ::close(peer);
+    tsock::Close(peer);
 }
 
 // ---------------------------------------------------------------- 场景 5a：1e4 echo
@@ -601,7 +856,7 @@ void Scenario5bHundredSockets() {
             }
         }
         if (!progressed) {
-            ::usleep(1000);
+            tsock::SleepMs(1);
         }
     }
     int unseen = 0;
@@ -807,18 +1062,17 @@ void BatchComparison() {
     // TCP 批量（writev）验证：128 KiB 单次 Send 按 batch_bytes=64 KiB 切成
     // 2 段，一次 writev 提交；对端逐块读回并校验内容。
     {
-        const int lfd = ::socket(AF_INET, SOCK_STREAM, 0);
-        if (lfd >= 0) {
+        const tsock::Handle lfd = tsock::TcpSocket();
+        if (tsock::Valid(lfd)) {
             int one = 1;
-            ::setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+            tsock::SetOpt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
             sockaddr_in la{};
             la.sin_family = AF_INET;
             la.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
             la.sin_port = 0;
-            ::bind(lfd, reinterpret_cast<sockaddr*>(&la), sizeof(la));
-            ::listen(lfd, 4);
-            socklen_t ll = sizeof(la);
-            ::getsockname(lfd, reinterpret_cast<sockaddr*>(&la), &ll);
+            tsock::Bind(lfd, la);
+            tsock::Listen(lfd, 4);
+            tsock::GetSockName(lfd, la);
             rd::net::DialOptions dopts;
             dopts.batch_bytes = 65536;
             dopts.batch_entries = 8;
@@ -826,7 +1080,7 @@ void BatchComparison() {
             auto cli = rd::net::StreamSocket::Open(
                 rd::net::Endpoint{"127.0.0.1", ntohs(la.sin_port)}, dopts);
             if (cli.ok()) {
-                const int peer = ::accept(lfd, nullptr, nullptr);
+                const tsock::Handle peer = tsock::Accept(lfd);
                 std::vector<std::uint8_t> block(128 * 1024);
                 FillPattern(block.data(), block.size(), 3);
                 rd::net::SendResult sr{};
@@ -836,7 +1090,7 @@ void BatchComparison() {
                 std::vector<std::uint8_t> got(block.size());
                 std::size_t off = 0;
                 while (off < block.size()) {
-                    const ssize_t n = ::read(peer, got.data() + off, got.size() - off);
+                    const std::ptrdiff_t n = tsock::ReadSome(peer, got.data() + off, got.size() - off);
                     if (n <= 0) {
                         break;
                     }
@@ -850,12 +1104,12 @@ void BatchComparison() {
                     off != block.size() || !same) {
                     std::printf("  [FAIL-BATCH] TCP writev 批量路径异常\n");
                 }
-                ::close(peer);
+                tsock::Close(peer);
             } else {
                 std::printf("  [FAIL-BATCH] TCP Open 失败 status=%s errno=%d\n",
                             rd::net::IoStatusName(cli.status()), cli.system_error());
             }
-            ::close(lfd);
+            tsock::Close(lfd);
         }
     }
 }
@@ -869,7 +1123,7 @@ int RecvUdpBatchExact(rd::net::DatagramSocket& rx,
     std::vector<std::uint8_t> buf(seg + 64);
     int matched = 0;
     for (std::size_t i = 0; i < count; ++i) {
-        if (WaitEvents(rx.fd(), POLLIN, 2000) <= 0) {
+        if (WaitEvents(rx.native_handle(), 2000) <= 0) {
             std::printf("  [recv] poll timeout at %zu/%zu\n", i, count);
             break;
         }
@@ -1129,15 +1383,15 @@ void Scenario6UdpSendBatch() {
 }
 
 // ---------------------------------------------------------------- 场景 7：TCP SendBatch
-std::size_t ReadFullBytes(int fd, std::uint8_t* dst, std::size_t n) {
+std::size_t ReadFullBytes(tsock::Handle fd, std::uint8_t* dst, std::size_t n) {
     std::size_t off = 0;
     while (off < n) {
-        const ssize_t got = ::read(fd, dst + off, n - off);
+        const std::ptrdiff_t got = tsock::ReadSome(fd, dst + off, n - off);
         if (got > 0) {
             off += static_cast<std::size_t>(got);
             continue;
         }
-        if (got < 0 && errno == EINTR) {
+        if (got < 0 && tsock::IsInterrupted(tsock::LastError())) {
             continue;
         }
         break;
@@ -1155,19 +1409,19 @@ TcpBatchBench RunTcpBatchBench(bool batched, int rounds, std::size_t entries,
                                std::size_t seg) {
     TcpBatchBench sample;
     std::uint16_t port = 0;
-    const int lfd = MakeListener(&port);
-    if (lfd < 0) {
+    const tsock::Handle lfd = MakeListener(&port);
+    if (!tsock::Valid(lfd)) {
         return sample;
     }
     auto opened = rd::net::StreamSocket::Open(rd::net::Endpoint{"127.0.0.1", port});
     if (!opened.ok()) {
-        ::close(lfd);
+        tsock::Close(lfd);
         return sample;
     }
     rd::net::StreamSocket cli = std::move(*opened);
-    const int peer = AcceptOne(lfd);
-    ::close(lfd);
-    if (peer < 0) {
+    const tsock::Handle peer = tsock::Accept(lfd);
+    tsock::Close(lfd);
+    if (!tsock::Valid(peer)) {
         return sample;
     }
     std::vector<std::uint8_t> block(entries * seg);
@@ -1213,7 +1467,7 @@ TcpBatchBench RunTcpBatchBench(bool batched, int rounds, std::size_t entries,
         }
         ++ok;
     }
-    ::close(peer);
+    tsock::Close(peer);
     sample.rounds = ok;
     if (ok > 0 && send_ns > 0) {
         const double bytes = static_cast<double>(ok) * static_cast<double>(entries) *
@@ -1232,22 +1486,22 @@ void Scenario7TcpSendBatch() {
     constexpr std::size_t kSeg = 1024;
 
     std::uint16_t port = 0;
-    const int lfd = MakeListener(&port);
-    CHECK_TRUE(lfd >= 0);
-    if (lfd < 0) {
+    const tsock::Handle lfd = MakeListener(&port);
+    CHECK_TRUE(tsock::Valid(lfd));
+    if (!tsock::Valid(lfd)) {
         return;
     }
     auto opened = rd::net::StreamSocket::Open(rd::net::Endpoint{"127.0.0.1", port});
     CHECK_TRUE(opened.ok());
     if (!opened.ok()) {
-        ::close(lfd);
+        tsock::Close(lfd);
         return;
     }
     rd::net::StreamSocket cli = std::move(*opened);
-    const int peer = AcceptOne(lfd);
-    ::close(lfd);
-    CHECK_TRUE(peer >= 0);
-    if (peer < 0) {
+    const tsock::Handle peer = tsock::Accept(lfd);
+    tsock::Close(lfd);
+    CHECK_TRUE(tsock::Valid(peer));
+    if (!tsock::Valid(peer)) {
         return;
     }
 
@@ -1326,14 +1580,14 @@ void Scenario7TcpSendBatch() {
         std::printf("  tcp-limit: count=1500 committed=%zu + %zu\n",
                     rd::net::kMaxBatchEntries, rest);
     }
-    ::close(peer);
+    tsock::Close(peer);
 
     // 部分提交（对端慢读）：SO_SNDBUF=4096，64 段 × 1KB 一次提交。
     {
         std::uint16_t p2 = 0;
-        const int l2 = MakeListener(&p2);
-        CHECK_TRUE(l2 >= 0);
-        if (l2 >= 0) {
+        const tsock::Handle l2 = MakeListener(&p2);
+        CHECK_TRUE(tsock::Valid(l2));
+        if (tsock::Valid(l2)) {
             rd::net::DialOptions opts;
             opts.send_buffer_bytes = 4096;
             opts.tcp_no_delay = true;
@@ -1342,9 +1596,9 @@ void Scenario7TcpSendBatch() {
             CHECK_TRUE(c2_opened.ok());
             if (c2_opened.ok()) {
                 rd::net::StreamSocket c2 = std::move(*c2_opened);
-                const int peer2 = AcceptOne(l2);
-                CHECK_TRUE(peer2 >= 0);
-                if (peer2 >= 0) {
+                const tsock::Handle peer2 = tsock::Accept(l2);
+                CHECK_TRUE(tsock::Valid(peer2));
+                if (tsock::Valid(peer2)) {
                     rd::net::SendResult sr{};
                     const auto st = c2.SendBatch(entries.data(), entries.size(), &sr);
                     std::printf("  tcp-partial: status=%s submitted=%zu/%zu "
@@ -1362,11 +1616,11 @@ void Scenario7TcpSendBatch() {
                     CHECK_TRUE(ReadFullBytes(peer2, got.data(), got.size()) ==
                                got.size());
                     CHECK_TRUE(std::memcmp(got.data(), block.data(), got.size()) == 0);
-                    ::close(peer2);
+                    tsock::Close(peer2);
                 }
                 c2.Close();
             }
-            ::close(l2);
+            tsock::Close(l2);
         }
     }
 
@@ -1404,6 +1658,10 @@ void Scenario7TcpSendBatch() {
 
 int main() {
     std::printf("REQ-006 四态 Socket 抽象验收（%s）\n", __DATE__);
+    if (!tsock::Init()) {
+        std::printf("[FAIL] Winsock 初始化失败\n");
+        return 1;
+    }
     Scenario1Fin();
     Scenario2Reset();
     Scenario3Truncated();

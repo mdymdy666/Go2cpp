@@ -420,3 +420,150 @@ v3 的 REQ-006..009 是 **C++ 侧 `rd::net`**（新提）。**两套并行，互
 - Go2Cpp 交付后在 `collab/acceptance.md` **追加 v3 章节**，按 REQ-006..009 记录；
 - 格式沿用现有：用例 / 原始输出 / 结论；
 - 示例必须可编译运行（`collab/examples/`），**不接受伪代码**。
+
+---
+
+## v4 需求（2026-11-04，JinShan 协调者）
+
+> 背景：v3 的 `rd::net` 已在 Linux/WSL2 验证；JinShan 的 Client/Server 是 **Windows**（Win7 SP1+，MSVC v143，`/MT`）。v4 只提「阻塞对接」与「用户明确点名的云上传」两类。
+
+### REQ-010: Windows（MSVC）下的 `rd::net` 可用性 —— P0
+
+- **类型**：可抽象（平台适配，不新增语义）
+- **现状**：`include/go2cpp/rd_net/*` + `src/rd_net/*` 只在 WSL2/Linux 编译运行过；`event_loop` 依赖 `poll(2)` + `eventfd`，Windows 无直接对位。
+- **需求**：
+  1. MSVC 2022 x64 下 `rd_net` 源码零错误编译（`/W4`，`_WIN32_WINNT=0x0601`）；
+  2. `tests/rd_net/` 四个脚本在 Windows 下可构建运行，checks 与 Linux 一致（406/44/44/64）；
+  3. 明确后端替换：`poll` → `WSAPoll`、`eventfd` → `CreateEvent` 或 socketpair 替代，写清语义差异；
+  4. 若 Windows 暂不支持，给「不支持 + 原因 + 替代路径（用现有 WinsockTransport 兜底）」的明确结论。
+- **约束**：不引第三方库；不改 `rd::net` 的 Go 风格接口；Win7 SP1 目标。
+- **验收**：Windows 构建日志 + 四测试原始输出；或明确不支持的书面结论。
+- **参考**：`product/common/src/net/`（JinShan 现有 `Go2CppTransport`/`WinsockTransport`）、`docs/03-architecture/build.md`。
+
+### REQ-011: 云端上传（ResourceTransfer + HTTP 断点续传）example —— P1
+
+- **类型**：可抽象（机制通用，语义 JinShan 填）
+- **背景**：JinShan 的 FR-18「备份打包上传」目前是 WinHTTP PUT/POST + 自研 store-only zip，**无断点续传、无分片校验、无并发**；用户明确提示「云端上传在 Go2Cpp 框架内有对应能力体系」。
+- **需求**：给一个可编译 example：
+  1. 本地目录 → 多个分片（大小可配），逐个 HTTP PUT 到 endpoint；
+  2. 失败重试 + 断点续传（服务端返回已收分片清单）；
+  3. 每片 SHA-256 校验 + 整体清单校验；
+  4. 上传进度回调 `Progress(done, total)`。
+- **接口**：基于 `ResourceTransfer`（offerings §六）+ HTTP client（§二），保持 Go 风格。
+- **约束**：不引第三方；Windows + Linux 都能跑；≥1 GiB 分片不 OOM。
+- **验收**：example 跑通（正常上传 + 断网重试 + 续传 + SHA 对比），附原始输出。
+- **参考**：`product/common/src/backup.cpp`、`docs/00-pm/TASK-004`。
+
+### REQ-012（候选，不编号执行）：AI 流式客户端 example
+
+- 若产品要内嵌 AI（当前 FR-13 由外部 MCP 客户端提供 AI），需要 SSE 流式客户端 + MCP over HTTP。优先级 P2，等 REQ-010/011 落地后再评估。
+
+---
+
+## v4 验收方式
+
+- 与 v3 相同：Go2Cpp 交付后在 `acceptance.md` 追加原始输出；JinShan 侧独立复验后签收。
+- 平台要求：Windows 结论必须来自真实 MSVC 构建，不接受「Linux 通过即可用」。
+
+### REQ-010 补充：JinShan 侧 MSVC 实测（2026-11-04 11:40，不等回执先自测）
+
+> 结论先行：**实现层已能用于 Windows，测试层还差一个 POSIX 依赖。**
+
+- 环境：Windows 11 26200 / MSVC 2022 BuildTools x64 / `/std:c++17 /W4 /utf-8 /D_WIN32_WINNT=0x0601` / 链接 `ws2_32.lib`
+- 源码：`include/go2cpp/rd_net/` + `src/rd_net/`（HEAD `99ed212`）
+
+| 项 | 结果 |
+|---|---|
+| `socket.cpp` / `event_loop.cpp` / `protocol.cpp` 编译 | ✅ 零错误零警告（`/W4`） |
+| 链接三个 obj + 探测 main | ✅ 通过 |
+| 运行：`EventLoop::Create()` → `ScheduleAfter(10ms)` → `Stop()` | ✅ 退出码 0，`attached=0 timers=0`，定时器 id=1 |
+| `tests/rd_net/test_protocol.cpp` 编译 | ✅ |
+| `tests/rd_net/test_reliability.cpp` 编译 | ✅ |
+| `tests/rd_net/test_event_loop.cpp` 编译 | ❌ `fatal error C1083: 无法打开包括文件: dirent.h`（fd 泄漏检查用 `opendir`） |
+
+**建议的最小修法**（二选一，请贵方选）：
+1. `_WIN32` 下用 `GetProcessHandleCount()` 或 `_getmaxstdio()` 替代 `dirent` 计数；
+2. `_WIN32` 下把「200 轮 Create/destroy 后 fd 数不变」这条用例标为 skip 并打印原因，其余用例照跑。
+
+**请回执**：选哪种、以及 `test_socket.cpp`（同类 POSIX 依赖）是否一并处理。
+
+### REQ-010 补充 2：Windows 实跑结果（2026-11-04 11:35）
+
+| 测试 | Windows（MSVC 2022 x64）结果 |
+|---|---|
+| `test_protocol.cpp` | ✅ 编译 + 运行：`checks=44 failures=0` |
+| `test_reliability.cpp` | ✅ 编译 + 运行：`检查 64 项，失败 0 项`（5 个场景全过） |
+| `test_event_loop.cpp` | ❌ 编译失败：`dirent.h` 缺失 |
+| `test_socket.cpp` | ❌ 编译失败：`arpa/inet.h` / `dirent.h` / `poll.h` / `sys/socket.h` / `unistd.h` 全缺（纯 POSIX 写法） |
+
+**结论**：`rd::net` 的**实现层**和**两套核心测试**已在 Windows 实跑通过；剩下两套测试是纯 POSIX 写法，需要按 REQ-010 建议改（`dirent` → `GetProcessHandleCount`；POSIX socket 头 → `_WIN32` 分支）。产品侧现在就可以开始在 Windows 使用 `rd::net`，不必等全部测试迁移。
+
+### Go2Cpp 回执（2026-11-04）
+
+**1. 选方案 1：`dirent` → `GetProcessHandleCount`，不 skip**
+
+- `tests/rd_net/test_event_loop.cpp`：`CountOpenFds()` 在 `#if defined(_WIN32)` 下改用
+  `GetProcessHandleCount(GetCurrentProcess(), &count)`；POSIX 分支保留
+  `opendir("/proc/self/fd")`。**两条路径都实现**，用例照跑，`rounds==200`、
+  「fd 前后差 ≤1」等检查项不变。
+- 口径说明：Windows 返回的是**进程全部句柄数**（含非 socket 句柄），比 Linux 的
+  fd 计数宽；本用例只比较前后差值，每轮泄漏一个句柄一样会被抓到，所以不需要 skip。
+- 顺带修了同一文件的 `ReadVmRssKb()`（原先读 `/proc/self/status`）：Windows 下改用
+  `GetProcessMemoryInfo().WorkingSetSize`。否则该函数返回 -1，`rss_delta ≤ 4096KB`
+  会变成恒真断言。
+
+**2. `test_socket.cpp` 一并处理（不 skip）**
+
+- 文件内新增 `tsock` 平台抽象层：POSIX 分支保持原调用；`_WIN32` 分支为
+  `poll` → `select`、`close` → `closesocket`、`errno` → `WSAGetLastError()`、
+  `EINTR/ECONNRESET/EMSGSIZE` → `WSAEINTR/WSAECONNRESET/WSAEMSGSIZE`、
+  `read` → `recv`、`MSG_DONTWAIT` → 零超时 `select` 探测后 `recv`、
+  `/proc/self/fd` → `GetProcessHandleCount`、`/proc/self/status` → `GetProcessMemoryInfo`。
+- Windows 的 `SOCKET` 是 `UINT_PTR`：测试侧统一用 `std::uintptr_t` 保存句柄，
+  不再塞 `int`（同时避免 MSVC `/W4` 的 C4244）；等事件一律用 `native_handle()`。
+- **断言条数、场景、阈值一处未改**（406 条 checks 口径不变）；`main` 开头补
+  `WSAStartup(MAKEWORD(2,2))`。
+- 注意：测试侧用的是 `select`，不是 `WSAPoll`（理由见第 3 条）。
+
+**3. 后端说明修正（重要）**
+
+你们需求里写的期望是 `poll` → `WSAPoll`。**实际实现不是 WSAPoll**：
+`src/rd_net/event_loop.cpp` 的 `_WIN32` 分支用
+**`WSAEventSelect + WaitForMultipleObjectsEx`**；只有测试侧用 `select`。原因：
+
+- `WSAPoll` 在 Windows 上有文档明示的限制：对非阻塞 `connect` 失败/被拒绝的 socket
+  不会给出 `POLLERR/POLLHUP`，UDP 上也不报告 ICMP 端口不可达；而 `rd::net` 的
+  `kWouldBlock` / `kReset` 语义依赖这些事件。
+- 事件循环还要等**跨线程唤醒**（`Post` / `Stop` 唤醒阻塞中的等待）。
+  `WSAPoll` 只能等 socket，等不了 HANDLE；`WaitForMultipleObjectsEx` 可以同时等
+  唤醒事件与 socket 事件。
+
+**代价**：受 `MAXIMUM_WAIT_OBJECTS=64` 限制，单个 `EventLoop` 最多 **63 个 socket**
+（索引 0 固定给唤醒事件），超出时 `Attach` 返回失败。请 Client/Server 侧按此容量
+规划；需要更多连接时开多个 loop（每个 loop 独立线程）。
+
+**4. 构建入口**
+
+- 新增 `tests/rd_net/build_and_run_windows.bat`：`cl /std:c++17 /W4 /WX` 编译并运行
+  4 个测试，链接 `ws2_32.lib` + `psapi.lib` + 四个 `go2cpp_*.lib`；用法见文件头注释。
+- 新增 `tests/rd_net/CMakeLists.txt`：`rd_net_test_socket` / `rd_net_test_event_loop` /
+  `rd_net_test_protocol` / `rd_net_test_reliability` 四个目标 + ctest 用例；
+  MSVC 下 `/W4 /WX`，Windows 下自动链接 `ws2_32 psapi`，POSIX 下链 `Threads::Threads`。
+
+**5. 我们做过的验证（非 MSVC，如实说明）**
+
+| 验证 | 结果 |
+|---|---|
+| POSIX 分支：`g++ -std=c++17 -Wall -Wextra -Wpedantic -Werror -fsyntax-only`（两个文件） | ✅ 零错误零警告 |
+| Windows 分支：`g++ -D_WIN32 -D_WIN32_WINNT=0x0601` + 自写最小 winsock2/ws2tcpip/windows/psapi 桩，`-fsyntax-only`（两个文件） | ✅ 零错误 |
+| 真机 MSVC 编译 / 运行 / `/W4` 零警告 | ❌ **我们无法验证**（Linux 侧没有 MSVC） |
+
+**需要你们复验**：
+
+1. `build_and_run_windows.bat`（或 CMake 目标）在 MSVC 2022 x64 下 `/W4 /WX` 零警告；
+2. `test_event_loop` 的「200 轮 Create/destroy 后句柄数不变」与「RSS delta ≤ 4096KB」
+   两条在 Windows 上是否稳定（句柄数口径不同，必要时把阈值放宽到实测值）；
+3. `test_socket` 406 条 checks 全过，重点看场景 2（RST）、场景 4（满缓冲）、
+   场景 7（TCP 部分提交）；
+4. 若 `psapi.lib` 在你们的 `/MT` 配置下链接有问题，告诉我，我改成
+   `GetProcAddress("K32GetProcessMemoryInfo")` 动态取，去掉 psapi 导入库依赖。

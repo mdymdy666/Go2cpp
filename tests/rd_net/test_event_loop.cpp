@@ -4,7 +4,24 @@
 /// @brief REQ-007 验收：单 tick 顺序、定时器精度（p50/p99/max）、高负载下定时器、
 ///        Post 跨线程 1e5 保序、单 tick 每 socket ≤64 包、CancelTimer / Stop / 无泄漏。
 
+#if defined(_WIN32)
+// Windows 无 dirent.h / procfs：句柄数走 GetProcessHandleCount，
+// 常驻内存走 GetProcessMemoryInfo（psapi）。
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+// NOMINMAX：windows.h 默认定义 min/max 宏，会破坏 std::min / std::max。
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <psapi.h>
+#if defined(_MSC_VER)
+#pragma comment(lib, "psapi.lib")
+#endif
+#else
 #include <dirent.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -60,6 +77,31 @@ std::unique_ptr<rd::net::EventLoop> MakeLoop() {
     return std::move(created.value());
 }
 
+#if defined(_WIN32)
+/// @brief 当前进程打开的句柄数（仅用于「前后不变」比较）。失败返回 -1。
+///
+/// @note Windows 没有 /proc/self/fd（REQ-010）：改用 GetProcessHandleCount
+///       取进程全部句柄数。口径比 Linux 的 fd 计数宽（含非 socket 句柄），
+///       但本测试只比较前后差值，同样能抓住「每轮泄漏一个句柄」。
+int CountOpenFds() {
+    DWORD count = 0;
+    if (::GetProcessHandleCount(::GetCurrentProcess(), &count) == 0) {
+        return -1;
+    }
+    return static_cast<int>(count);
+}
+
+/// @brief 当前进程常驻内存（KB）。失败返回 -1。
+/// @note Windows 无 /proc/self/status，改用 GetProcessMemoryInfo().WorkingSetSize。
+long ReadVmRssKb() {
+    PROCESS_MEMORY_COUNTERS counters{};
+    if (::GetProcessMemoryInfo(::GetCurrentProcess(), &counters,
+                               static_cast<DWORD>(sizeof(counters))) == 0) {
+        return -1;
+    }
+    return static_cast<long>(counters.WorkingSetSize / 1024u);
+}
+#else
 long ReadVmRssKb() {
     std::FILE* file = std::fopen("/proc/self/status", "r");
     if (file == nullptr) {
@@ -79,6 +121,7 @@ long ReadVmRssKb() {
     return kb;
 }
 
+/// @brief 枚举 /proc/self/fd 统计打开的 fd 数（含目录本身之外的全部条目）。
 int CountOpenFds() {
     DIR* dir = ::opendir("/proc/self/fd");
     if (dir == nullptr) {
@@ -93,6 +136,7 @@ int CountOpenFds() {
     ::closedir(dir);
     return count;
 }
+#endif
 
 /// @brief 只统计包数的协议（负载测试用）。
 struct CountingProtocol : rd::net::Protocol {
