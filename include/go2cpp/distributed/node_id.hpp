@@ -40,6 +40,8 @@
  * @copyright MIT License
  */
 
+#include "go2cpp/distributed/types.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -127,6 +129,25 @@ public:
      * @return 成功 true；`out == nullptr` 或文本非法返回 false。
      */
     static bool TryParse(std::string_view text, NodeId* out) noexcept;
+
+    /**
+     * @brief 解析并**区分「文本非法」与「合法但全 0」**。
+     *
+     * @param text [in] 待解析文本（借用；调用期间有效，不保留）。
+     * @return `kOk` + 解析结果（可能 `IsValid() == false`，表示配置里的
+     *         「未设置」哨兵）；`kInvalidArgument` 表示文本非法，调用方
+     *         **必须**拒绝该配置而不是当成「未设置」。
+     *
+     * ## 定位
+     * 配置/协议边界上需要「解析成功但值是全 0」与「解析失败」不同处理的
+     * 唯一入口。`Parse()` 两者都返回全 0，只能靠 `IsValid()` 猜；本函数
+     * 把失败变成显式状态码，避免把拼错的节点 id 静默当成「未设置」。
+     *
+     * ## 并发/失败语义
+     * - 调用约束：任意线程，纯函数；
+     * - 失败语义：不抛异常；失败不写入任何调用方状态。
+     */
+    static Result<NodeId> ParseChecked(std::string_view text) noexcept;
 
     /// @brief 高 64 位（进程级随机区）。
     constexpr std::uint64_t high() const noexcept { return m_high; }

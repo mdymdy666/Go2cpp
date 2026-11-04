@@ -57,10 +57,12 @@ Coordinator::Coordinator(CoordinatorOptions options) : m_options(std::move(optio
     if (!m_options.snapshot_path.empty()) {
         const Outcome restored = Restore();
         if (!restored.ok()) {
-            m_degraded = true;
+            m_degraded.store(true, std::memory_order_release);
             m_load_error = restored.message;
         }
     }
+    // 合并落盘窗口从启动时刻起算：首个窗口内即使有清扫也不额外写盘。
+    m_last_sweep_persist = Clock::now();
     if (m_options.start_sweeper) {
         Start();
     }
@@ -131,6 +133,15 @@ bool Coordinator::ValidTtl(Duration ttl) const noexcept {
     return ttl >= m_options.min_ttl && ttl <= m_options.max_ttl;
 }
 
+std::uint64_t Coordinator::EpochSumLocked() const noexcept {
+    std::uint64_t sum = 0;
+    for (const auto &[name, election] : m_elections) {
+        (void)name;
+        sum += election.epoch;
+    }
+    return sum;
+}
+
 std::size_t Coordinator::SweepExpired() {
     std::unique_lock<std::mutex> lock(m_mutex);
     const TimePoint now = Clock::now();
@@ -141,19 +152,36 @@ std::size_t Coordinator::SweepExpired() {
             expired.push_back(id);
         }
     }
+    const std::uint64_t epoch_before = EpochSumLocked();
     for (const LeaseId id : expired) {
         EraseLeaseLocked(id, now);
     }
+    // 删除候选者可能让 leader 换代（epoch 递增）：任期是下游拒绝旧主的
+    // 依据，必须立即落盘，不能进合并窗口。
+    const bool epoch_changed = EpochSumLocked() != epoch_before;
     ++m_sweeps;
     m_expired_total += expired.size();
     if (!expired.empty()) {
         metrics::LeasesExpired().Add(expired.size());
+        m_sweep_persist_pending = true;
+    }
+    // 批量落盘：清扫每 10ms 一轮、租约表可达上千条，逐轮全量写盘会把 IO
+    // 放大成 O(n)/10ms。窗口内只累积 dirty，到期后写一次；删除租约本身
+    // 不改变 fencing，延迟提交是安全的（epoch 换代除外，见上）。
+    const bool interval_elapsed =
+        m_options.sweep_persist_interval <= Duration::zero() ||
+        now - m_last_sweep_persist >= m_options.sweep_persist_interval;
+    const bool flush =
+        epoch_changed || (interval_elapsed && (m_sweep_persist_pending || m_dirty));
+    if (flush) {
+        m_sweep_persist_pending = false;
+        m_last_sweep_persist = now;
     }
     const std::size_t swept = expired.size();
     lock.unlock();
-    // 删除租约改变了 lease-id 水位与选举 epoch，需要落盘；dirty 未置位时
-    // PersistAfterWrite 是零 I/O 的空操作（清扫每 10ms 一次，不能无脑写盘）。
-    (void)PersistAfterWrite();
+    if (flush) {
+        (void)PersistAfterWrite();
+    }
     return swept;
 }
 
@@ -506,6 +534,20 @@ Result<LeaseView> Coordinator::AcquireLock(std::string_view key, std::string_vie
     // fencing token 必须在返回给调用方**之前**落盘：否则返回成功、重启回退，
     // 下游会同时接受两个持有者的写。
     if (Outcome persisted = PersistAfterWrite(); !persisted.ok()) {
+        // 落盘失败必须**回滚内存授予**：否则调用方拿到 kUnavailable 后重试，
+        // 会被自己刚授予的锁挡住一个 TTL（kConflict），表现为「报错却永久
+        // 占着锁」。fencing 计数不回滚——token 只升不降，跳号是安全的。
+        {
+            std::lock_guard<std::mutex> rollback(m_mutex);
+            const auto held = m_locks.find(std::string(key));
+            if (held != m_locks.end() && held->second == id) {
+                m_locks.erase(held);
+            }
+            m_leases.erase(id);
+            // fencing 已前进，仍需要在下一次成功快照里落盘。
+            m_dirty = true;
+            m_sweep_persist_pending = true;
+        }
         return Result<LeaseView>::Failure(persisted.status, persisted.message);
     }
     return result;

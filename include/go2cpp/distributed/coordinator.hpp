@@ -69,6 +69,7 @@
 
 #include "go2cpp/distributed/types.hpp"
 
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -94,6 +95,10 @@ struct CoordinatorOptions {
     Duration min_ttl{10};                ///< 允许的最小租约。
     Duration max_ttl{10 * 60 * 1000};    ///< 允许的最大租约（10 分钟）。
     bool start_sweeper{true};            ///< 是否在构造时启动后台清扫线程。
+    /// 清扫删除租约后的**合并落盘窗口**：窗口内只累积 dirty，到期后一次落盘。
+    /// 清扫默认 10ms 一轮，逐轮全量写盘会把磁盘 IO 放大 O(n)；<=0 表示每轮都写
+    /// （旧行为，仅测试用）。选举 epoch 变化不受窗口约束，立即落盘。
+    Duration sweep_persist_interval{100};
     /// 快照文件路径；空 = 不持久化（重启后 fencing 从 0 开始，仅测试可用）。
     std::string snapshot_path;
     /// true：影响单调性的写返回前立即落盘（fencing 安全的关键，默认开）；
@@ -229,7 +234,7 @@ public:
      * step2. 读整文件；不存在 → 成功；读失败 → `kUnavailable`；
      * step3. 校验尾部 CRC 后逐条解析（任何越界/未知 kind 都是损坏）；
      * step4. 与内存状态**取较大值**合并（fencing/epoch/next_lease 只升不降）；
-     * step5. 清 dirty 并返回。
+     * step5. 清 dirty、清除降级标记（成功加载即恢复可用）并返回。
      *
      * ## 并发/失败语义
      * - 调用约束：构造期或显式重载时调用；内部锁 `m_mutex`，可与读并发；
@@ -238,6 +243,29 @@ public:
      * - 不变量：成功返回后，任何新授予的 token 都严格大于快照里的值。
      */
     Outcome Restore();
+
+    /**
+     * @brief 重新加载快照；成功时解除降级（构造期加载失败后的唯一恢复路径）。
+     *
+     * @return `kOk`：快照已重新合并进内存，`healthy()` 恢复为 true，
+     *         写操作重新可用；`kUnavailable`/`kProtocolError`：加载失败，
+     *         协调者保持/进入降级（fail-stop，不静默回退）。
+     *
+     * ## 定位
+     * 运维修复快照文件后的**唯一**恢复入口。没有它，一次坏文件就让协调者
+     * 永久不可写，只能重启进程；错了会把损坏状态当成可用状态。
+     *
+     * ## 步骤
+     * step1. 未配置快照路径 → 直接成功；
+     * step2. 复用 `Restore()` 的「解析在锁外、提交在锁内」流程；
+     * step3. 失败则记录原因并保持降级；成功由 `Restore()` 清除降级。
+     *
+     * ## 并发/失败语义
+     * - 调用约束：任意线程；与写并发时存在短暂的降级状态切换窗口；
+     * - 原子性：快照解析失败时内存状态保持调用前（`Restore()` 契约）；
+     * - 失败语义：失败不抛异常，返回错误并保持降级。
+     */
+    Outcome Reload();
 
     /**
      * @brief 把 fencing 表、租约表、选举 epoch 原子写入 `snapshot_path`。
@@ -262,11 +290,13 @@ public:
      */
     Outcome Snapshot();
 
-    /// @brief 构造期加载是否成功（未启用快照恒为 true）。
-    bool healthy() const noexcept { return !m_degraded; }
+    /// @brief 加载是否成功（构造期或最近一次 `Reload()`；未启用快照恒为 true）。
+    bool healthy() const noexcept {
+        return !m_degraded.load(std::memory_order_acquire);
+    }
 
-    /// @brief 构造期加载失败的原因；成功时为空。
-    const std::string &load_error() const noexcept { return m_load_error; }
+    /// @brief 最近一次加载失败的原因；成功时为空（值拷贝，线程安全）。
+    std::string load_error() const;
 
     /// @brief 最近一次快照写入失败的原因；成功时为空。
     std::string persist_error() const;
@@ -324,6 +354,8 @@ private:
     Outcome PersistAfterWrite();
     /// @brief 序列化当前状态（fencing/租约表/选举 epoch）；调用方必须持有 `m_mutex`。
     std::string SerializeSnapshotLocked() const;
+    /// @brief 所有选举的任期之和，用于检测一次清扫是否触发 leader 换代。
+    std::uint64_t EpochSumLocked() const noexcept;
     /// @brief 删除一条租约并清理所有索引；调用方必须已持有 `m_mutex`。
     bool EraseLeaseLocked(LeaseId id, TimePoint now);
     /// @brief 按当前存活候选者重算 leader；leader 变化时递增任期。
@@ -344,8 +376,10 @@ private:
     mutable std::mutex m_snapshot_mutex;
     /// 自上次快照以来是否有影响单调性的变更。
     bool m_dirty{false};
-    /// 构造期快照加载失败（fail-stop）；true 时一切写操作返回 kUnavailable。
-    bool m_degraded{false};
+    /// 快照加载失败（fail-stop）；true 时一切写操作返回 kUnavailable。
+    /// 原子读：`healthy()` / `EnsureWritable()` 是无锁快路径；写只在构造与
+    /// `Reload()` 时发生，读多写少。
+    std::atomic<bool> m_degraded{false};
     std::string m_load_error;
     std::string m_persist_error;
     std::unordered_map<LeaseId, LeaseRecord> m_leases;
@@ -361,6 +395,10 @@ private:
     LeaseId m_next_lease{1};
     std::uint64_t m_sweeps{0};
     std::uint64_t m_expired_total{0};
+    /// 上次清扫落盘时刻；用于合并窗口（避免 10ms 一轮的全量写盘）。
+    TimePoint m_last_sweep_persist{};
+    /// 清扫删除了租约但尚未落盘；窗口到期或任一次成功快照后清除。
+    bool m_sweep_persist_pending{false};
 
     mutable std::mutex m_sweep_mutex;    std::condition_variable m_sweep_cv;
     std::thread m_sweeper;

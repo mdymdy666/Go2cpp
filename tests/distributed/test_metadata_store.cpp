@@ -394,6 +394,25 @@ void TestWatchGapNeedsReplay() {
     GO2CPP_CHECK(!store->Replay(id + 999, 0).ok());
 }
 
+/**
+ * @brief `Open` 的错误分类：权限/IO 失败必须是 kUnavailable，不是协议错误。
+ *
+ * 把 WAL 路径指向一个已存在的目录：`open(O_RDWR|O_CREAT)` 返回 EISDIR，
+ * 这是环境/权限问题，调用方应重试或换路径，而不是认定 WAL 内容损坏。
+ */
+void TestOpenErrorMapping() {
+    go2cpp_tests::announce("metadata_store.open_error_mapping");
+    const std::string dir = MakeTempDir("go2cpp_metadata_open_map");
+    MetadataStoreOptions options;
+    options.wal_path = dir;
+    const auto opened = MetadataStore::Open(options);
+    GO2CPP_CHECK(!opened.ok());
+    GO2CPP_CHECK(opened.status == go2cpp::distributed::Status::kUnavailable);
+
+    std::error_code error;
+    std::filesystem::remove_all(dir, error);
+}
+
 } // namespace
 
 int main() {
@@ -406,6 +425,7 @@ int main() {
     TestWalRestart();
     TestWalTruncatedTailRecovers();
     TestWalMiddleCorruptionRejected();
+    TestOpenErrorMapping();
     TestBackpressureNoDeadlock();
     TestWatchGapNeedsReplay();
 

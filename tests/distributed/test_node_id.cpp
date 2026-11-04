@@ -185,6 +185,25 @@ void TestOrdering() {
     GO2CPP_CHECK(NodeId{} == NodeId::FromParts(0, 0));
 }
 
+void TestParseCheckedDistinguishesZero() {
+    go2cpp_tests::announce("node_id.parse_checked");
+    // 合法文本但全 0：解析成功、身份无效（配置里的「未设置」哨兵）。
+    const auto zero = NodeId::ParseChecked(std::string(32, '0'));
+    GO2CPP_REQUIRE(zero.ok());
+    GO2CPP_CHECK(!zero.value.IsValid());
+    GO2CPP_CHECK(zero.value.ToString() == std::string(32, '0'));
+    // 非法文本：失败，与全 0 明确区分——调用方不能把拼错的 id 当成「未设置」。
+    const auto bad = NodeId::ParseChecked("not-a-node-id");
+    GO2CPP_CHECK(!bad.ok());
+    GO2CPP_CHECK(bad.status == go2cpp::distributed::Status::kInvalidArgument);
+    // 正常往返仍然有效。
+    const NodeId id = NodeId::Generate();
+    const auto good = NodeId::ParseChecked(id.ToString());
+    GO2CPP_REQUIRE(good.ok());
+    GO2CPP_CHECK(good.value == id);
+    GO2CPP_CHECK(good.value.IsValid());
+}
+
 } // namespace
 
 int main() {
@@ -195,6 +214,7 @@ int main() {
     TestInvalidInputRejected();
     TestParseByteBoundaries();
     TestOrdering();
+    TestParseCheckedDistinguishesZero();
 
     const int failures = go2cpp_tests::g_failures.load();
     if (failures != 0) {

@@ -92,6 +92,15 @@ NodeId NodeId::Generate() noexcept {
     return NodeId::FromParts(high, low);
 }
 
+Result<NodeId> NodeId::ParseChecked(std::string_view text) noexcept {
+    NodeId id;
+    if (!TryParse(text, &id)) {
+        // 消息用 SSO 短串：noexcept 路径上不引入分配失败点。
+        return Result<NodeId>::Failure(Status::kInvalidArgument, "bad node id");
+    }
+    return Result<NodeId>::Success(id);
+}
+
 NodeId NodeId::Parse(std::string_view text) noexcept {
     NodeId id;
     if (TryParse(text, &id)) {

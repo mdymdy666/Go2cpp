@@ -809,6 +809,10 @@ struct CoordinatorClient::Impl {
     CoordinatorClientOptions options;
 
     mutable std::mutex mutex;
+    /// 串行化整轮请求/响应 IO；**不保护状态**，所以 Close() 不必等它。
+    /// 同一 socket 上的两帧不能交错，但 IO 期间不持 `mutex`，Close() 才能
+    /// 拿到 `mutex` 并 close socket 取消挂起的 read/write。
+    std::mutex io_mutex;
     net::Socket::Ptr socket;
     bool closed{false};
 
@@ -859,6 +863,9 @@ struct CoordinatorClient::Impl {
     void Close() {
         std::lock_guard<std::mutex> lock(mutex);
         closed = true;
+        // `Call` 的 IO 不持 `mutex`：这里 close 会唤醒在途的 recv/send
+        // （Socket::close 内部 NotifyCloseAll 并等待 in-flight 归零），
+        // 因此挂起的 RPC 会立刻以 kUnavailable/kClosed 返回。
         CloseLocked();
     }
 
@@ -868,29 +875,47 @@ struct CoordinatorClient::Impl {
     }
 
     Response Call(Op op, const Writer &request) {
-        std::lock_guard<std::mutex> lock(mutex);
-        if (closed) {
-            return Response{Status::kClosed, "client closed", {}};
-        }
-        if (!ConnectLocked()) {
-            return Response{Status::kUnavailable, "connect failed", {}};
+        // step1: 整轮 IO 由 `io_mutex` 串行（同一 socket 不能交错两帧），
+        //        但状态锁只在取 socket 与提交失败结果时短暂持有。
+        std::lock_guard<std::mutex> io_lock(io_mutex);
+        net::Socket::Ptr active;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (closed) {
+                return Response{Status::kClosed, "client closed", {}};
+            }
+            if (!ConnectLocked()) {
+                return Response{Status::kUnavailable, "connect failed", {}};
+            }
+            active = socket;
         }
         std::vector<std::uint8_t> payload;
         payload.reserve(request.data().size() + 1);
         payload.push_back(static_cast<std::uint8_t>(op));
         payload.insert(payload.end(), request.data().begin(), request.data().end());
-        if (!WriteFrame(*socket, payload, options.io_timeout)) {
-            CloseLocked();
-            return Response{Status::kUnavailable, "write failed", {}};
+        // step2: IO 全程不持 `mutex`：挂起时 Close() 可 close socket 取消等待。
+        bool io_failed = false;
+        if (!WriteFrame(*active, payload, options.io_timeout)) {
+            io_failed = true;
         }
         std::vector<std::uint8_t> frame;
-        if (!ReadFrame(*socket, options.max_frame_bytes, frame, options.io_timeout)) {
-            CloseLocked();
-            return Response{Status::kUnavailable, "read failed or frame too large", {}};
+        if (!io_failed &&
+            !ReadFrame(*active, options.max_frame_bytes, frame, options.io_timeout)) {
+            io_failed = true;
+        }
+        if (io_failed) {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (socket == active) {
+                CloseLocked();
+            }
+            return Response{Status::kUnavailable, "io failed or client closed", {}};
         }
         Response response;
         if (!DecodeResponseHeader(frame, response)) {
-            CloseLocked();
+            std::lock_guard<std::mutex> lock(mutex);
+            if (socket == active) {
+                CloseLocked();
+            }
             return Response{Status::kProtocolError, "malformed response", {}};
         }
         return response;

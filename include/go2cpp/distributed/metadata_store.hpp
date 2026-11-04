@@ -340,6 +340,9 @@ class MetadataStore {
     std::uint64_t m_recovered_bytes{0};
     std::uint64_t m_truncated_bytes{0};
     std::string m_last_error;
+    /// 最近一次打开/恢复失败的分类：IO/权限 → kUnavailable，
+    /// WAL 内容损坏/超限 → kProtocolError。
+    Status m_last_status{Status::kOk};
 };
 
 } // namespace go2cpp::distributed

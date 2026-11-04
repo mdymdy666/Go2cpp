@@ -332,11 +332,18 @@ std::string Coordinator::persist_error() const {
 }
 
 Outcome Coordinator::EnsureWritable() const {
-    if (m_degraded) {
-        return Outcome::Failure(Status::kUnavailable,
-                                "coordinator degraded: " + m_load_error);
+    if (!m_degraded.load(std::memory_order_acquire)) {
+        return Outcome::Success();
     }
-    return Outcome::Success();
+    // 降级后错误消息需要锁保护（`Reload()` 会改写它）；这里已是冷路径。
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return Outcome::Failure(Status::kUnavailable,
+                            "coordinator degraded: " + m_load_error);
+}
+
+std::string Coordinator::load_error() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_load_error;
 }
 
 std::string Coordinator::SerializeSnapshotLocked() const {
@@ -416,6 +423,10 @@ Outcome Coordinator::Restore() {
     }
     m_next_lease = std::max(m_next_lease, parsed.max_lease_id + 1);
     m_dirty = false;
+    // 加载成功即恢复可用：降级只能在加载失败时成立，否则一次坏文件会让
+    // 协调者永久不可写，只能重启进程。
+    m_degraded.store(false, std::memory_order_release);
+    m_load_error.clear();
     return Outcome::Success();
 }
 
@@ -423,7 +434,8 @@ Outcome Coordinator::Snapshot() {
     if (m_options.snapshot_path.empty()) {
         return Outcome::Success();
     }
-    if (m_degraded) {
+    if (m_degraded.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lock(m_mutex);
         return Outcome::Failure(Status::kUnavailable,
                                 "coordinator degraded: " + m_load_error);
     }
@@ -453,7 +465,24 @@ Outcome Coordinator::Snapshot() {
     }
     std::lock_guard<std::mutex> lock(m_mutex);
     m_persist_error.clear();
+    // 本次快照已经包含清扫删除的结果，无需再单独提交一轮。
+    m_sweep_persist_pending = false;
     return Outcome::Success();
+}
+
+Outcome Coordinator::Reload() {
+    if (m_options.snapshot_path.empty()) {
+        return Outcome::Success();
+    }
+    const Outcome restored = Restore();
+    if (restored.ok()) {
+        return restored;
+    }
+    // 重新加载失败：保持 fail-stop，不把旧内存状态当作可用。
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_degraded.store(true, std::memory_order_release);
+    m_load_error = restored.message;
+    return restored;
 }
 
 Outcome Coordinator::PersistAfterWrite() {

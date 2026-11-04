@@ -267,6 +267,61 @@ void TestMalformedFrameDoesNotKillServer() {
     server.Stop();
 }
 
+/**
+ * @brief `Close()` 必须能中断挂起的 RPC：一个只 accept、永不回包的 server
+ *        会让客户端卡在 `ReadFrame`，旧实现持客户端锁做 IO，Close 只能干等
+ *        io_timeout。
+ */
+void TestCloseInterruptsHangingCall() {
+    go2cpp_tests::announce("transport.close_interrupts_call");
+    auto listener = go2cpp::net::ListenTCP("127.0.0.1", 0, 16);
+    GO2CPP_REQUIRE(listener != nullptr);
+    std::uint16_t port = 0;
+    if (const auto ipv4 =
+            std::dynamic_pointer_cast<go2cpp::net::IPv4Address>(listener->local_address())) {
+        port = ipv4->port();
+    } else if (const auto ipv6 =
+                   std::dynamic_pointer_cast<go2cpp::net::IPv6Address>(
+                       listener->local_address())) {
+        port = ipv6->port();
+    }
+    GO2CPP_REQUIRE(port != 0);
+
+    std::atomic<bool> stop{false};
+    std::thread acceptor([&] {
+        auto connection = listener->accept(2000ms);
+        while (connection && !stop.load(std::memory_order_acquire)) {
+            std::this_thread::sleep_for(5ms);
+        }
+    });
+
+    CoordinatorClientOptions options;
+    options.io_timeout = 5000ms;  // 没有 Close 中断时，caller 要卡满 5 秒。
+    CoordinatorClient client("127.0.0.1", port, options);
+    GO2CPP_REQUIRE(client.Connect().ok());
+
+    std::atomic<int> caller_status{999};
+    std::thread caller([&] {
+        const auto acquired = client.AcquireLock("hanging", "node", 500ms);
+        caller_status.store(static_cast<int>(acquired.status));
+    });
+    SleepMs(100);  // 让 caller 进入 ReadFrame。
+
+    const auto close_start = std::chrono::steady_clock::now();
+    client.Close();
+    caller.join();
+    const auto elapsed = std::chrono::steady_clock::now() - close_start;
+    GO2CPP_CHECK(elapsed < 1500ms);
+    const int status = caller_status.load();
+    GO2CPP_CHECK(status == static_cast<int>(Status::kUnavailable) ||
+                 status == static_cast<int>(Status::kClosed));
+    GO2CPP_CHECK(!client.connected());
+
+    stop.store(true, std::memory_order_release);
+    listener->close();
+    acceptor.join();
+}
+
 } // namespace
 
 int main() {
@@ -277,6 +332,7 @@ int main() {
     TestLargeLookup();
     TestConcurrentClients();
     TestMalformedFrameDoesNotKillServer();
+    TestCloseInterruptsHangingCall();
 
     const int failures = go2cpp_tests::g_failures.load();
     if (failures != 0) {

@@ -273,6 +273,120 @@ void TestWriteFailureKeepsPreviousSnapshot() {
     GO2CPP_CHECK(next > token);
 }
 
+
+/**
+ * @brief 落盘失败时必须回滚内存授予（不能「报错却占着锁」）。
+ *
+ * 旧实现先授予锁再落盘：写盘失败返回 `kUnavailable`，但锁仍在内存里，
+ * 调用方重试会拿到 `kConflict`——被自己挡一个 TTL。这里把 tmp 路径变成
+ * 目录，让 `open(tmp, O_CREAT)` 稳定失败（EISDIR），不需要制造磁盘满。
+ */
+void TestAcquireLockRollbackOnPersistFailure() {
+    go2cpp_tests::announce("coordinator_snapshot.acquire_rollback");
+    const std::string dir = MakeTempDir("go2cpp_coord_rollback");
+    const std::string path = dir + "/coordinator.snapshot";
+    Coordinator coordinator(MakeOptions(path));
+    std::error_code ignored;
+    GO2CPP_CHECK(std::filesystem::create_directory(path + ".tmp", ignored));
+
+    const auto failed = coordinator.AcquireLock("lock/rollback", "node-a", Duration(60000));
+    GO2CPP_CHECK(!failed.ok());
+    GO2CPP_CHECK(failed.status == Status::kUnavailable);
+    // 关键断言：内存里不能留下这把锁。
+    GO2CPP_CHECK(!coordinator.QueryLock("lock/rollback").has_value());
+
+    // 重试仍然落盘失败（kUnavailable），但不能是被自己挡住的 kConflict。
+    const auto retry = coordinator.AcquireLock("lock/rollback", "node-b", Duration(60000));
+    GO2CPP_CHECK(retry.status == Status::kUnavailable);
+    GO2CPP_CHECK(!coordinator.QueryLock("lock/rollback").has_value());
+
+    // 修复落盘路径后重新抢锁：必须成功，token 跳过两次被回滚的授予（单调）。
+    GO2CPP_CHECK(std::filesystem::remove(path + ".tmp", ignored));
+    const auto recovered = coordinator.AcquireLock("lock/rollback", "node-c", Duration(60000));
+    GO2CPP_REQUIRE(recovered.ok());
+    GO2CPP_CHECK(recovered.value.fencing >= 3);
+    GO2CPP_CHECK(coordinator.QueryLock("lock/rollback")->owner == "node-c");
+
+    std::filesystem::remove_all(dir, ignored);
+}
+
+/**
+ * @brief `Reload()` 是坏快照修复后的恢复路径：成功必须清除降级并恢复写。
+ */
+void TestReloadClearsDegraded() {
+    go2cpp_tests::announce("coordinator_snapshot.reload_recovers");
+    const std::string dir = MakeTempDir("go2cpp_coord_reload");
+    const std::string path = dir + "/coordinator.snapshot";
+    const std::string backup = dir + "/backup.snapshot";
+    std::uint64_t token = 0;
+    {
+        Coordinator coordinator(MakeOptions(path));
+        token = AcquireToken(coordinator, "lock/reload", "node-a");
+        GO2CPP_CHECK(token == 1);
+    }
+    std::error_code error;
+    std::filesystem::copy_file(path, backup, std::filesystem::copy_options::overwrite_existing,
+                               error);
+    GO2CPP_CHECK(!error);
+    std::filesystem::resize_file(path, std::filesystem::file_size(path) / 2, error);
+    GO2CPP_CHECK(!error);
+
+    Coordinator degraded(MakeOptions(path));
+    GO2CPP_CHECK(!degraded.healthy());
+    GO2CPP_CHECK(!degraded.load_error().empty());
+    GO2CPP_CHECK(degraded.AcquireLock("lock/reload", "node-b", Duration(60000)).status ==
+                 Status::kUnavailable);
+
+    // 运维修复文件后 Reload：解除降级、写操作恢复可用，且 fencing 不回退。
+    std::filesystem::copy_file(backup, path, std::filesystem::copy_options::overwrite_existing,
+                               error);
+    GO2CPP_CHECK(!error);
+    GO2CPP_CHECK(degraded.Reload().ok());
+    GO2CPP_CHECK(degraded.healthy());
+    GO2CPP_CHECK(degraded.load_error().empty());
+    const std::uint64_t next = AcquireToken(degraded, "lock/reload", "node-c");
+    GO2CPP_CHECK(next > token);
+    // 幂等：再次 Reload 仍然成功，不是一次性开关。
+    GO2CPP_CHECK(degraded.Reload().ok());
+    GO2CPP_CHECK(degraded.healthy());
+
+    std::filesystem::remove_all(dir, error);
+}
+
+/**
+ * @brief 清扫删除租约必须合并落盘，而不是每轮（10ms）全量写盘。
+ *
+ * 把 `sweep_persist_interval` 设成 1 小时：窗口内无论删多少租约都不应写盘，
+ * 文件 mtime 保持不变；显式 `Snapshot()` 才把累积删除一次提交。
+ */
+void TestSweepPersistCoalescing() {
+    go2cpp_tests::announce("coordinator_snapshot.sweep_persist_coalesced");
+    const std::string dir = MakeTempDir("go2cpp_coord_sweep_batch");
+    const std::string path = dir + "/coordinator.snapshot";
+    CoordinatorOptions options = MakeOptions(path);
+    options.sweep_persist_interval = Duration(3600000);
+    Coordinator coordinator(options);
+    for (int index = 0; index < 3; ++index) {
+        GO2CPP_REQUIRE(coordinator
+                           .AcquireLock("lock/sweep-" + std::to_string(index), "node",
+                                        Duration(10))
+                           .ok());
+    }
+    const auto mtime_before = std::filesystem::last_write_time(path);
+    ::usleep(40000);
+    GO2CPP_CHECK(coordinator.SweepExpired() == 3);
+    // 窗口内不写盘：这是「批量」的直接证据。
+    GO2CPP_CHECK(std::filesystem::last_write_time(path) == mtime_before);
+    GO2CPP_CHECK(coordinator.SweepExpired() == 0);
+    GO2CPP_CHECK(std::filesystem::last_write_time(path) == mtime_before);
+    // 显式快照把累积删除一次提交（并清空 pending）。
+    GO2CPP_CHECK(coordinator.Snapshot().ok());
+    GO2CPP_CHECK(std::filesystem::last_write_time(path) != mtime_before);
+
+    std::error_code error;
+    std::filesystem::remove_all(dir, error);
+}
+
 /**
  * @brief 超过恢复侧上限（64 MiB）的快照文件必须被拒绝启动，而不是 OOM/截断。
  */
@@ -307,6 +421,9 @@ int main() {
     TestCorruptedCrcRejected();
     TestLeftoverTempFileIgnored();
     TestWriteFailureKeepsPreviousSnapshot();
+    TestAcquireLockRollbackOnPersistFailure();
+    TestReloadClearsDegraded();
+    TestSweepPersistCoalescing();
     TestOversizedSnapshotRejected();
 
     const int failures = go2cpp_tests::g_failures.load();

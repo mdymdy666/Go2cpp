@@ -131,8 +131,13 @@ Result<std::unique_ptr<MetadataStore>> MetadataStore::Open(
     }
     // step1: WAL 打开 + 恢复（内存模式跳过）。
     if (!store->OpenWal()) {
-        return Result<std::unique_ptr<MetadataStore>>::Failure(
-            Status::kProtocolError, store->m_last_error);
+        // 权限/IO 失败是「暂时不可用」，不能报成协议错误（调用方会误以为
+        // 数据损坏而放弃重试）；只有 WAL 内容异常才是 kProtocolError。
+        const Status status = store->m_last_status == Status::kOk
+                                  ? Status::kProtocolError
+                                  : store->m_last_status;
+        return Result<std::unique_ptr<MetadataStore>>::Failure(status,
+                                                              store->m_last_error);
     }
     // step2: 异步派发线程（同步模式在写线程内直接回调，不需要线程）。
     if (!store->m_options.sync_callbacks) {
@@ -168,6 +173,7 @@ MetadataStore::~MetadataStore() {
 bool MetadataStore::persistent() const noexcept { return m_wal_fd >= 0; }
 
 bool MetadataStore::OpenWal() {
+    m_last_status = Status::kOk;
     if (m_options.wal_path.empty()) {
         return true;
     }
@@ -175,12 +181,20 @@ bool MetadataStore::OpenWal() {
     m_wal_fd = ::open(m_options.wal_path.c_str(), O_RDWR | O_CREAT | O_APPEND, 0644);
     if (m_wal_fd < 0) {
         m_last_error = DescribeErrno("open wal");
+        m_last_status = Status::kUnavailable;
         return false;
     }
     // step2: 全量读入（WAL 只装元数据，256MiB 上限防御异常文件）。
     const off_t size = ::lseek(m_wal_fd, 0, SEEK_END);
-    if (size < 0 || static_cast<std::uint64_t>(size) > kMaxWalBytes) {
+    if (size < 0) {
+        m_last_error = DescribeErrno("lseek wal");
+        m_last_status = Status::kUnavailable;
+        CloseWal();
+        return false;
+    }
+    if (static_cast<std::uint64_t>(size) > kMaxWalBytes) {
         m_last_error = "wal size out of range";
+        m_last_status = Status::kProtocolError;
         CloseWal();
         return false;
     }
@@ -195,6 +209,7 @@ bool MetadataStore::OpenWal() {
                     continue;
                 }
                 m_last_error = DescribeErrno("pread wal");
+                m_last_status = Status::kUnavailable;
                 CloseWal();
                 return false;
             }
@@ -270,6 +285,7 @@ bool MetadataStore::OpenWal() {
     }
     m_recovered_bytes = valid_end;
     if (damaged) {
+        m_last_status = Status::kProtocolError;
         CloseWal();
         return false;
     }
@@ -278,6 +294,7 @@ bool MetadataStore::OpenWal() {
         m_truncated_bytes = content.size() - valid_end;
         if (::ftruncate(m_wal_fd, static_cast<off_t>(valid_end)) != 0) {
             m_last_error = DescribeErrno("ftruncate wal");
+            m_last_status = Status::kUnavailable;
             CloseWal();
             return false;
         }
