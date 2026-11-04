@@ -16,7 +16,9 @@
 2. **阻塞式写法 + 非阻塞底层**：`io::IOManager`（Linux epoll）+ `net::hook`
    （拦截 `recv`/`send`/`connect`/`sleep`，EAGAIN 时让出 Fiber）；
 3. **应用层协议**：TCP 分帧、HTTP/1.1（消息/解析器/客户端/服务端/路由/静态文件）、
-   WebSocket（RFC 6455）、SSE、以及 HTTP/2 h2c 与 QUIC 的互通示例。
+   WebSocket（RFC 6455）、SSE、以及 HTTP/2 h2c 与 QUIC 的互通示例；
+4. **故障语义**：超时 / 连接复位 / 部分写都有明确错误码，并给出「默认行为 +
+   可选处理策略」的可运行示例（见下文「异常处理示例」）。
 
 ## 底层架构
 
@@ -117,6 +119,30 @@ task->wait_for(3s);
 - **现象**：内存暴涨几个 GB 后 OOM。
 - **原因**：长度前缀模式直接信任对端给的帧长，恶意/损坏长度会触发巨额分配。
 - **处理**：先校验 `len <= max_frame` 再等数据；超限立即断开并记日志。
+
+## 异常处理示例（默认行为 + 可选策略）
+
+三个可编译、可运行的故障注入示例，覆盖「HTTP 超时 / 连接复位 / 大 body 部分写」。
+每个示例先演示**不写兜底代码时的默认行为**，再给出 3 种可选策略与选择依据。
+
+| 场景 | 默认行为（源码位置） | 可选策略 | 示例 |
+| --- | --- | --- | --- |
+| 服务端 3s 不回，HTTP 请求超时 | `Socket::recv` 超时返回 `ETIMEDOUT`（`src/network/socket.cpp:887`），HTTP 层映射 `Result::Error::Timeout`（`src/network/http.cpp:728`） | ① 指数退避重试 ② 返回陈旧缓存 ③ 抛业务异常快速失败 | [`01-timeout.cpp:1`](01-timeout.cpp#L1) |
+| 服务端 kill -9 / 对端 RST | `ECONNRESET`/`EPIPE` 统一映射 `Result::Error::Closed`（`src/network/http.cpp:733`） | ① 重连 + 退避 ② 结构化上报 ③ 带 `Idempotency-Key` 幂等重发 | [`02-connection-reset.cpp:1`](02-connection-reset.cpp#L1) |
+| 4 MiB body 只发出一部分 | 单次 `Socket::send` 部分成功仍 `ok()==true`（`src/network/socket.cpp:857`）；库**没有** `SendAll` | ① `send_all` 循环 ② 分片 + checkpoint 续传 ③ 放弃并清理 | [`03-partial-write.cpp:1`](03-partial-write.cpp#L1) |
+
+在仓库根目录编译运行（只依赖 `libgo2cpp_network`）：
+
+```sh
+g++ -std=c++17 -O2 -pthread -Iinclude user/modules/network/01-timeout.cpp \
+    -o /tmp/01-timeout -Lbuild-stack-unify -lgo2cpp_network \
+    -Wl,-rpath,$PWD/build-stack-unify
+/tmp/01-timeout    # 退出码 0 = 全部断言通过
+```
+
+`02`、`03` 同理替换文件名；策略选择建议写在各自文件头注释里。
+这三个示例用 `g++` 直接编译（自带 mock 服务端），不注册 ctest。
+错误码与协议状态机细节见 [网络深入文档](../../deep/02-network.md)。
 
 ## 示例清单
 

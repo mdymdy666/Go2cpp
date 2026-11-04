@@ -3,9 +3,9 @@
  * @brief 真实异常场景三：大 body 只发出去一半（send 部分成功），默认语义与 3 种可选策略。
  *
  * ## 场景
- * 客户端上传 4 MiB 的 body。服务端把 `SO_RCVBUF` 压到 4 KiB，先只读 1 KiB
- * 就暂停读取 120ms。此时客户端内核发送缓冲很快写满，`send` 只提交了一部分
- * 字节就返回——**这不是错误，而是 TCP 流式语义的正常现象**。
+ * 客户端上传 4 MiB 的 body，socket 的发送/接收缓冲只有 64 KiB。一次
+ * `Socket::send` 只能提交其中一小部分字节就返回——**这不是错误，而是 TCP
+ * 流式语义的正常现象**。策略 ③ 另外模拟服务端读取到一半就停读 3 秒。
  *
  * ## 默认行为（危险点）
  * - 库**没有** `SendAll`；唯一的发送接口是单次 `Socket::send`。它把
@@ -129,16 +129,27 @@ private:
     Handler m_handler;
 };
 
-/** @brief 慢服务端：先收 1 KiB，停读 120ms，再持续读，直到客户端关闭。 */
-void slow_reader(int fd) {
-    int receive_buffer = 4096;
+/** @brief 正常服务端：持续读，直到客户端关闭。 */
+void fast_reader(int fd) {
+    int receive_buffer = 65536;
     ::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &receive_buffer, sizeof receive_buffer);
     char buffer[65536];
-    (void)::recv(fd, buffer, 1024, 0);       // 只先读 1 KiB。
-    std::this_thread::sleep_for(120ms);      // 制造发送缓冲耗尽窗口。
     for (;;) {
         const ssize_t count = ::recv(fd, buffer, sizeof buffer, 0);
-        if (count <= 0) return;              // 客户端关闭或出错。
+        if (count <= 0) return;
+    }
+}
+
+/** @brief 故障服务端：只读 1 KiB 就停读 3s，用于演示发送超时后的放弃清理。 */
+void stalled_reader(int fd) {
+    int receive_buffer = 65536;
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &receive_buffer, sizeof receive_buffer);
+    char buffer[65536];
+    (void)::recv(fd, buffer, 1024, 0);
+    std::this_thread::sleep_for(3s);
+    for (;;) {
+        const ssize_t count = ::recv(fd, buffer, sizeof buffer, 0);
+        if (count <= 0) return;
     }
 }
 
@@ -147,7 +158,7 @@ Socket::Ptr connect_to(std::uint16_t port) {
     if (!socket) return nullptr;
     auto address = Address::LookupAny("127.0.0.1:" + std::to_string(port));
     if (!address || !socket->connect(*address, 1000ms)) return nullptr;
-    int send_buffer = 4096;  // 小发送缓冲，放大部分写的概率与可观测性。
+    int send_buffer = 65536;  // 远小于 4 MiB body，保证单次 send 必然部分写。
     ::setsockopt(socket->fd(), SOL_SOCKET, SO_SNDBUF, &send_buffer, sizeof send_buffer);
     return socket;
 }
@@ -225,7 +236,7 @@ ChunkedOutcome send_chunked(Socket& socket, const char* data, std::size_t size,
 // 默认行为：单次 send 部分成功，但 ok() == true（危险点）
 // ---------------------------------------------------------------------------
 void demo_default_partial() {
-    MockServer server([](int fd, int) { slow_reader(fd); });
+    MockServer server([](int fd, int) { fast_reader(fd); });
     auto socket = connect_to(server.port());
     if (!socket) {
         check("默认行为：连接 mock 服务端", false, "connect failed");
@@ -248,7 +259,7 @@ void demo_default_partial() {
 // 策略 ①：SendAll 循环
 // ---------------------------------------------------------------------------
 void demo_send_all() {
-    MockServer server([](int fd, int) { slow_reader(fd); });
+    MockServer server([](int fd, int) { fast_reader(fd); });
     auto socket = connect_to(server.port());
     if (!socket) {
         check("策略① SendAll：连接 mock 服务端", false, "connect failed");
@@ -270,7 +281,7 @@ void demo_send_all() {
 // 策略 ②：分片重发（checkpoint）
 // ---------------------------------------------------------------------------
 void demo_chunked() {
-    MockServer server([](int fd, int) { slow_reader(fd); });
+    MockServer server([](int fd, int) { fast_reader(fd); });
     auto socket = connect_to(server.port());
     if (!socket) {
         check("策略② 分片重发：连接 mock 服务端", false, "connect failed");
@@ -296,7 +307,7 @@ void demo_chunked() {
 // 策略 ③：放弃并清理
 // ---------------------------------------------------------------------------
 void demo_abort_and_cleanup() {
-    MockServer server([](int fd, int) { slow_reader(fd); });
+    MockServer server([](int fd, int) { stalled_reader(fd); });
     auto socket = connect_to(server.port());
     if (!socket) {
         check("策略③ 放弃并清理：连接 mock 服务端", false, "connect failed");
@@ -304,8 +315,8 @@ void demo_abort_and_cleanup() {
     }
     std::vector<char> body(4 * 1024 * 1024, 'x');
 
-    std::printf("\n[策略③ 放弃并清理] 50ms 预算，服务端停读 120ms\n");
-    const auto outcome = send_all(*socket, body.data(), body.size(), 50ms, 64 * 1024);
+    std::printf("\n[策略③ 放弃并清理] 200ms 预算，服务端停读 3s\n");
+    const auto outcome = send_all(*socket, body.data(), body.size(), 200ms, 64 * 1024);
     std::printf("  complete=%d sent=%zu error=%d\n", static_cast<int>(outcome.complete),
                 outcome.sent, outcome.error);
     const bool aborted = !outcome.complete && outcome.sent > 0 && outcome.error == ETIMEDOUT;
