@@ -1488,6 +1488,179 @@ std::size_t Poly1305BlocksIfma(std::uint64_t h[3], const std::uint64_t r[3],
     return offset;
 }
 
+/// @brief 取 rp[base .. base+7] 的第 limb 拼成 8 lane 常量（lane k = rp[base+7-k]·scale）。
+/// @param rp [in] r^0..r^16 的 radix-2^44 表示；不可为 nullptr
+/// @param base [in] 起始下标（0 或 8），base+7 ≤ 16
+/// @param limb [in] 0..2
+/// @param scale [in] 1 或 20（跨 limb 折回）；20·rp < 2^49，落在 IFMA 的 52 位操作数内
+/// @return 8 lane 向量，lane k 乘 rp[base+7-k]·scale
+BENTO_CRYPTO_TARGET_AVX512IFMA
+inline __m512i Poly1305IfmaLanes(const std::uint64_t rp[17][3], int base, int limb,
+                                 std::uint64_t scale) noexcept {
+    return _mm512_setr_epi64(
+        static_cast<long long>(rp[base + 7][limb] * scale),
+        static_cast<long long>(rp[base + 6][limb] * scale),
+        static_cast<long long>(rp[base + 5][limb] * scale),
+        static_cast<long long>(rp[base + 4][limb] * scale),
+        static_cast<long long>(rp[base + 3][limb] * scale),
+        static_cast<long long>(rp[base + 2][limb] * scale),
+        static_cast<long long>(rp[base + 1][limb] * scale),
+        static_cast<long long>(rp[base + 0][limb] * scale));
+}
+
+/// @brief 16 路（每批 16×16B = 256B）Poly1305 吸收（AVX-512 IFMA，两批共享一次归并）。
+/// @param h [in,out] radix-2^44 的 3 limb 累积值；成功批次后推进
+/// @param r [in] radix-2^44 的 3 limb 密钥（Poly1305Init 已 clamp）；不可为 nullptr
+/// @param data [in] 连续 16B 块；不可为 nullptr
+/// @param bytes [in] 可用字节数（不足 16 块时本函数不消费）
+/// @return 已消费字节数，恒为 256 的整数倍；调用方须用 8 路/4 路/标量处理剩余字节
+/// @details lane k 在批 A 处理块 k（权重 r^16..r^9）、批 B 处理块 k+8（权重
+///          r^8..r^1），两批的 36 条 madd 累加到**同一组** 6 个累加器，于是跨 lane
+///          归并从每 8 块 6 次降到每 16 块 6 次。lane 内上界：lo 每 lane
+///          < 6·2^52 = 2^54.6，8 lane 和 < 2^58；hi 每 lane < 6·2^42 = 2^44.6，
+///          8 lane 和 < 2^48，都远小于 2^64。累积值 h 只在批 A 的 lane 0 注入。
+///
+/// ## 定位
+/// 唯一的 IFMA 16 路入口；错了会算出错误 MAC（静默认证失败）。
+///
+/// ## 步骤
+/// step1. 预算 r^1..r^16（标量 radix-2^44），拼 10 个 lane 常量。
+/// step2. 批 A：转置 8×2 的 lo/hi，提取 3 个 limb，lane 0 注入 h。
+/// step3. 批 A 的 18 条 madd，按轮次交错以遮住 4-5 拍累加延迟。
+/// step4. 批 B：同样提取后 18 条 madd 累加到同一组累加器（不含 h）。
+/// step5. 每 16 块一次 6 次跨 lane 求和 + 3 段进位链，推进 h。
+///
+/// ## 并发/失败语义
+/// 无可变全局态；h 只在本函数返回后可见；noexcept，无异常路径。
+BENTO_CRYPTO_TARGET_AVX512IFMA
+std::size_t Poly1305BlocksIfma16(std::uint64_t h[3], const std::uint64_t r[3],
+                                 const std::uint8_t* data, std::size_t bytes) noexcept {
+    constexpr std::size_t kBlocksPerBatch = 16;
+    const std::size_t batches = bytes / (kBlocksPerBatch * 16);
+    if (batches == 0) {
+        return 0;
+    }
+    // step1: r^1..r^16（radix 2^44 标量乘，每调用一次，摊到每 256B 不足 1 条）。
+    std::uint64_t rp[17][3];
+    rp[0][0] = r[0];
+    rp[0][1] = r[1];
+    rp[0][2] = r[2];
+    for (std::size_t k = 1; k <= kBlocksPerBatch; ++k) {
+        Poly1305Mul44(rp[k - 1], r, rp[k]);
+    }
+    const __m512i rv0a = Poly1305IfmaLanes(rp, 8, 0, 1);
+    const __m512i rv1a = Poly1305IfmaLanes(rp, 8, 1, 1);
+    const __m512i rv2a = Poly1305IfmaLanes(rp, 8, 2, 1);
+    const __m512i sv1a = Poly1305IfmaLanes(rp, 8, 1, 20);
+    const __m512i sv2a = Poly1305IfmaLanes(rp, 8, 2, 20);
+    const __m512i rv0b = Poly1305IfmaLanes(rp, 0, 0, 1);
+    const __m512i rv1b = Poly1305IfmaLanes(rp, 0, 1, 1);
+    const __m512i rv2b = Poly1305IfmaLanes(rp, 0, 2, 1);
+    const __m512i sv1b = Poly1305IfmaLanes(rp, 0, 1, 20);
+    const __m512i sv2b = Poly1305IfmaLanes(rp, 0, 2, 20);
+    const __m512i mask44 = _mm512_set1_epi64(static_cast<long long>(kPoly1305Mask44));
+    const __m512i hibit = _mm512_set1_epi64(static_cast<long long>(kPoly1305Hibit));
+    const __m512i order_lo = _mm512_setr_epi64(0, 2, 4, 6, 8, 10, 12, 14);
+    const __m512i order_hi = _mm512_setr_epi64(1, 3, 5, 7, 9, 11, 13, 15);
+    const __m512i zero = _mm512_setzero_si512();
+    std::uint64_t acc0 = h[0];
+    std::uint64_t acc1 = h[1];
+    std::uint64_t acc2 = h[2];
+    std::size_t offset = 0;
+    for (std::size_t batch = 0; batch < batches; ++batch) {
+        // step2: 批 A 的 8 块——转置成 lane 主序并提取 3 个 44/44/42 位 limb，
+        //        lane 0 额外带累积值 h（其余 lane 为 0），使 lane 0 成为 (h+m0)·r^16。
+        const __m512i za0 = _mm512_loadu_si512(data + offset);
+        const __m512i za1 = _mm512_loadu_si512(data + offset + 64);
+        const __m512i la = _mm512_permutex2var_epi64(za0, order_lo, za1);
+        const __m512i ha = _mm512_permutex2var_epi64(za0, order_hi, za1);
+        const __m512i ca0 = _mm512_add_epi64(
+            _mm512_and_si512(la, mask44),
+            _mm512_maskz_set1_epi64(0x01, static_cast<long long>(acc0)));
+        const __m512i ca1 = _mm512_add_epi64(
+            _mm512_and_si512(
+                _mm512_or_si512(_mm512_srli_epi64(la, 44), _mm512_slli_epi64(ha, 20)),
+                mask44),
+            _mm512_maskz_set1_epi64(0x01, static_cast<long long>(acc1)));
+        const __m512i ca2 = _mm512_add_epi64(
+            _mm512_or_si512(_mm512_srli_epi64(ha, 24), hibit),
+            _mm512_maskz_set1_epi64(0x01, static_cast<long long>(acc2)));
+        // step3: 批 A 的 18 条 madd（lane k 权重 r^(16-k)）；同累加器的相邻两条
+        //        之间隔 6 条指令，4-5 拍延迟被其余 5 个累加器遮住。
+        __m512i lo0 = _mm512_madd52lo_epu64(zero, ca0, rv0a);
+        __m512i lo1 = _mm512_madd52lo_epu64(zero, ca0, rv1a);
+        __m512i lo2 = _mm512_madd52lo_epu64(zero, ca0, rv2a);
+        __m512i hi0 = _mm512_madd52hi_epu64(zero, ca0, rv0a);
+        __m512i hi1 = _mm512_madd52hi_epu64(zero, ca0, rv1a);
+        __m512i hi2 = _mm512_madd52hi_epu64(zero, ca0, rv2a);
+        lo0 = _mm512_madd52lo_epu64(lo0, ca1, sv2a);
+        lo1 = _mm512_madd52lo_epu64(lo1, ca1, rv0a);
+        lo2 = _mm512_madd52lo_epu64(lo2, ca1, rv1a);
+        hi0 = _mm512_madd52hi_epu64(hi0, ca1, sv2a);
+        hi1 = _mm512_madd52hi_epu64(hi1, ca1, rv0a);
+        hi2 = _mm512_madd52hi_epu64(hi2, ca1, rv1a);
+        lo0 = _mm512_madd52lo_epu64(lo0, ca2, sv1a);
+        lo1 = _mm512_madd52lo_epu64(lo1, ca2, sv2a);
+        lo2 = _mm512_madd52lo_epu64(lo2, ca2, rv0a);
+        hi0 = _mm512_madd52hi_epu64(hi0, ca2, sv1a);
+        hi1 = _mm512_madd52hi_epu64(hi1, ca2, sv2a);
+        hi2 = _mm512_madd52hi_epu64(hi2, ca2, rv0a);
+        // step4: 批 B 的 8 块（偏移 +128B），18 条 madd 累加到**同一组**累加器，
+        //        lane k 权重 r^(8-k)。批 B 不含累积值 h——h 已在批 A 的 lane 0 里。
+        const __m512i zb0 = _mm512_loadu_si512(data + offset + 128);
+        const __m512i zb1 = _mm512_loadu_si512(data + offset + 192);
+        const __m512i lb = _mm512_permutex2var_epi64(zb0, order_lo, zb1);
+        const __m512i hb = _mm512_permutex2var_epi64(zb0, order_hi, zb1);
+        const __m512i cb0 = _mm512_and_si512(lb, mask44);
+        const __m512i cb1 = _mm512_and_si512(
+            _mm512_or_si512(_mm512_srli_epi64(lb, 44), _mm512_slli_epi64(hb, 20)), mask44);
+        const __m512i cb2 = _mm512_or_si512(_mm512_srli_epi64(hb, 24), hibit);
+        lo0 = _mm512_madd52lo_epu64(lo0, cb0, rv0b);
+        lo1 = _mm512_madd52lo_epu64(lo1, cb0, rv1b);
+        lo2 = _mm512_madd52lo_epu64(lo2, cb0, rv2b);
+        hi0 = _mm512_madd52hi_epu64(hi0, cb0, rv0b);
+        hi1 = _mm512_madd52hi_epu64(hi1, cb0, rv1b);
+        hi2 = _mm512_madd52hi_epu64(hi2, cb0, rv2b);
+        lo0 = _mm512_madd52lo_epu64(lo0, cb1, sv2b);
+        lo1 = _mm512_madd52lo_epu64(lo1, cb1, rv0b);
+        lo2 = _mm512_madd52lo_epu64(lo2, cb1, rv1b);
+        hi0 = _mm512_madd52hi_epu64(hi0, cb1, sv2b);
+        hi1 = _mm512_madd52hi_epu64(hi1, cb1, rv0b);
+        hi2 = _mm512_madd52hi_epu64(hi2, cb1, rv1b);
+        lo0 = _mm512_madd52lo_epu64(lo0, cb2, sv1b);
+        lo1 = _mm512_madd52lo_epu64(lo1, cb2, sv2b);
+        lo2 = _mm512_madd52lo_epu64(lo2, cb2, rv0b);
+        hi0 = _mm512_madd52hi_epu64(hi0, cb2, sv1b);
+        hi1 = _mm512_madd52hi_epu64(hi1, cb2, sv2b);
+        hi2 = _mm512_madd52hi_epu64(hi2, cb2, rv0b);
+        // step5: 每 16 块一次跨 lane 归并（6 次 64 位水平求和）+ 3 段进位链；
+        //        d = lo + (hi << 52)，所以 d >> 44 = (lo >> 44) + (hi << 8)。
+        const std::uint64_t s_lo0 = Poly1305Sum8x64Ifma(lo0);
+        const std::uint64_t s_hi0 = Poly1305Sum8x64Ifma(hi0);
+        const std::uint64_t s_lo1 = Poly1305Sum8x64Ifma(lo1);
+        const std::uint64_t s_hi1 = Poly1305Sum8x64Ifma(hi1);
+        const std::uint64_t s_lo2 = Poly1305Sum8x64Ifma(lo2);
+        const std::uint64_t s_hi2 = Poly1305Sum8x64Ifma(hi2);
+        acc0 = s_lo0 & kPoly1305Mask44;
+        std::uint64_t carry = (s_lo0 >> 44) + (s_hi0 << 8);
+        const std::uint64_t v1 = s_lo1 + carry;
+        acc1 = v1 & kPoly1305Mask44;
+        carry = (v1 >> 44) + (s_hi1 << 8);
+        const std::uint64_t v2 = s_lo2 + carry;
+        acc2 = v2 & kPoly1305Mask42;
+        carry = (v2 >> 42) + (s_hi2 << 10);
+        acc0 += carry * 5U;
+        carry = acc0 >> 44;
+        acc0 &= kPoly1305Mask44;
+        acc1 += carry;
+        offset += kBlocksPerBatch * 16;
+    }
+    h[0] = acc0;
+    h[1] = acc1;
+    h[2] = acc2;
+    return offset;
+}
+
 /// @brief 多路 Poly1305 的统一入口：按运行期后端选 IFMA 8 路 / AVX-512 8 路 /
 ///        AVX2 4 路 / 标量。
 /// @param h [in,out] radix-2^44 的 3 limb 累积值；被消费的批次推进
@@ -1507,7 +1680,12 @@ std::size_t Poly1305BlocksSimd(std::uint64_t h[3], const std::uint64_t r[3],
     }
     std::size_t consumed = 0;
     if (backend == SimdBackend::kAvx512Ifma) {
-        consumed += Poly1305BlocksIfma(h, r, data, bytes);
+        // 16 路（256B/批）两批共享一次跨 lane 归并；剩余 128B 交给 8 路，
+        // 再剩 64B 由下面的 4 路收尾。
+        consumed += Poly1305BlocksIfma16(h, r, data, bytes);
+        if (bytes - consumed >= 8 * 16) {
+            consumed += Poly1305BlocksIfma(h, r, data + consumed, bytes - consumed);
+        }
     } else if (backend == SimdBackend::kAvx512) {
         consumed += Poly1305BlocksAvx512(h, r, data, bytes);
     }

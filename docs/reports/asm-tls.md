@@ -816,3 +816,87 @@ BENTO_CRYPTO_SIMD=avx512 taskset -c 6 /tmp/tls_bench3/bench_ifma 0.5
 src/bento/net/crypto.cpp | +218 −6（IFMA 实现约 185 行 + 后端/分派/探测 33 行）
 docs/reports/asm-tls.md  | 本节
 ```
+## 冲 1.1×（2026-11-04）
+
+### 1. 结论
+
+- **达到目标**：AEAD vs EVP 从 **1.14–1.21×** 降到 **1.02–1.04×**（<1.1×）。
+- Poly1305 9.9–10.1 → **14.8–15.9 GB/s**（+51–53%）；AEAD 总吞吐
+  64 KiB 4.15–4.23 → **4.55–4.93 GB/s**、1 MiB 3.93–3.99 → **4.69–4.84 GB/s**。
+- 走的路径是**16 路（2 批共享一次跨 lane 归并）**，不是 §5 列的
+  「lo/hi 打包归并」——后者经指令账核算在 Zen 4 上不赚（见 §2）。
+
+### 2. 为什么跳过「lo/hi 打包归并」（低风险路径的书面否决）
+
+1. **数学上不能合并成 3 次**：3 个 `d` 的 8 lane lo 和上界 2^57、hi 和 2^47，
+   两者合计 104 位，装不进一个 64 位水平求和；`d mod 2^44` 与 `d >> 44`
+   需要的是同一个 104 位量的两段，没有第二种编码能在一个累加器里同时保住
+   44 位低位与 52 位进位的精度。
+2. **打包进同一 zmm 的不同 128 位块**在 Zen 4 双泵上：6 次归约的 6 条 512 位
+   `vextracti64x4`（12 μop）会变成 3 × 5 条 512 位 shuffle（约 30 μop），
+   512 位域的账反而变差；能省的只有 128 位域末尾 6 条，不足以覆盖
+   打包的 shuffle。故直接采用 16 路。
+
+### 3. 改动（`src/bento/net/crypto.cpp`，+179/−1，未 commit）
+
+1. 新增 `Poly1305BlocksIfma16`（每批 **16 块 = 256B**）：lane k 在批 A 处理块 k
+   （权重 `r^16..r^9`）、批 B 处理块 k+8（权重 `r^8..r^1`），**36 条 madd 累加到
+   同一组 6 个累加器**，于是跨 lane 归并从每 8 块 6 次降到每 16 块 6 次；
+   进位链、`h` 广播、`permutex2var` 转置、limb 提取全部摊薄一半。
+2. 寄存器账（32 个 zmm）：10 个 lane 常量（两套 `rv0/rv1/rv2/sv1/sv2`）+
+   6 个累加器 + 3 个 limb + 4 个输入 + `mask44`/`hibit`/`order_lo`/`order_hi`/`zero`
+   ≈ **28/32**，`objdump` 无栈 spill。
+3. 上界（两批合计）：lo 每 lane < 6·2^52 = **2^54.6**，8 lane 和 < 2^58；
+   hi 每 lane < 6·2^42 = **2^44.6**，8 lane 和 < 2^48——都远小于 2^64，
+   lo/hi 累加器不会溢出。`h` 只在批 A 的 lane 0 注入（批 B 不含累积值）。
+4. 分派：IFMA 档先跑 16 路，剩余 ≥128B 交给旧 8 路，再剩 64B 交给 4 路；
+   `BENTO_CRYPTO_SIMD=avx512` 仍是 8 路 2^26 路径，回退链与上一版一致。
+5. 未改标量 / 2^26 / 4 路代码；`-O3 -Wall -Wextra -Wpedantic` **零告警**。
+
+### 4. 数据（同窗口 A/B，`taskset -c 6`，每尺寸 0.5s × 2 轮，取两轮区间）
+
+| 场景 | 8 路 IFMA（旧） | **16 路 IFMA（新）** | 变化 |
+|---|---:|---:|---:|
+| Poly 64 KiB | 9.92 GB/s | **14.83–15.95 GB/s** | +50–61% |
+| Poly 1 MiB | 9.99 GB/s | **14.77–15.32 GB/s** | +48–53% |
+| AEAD 64 KiB | 4.15–4.23 GB/s | **4.55–4.93 GB/s** | +10–19% |
+| AEAD 1 MiB | 3.93–3.99 GB/s | **4.69–4.84 GB/s** | +19–23% |
+| vs EVP 64 KiB | 1.14–1.20× | **1.02–1.03×** | |
+| vs EVP 1 MiB | 1.19–1.21× | **1.03–1.04×** | |
+
+- ChaCha20-only 不变（6.93 GB/s，仍走 16 lane AVX-512）。
+- 增速来源与预算一致：每批固定开销（6 次归并 ≈12–16 周期 + 3 段进位链 +
+  广播/转置/limb 提取）从 46–49 周期/128B 摊到 256B，实测每 128B 约 **33–35
+  周期**（4.4 GHz 折算），与「归并减半后 ≈34」的估算吻合。
+- EVP 基线本身有窗口漂移（4.6–5.1 GB/s），故 A/B 只用同一轮的 EVP 值相除。
+
+### 5. 正确性
+
+```bash
+cmake --build build-review --target bento_test_crypto -j8 && ./build-review/bento_test_crypto
+# → [PASS] test_crypto (5482 checks)
+
+/tmp/tls_bench4/cv16                            # 默认（探测到 IFMA，走 16 路）→ ALL_VECTORS_OK
+BENTO_CRYPTO_SIMD=avx512ifma /tmp/tls_bench4/cv16   # 强制 IFMA（16 路）→ ALL_VECTORS_OK
+BENTO_CRYPTO_SIMD=avx512     /tmp/tls_bench4/cv16   # 2^26 8 路 → ALL_VECTORS_OK
+BENTO_CRYPTO_SIMD=avx2       /tmp/tls_bench4/cv16   # 4 路     → ALL_VECTORS_OK
+BENTO_CRYPTO_SIMD=scalar     /tmp/tls_bench4/cv16   # 标量     → ALL_VECTORS_OK
+```
+
+对拍内容不变：RFC 8439 §2.5.2/§2.8.2、0..2049 全长度往返 + 变长 AAD、
+逐字节篡改拒绝（每个长度翻转一位必须被拒）。
+
+### 6. 回退
+
+- 运行期：`DetectSimdBackend` 逐级探测；IFMA 不在 → 2^26 8 路 → 4 路 → 标量。
+- 代码级：16 路是新函数 + 分派分支；`BENTO_CRYPTO_SIMD=avx512|avx2|scalar`
+  可随时退到上一版路径，行为与上一版逐字节一致（四档均实测）。
+- 遗留尾巴：128–255B 的尾部会掉到 8 路/4 路（小包，实测无影响）。
+
+### 7. 改动清单（未 commit）
+
+```
+src/bento/net/crypto.cpp | +179 −1（Poly1305BlocksIfma16 ≈150 行 + lane 常量助手 + 分派 5 行）
+docs/reports/asm-tls.md  | 本节
+```
+
