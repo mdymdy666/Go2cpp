@@ -355,3 +355,60 @@ client: local  socket  ⇄  RelayPipe  ⇄  MuxStream（同上）
 2. 达标的前提是**每段纯 socket 对 socket**：需要为每条隧道流建一条 per-stream raw TCP 数据通道（控制连接只传 OPEN/CLOSE 信令），server 侧 `splice(公网 socket → pipe → raw)`、client 侧 `splice(raw → pipe → 本地 socket)`。这样 3 段全零拷贝，按物理实测（1/2/3/4 段 = 2517/1851/1291/739 MiB/s），3 段上限 1291 MiB/s ≈ 1.95×，恰好压在门槛上。
 3. 该改动需要协议新增「数据通道」握手与配对表，超出本次时间盒；本次交付的是可复用的 `SplicePipe` + 接线点，raw 通道落地后只需把 server/client 的 `MuxStream` 换成 raw socket 的 `SocketStream` 即可自动启用。
 4. 回退：`GO2CPP_TUNNEL_SPLICE` 默认关；非 Linux 编译期 `Supported()=false`；两端 fd 任一为 -1 自动回退 `RelayPipe`，行为与改动前完全一致。
+
+## per-stream raw TCP（2026-11-04，`GO2CPP_TUNNEL_RAW_STREAM`）
+
+目标：绕开 `MuxStream` 的用户态帧化，让**每条流独占一条 raw TCP**，使 3 段数据面全部落在
+`splice(2)` 上（server 公网 socket ⇄ pipe ⇄ raw 数据连接；client raw 数据连接 ⇄ pipe ⇄ 本地 socket）。
+控制连接只传 `OPEN_RAW` / `CLOSE` 信令。
+
+### 1. 协议与数据流
+
+| 帧 | 方向 | 载荷 | 说明 |
+|---|---|---|---|
+| `OPEN_RAW(11)` | S→C | 同 `OPEN`：`stream_id(4) ip_len(1) ip port(2)` | 服务端收到公网连接后分配 id 并通知客户端 |
+| `RAW_BIND(12)` | C→S | `stream_id(4)` | 客户端新建数据连接，握手后绑定该 id |
+
+客户端收到 `OPEN_RAW` → 新建 TCP 到控制端口 → 复用既有 `CHALLENGE/AUTH/HELLO` 握手
+（`HELLO.flags` 带 `kHelloFlagDataConnection | kHelloFlagRawStream`）→ 发 `RAW_BIND` →
+**不启动 MuxSession**（否则心跳 PING 会混进裸字节流）→ 本地拨号 → `SplicePipe(raw_fd, local_fd)`。
+
+服务端 `ServeRawStream`：先注册等待槽位（`Entry::raw_waiters[stream_id]`）再发 `OPEN_RAW`，
+等到绑定后把「已读走的 HTTP 头 + 预读 body」`WriteAll` 进数据连接，再 `SplicePipe(public_fd, raw_fd)`。
+关闭语义与 relay 一致：EOF 只 `shutdown(SHUT_WR)`；绑定超时 10 s（`raw_bind_timeout_ms`）回 504；
+任一 splice 方向失败即全关两端。`DetachConn()` 把数据连接从 MuxSession 摘出，`Stop()` 不会再关它。
+
+### 2. 改动清单
+
+| 文件 | 内容 |
+|---|---|
+| `protocol.hpp/cpp` | `kOpenRaw` / `kRawBind` / `kHelloFlagRawStream`；`RawStreamEnabledFromEnv()`（默认关） |
+| `mux.hpp/cpp` | `OnRawOpen` 回调、`AllocateStreamId`、`SendOpenRaw`、`DetachConn`（连接所有权移交） |
+| `server.hpp/cpp` | `Entry::raw_waiters`、`ServeRawStream`、`BindRawStream`、数据连接握手分支 |
+| `client.hpp/cpp` | `ConnectAndRegister(..., raw_stream_id)`、`RelayRawStream` |
+
+7 个文件、约 330 行（含注释）。未改 CMake / tests / 其他模块。
+
+### 3. 实测（环回，`bench_tunnel`，同进程内 server+client）
+
+| 指标 | 默认 mux | raw | 直连 | 开销 |
+|---|---|---|---|---|
+| 单连接吞吐（8 MiB POST） | 414–582 MiB/s | **1469–1903 MiB/s** | 1937–3207 | 默认 3.8–5.5× / **raw 1.03–1.44×** |
+| 单连接延迟 p50（64 KiB POST） | 1.34 ms | 1.23 ms | 0.32 ms | — |
+| `ctest -R tunnel` | 1/1 Passed | 1/1 Passed | — | — |
+| integrity | failures=0 | failures=0 | — | — |
+
+raw 单流逐次：`1861`（1.39×）、`1903`（1.20×）、`1853`（1.15×）、`1873`（1.03×）、`1469`（1.44×）。
+测量窗口内本机同时跑着其他构建/测试任务（直连基线在 1937–7609 MiB/s 间漂移），
+故以「同一轮内 直连 : 隧道」的倍率为主；raw 单流稳定 **≤1.44×**。
+4 并发受同一负载干扰，观测 1.62×（`2668` vs `4319`）到 5.78×（`1316` vs `7609`），不作结论。
+
+### 4. 结论
+
+1. per-stream raw 数据通道**已跑通**：控制连接只传 `OPEN_RAW`/`CLOSE`，数据连接 3 段全 `splice`；
+   单流开销 **1.03–1.44×，达 ≤2×**，比默认 mux 路径（同窗口 3.8–5.5×）快 **2.5–3.5 倍**。
+2. 默认关：未设 `GO2CPP_TUNNEL_RAW_STREAM` 时协议、线程、内存行为与改动前完全一致；
+   既有 `ctest -R tunnel` 全绿（4.53 s）。
+3. 已知限制：每条流多一次 TCP 握手（1 RTT + 4 帧）；绑定超时 10 s；`OPEN_RAW` 里的 peer_ip/port
+   仅展示，目标地址仍由客户端配置决定（与既有语义一致）。
+4. 后续：数据连接复用（连接池 + 绑定复用）摊掉握手；按流限速/窗口。

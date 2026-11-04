@@ -913,6 +913,36 @@ void TunnelServer::HandleControl(TcpConn::Ptr conn) {
             session->Stop();
             return;
         }
+        // per-stream 裸 TCP：握手完成后只读一个 kRawBind 帧；此后这条连接
+        // 直接承载某个流的原始字节，不再进入 MuxSession 的帧化路径。
+        if ((hello.flags & kHelloFlagRawStream) != 0) {
+            if (!RawStreamEnabledFromEnv()) {
+                Emit("raw data connection rejected: GO2CPP_TUNNEL_RAW_STREAM off");
+                session->Stop();
+                return;
+            }
+            frame::Frame bind_frame;
+            std::string bind_error;
+            if (!reader.Next(5000, &bind_frame, &bind_error) ||
+                static_cast<FrameType>(bind_frame.type) != FrameType::kRawBind ||
+                bind_frame.payload.size() != 4U) {
+                Emit("raw data connection: malformed RAW_BIND: " + bind_error);
+                session->Stop();
+                return;
+            }
+            std::uint32_t raw_id = 0;
+            for (std::size_t index = 0; index < 4U; ++index) {
+                raw_id |= static_cast<std::uint32_t>(bind_frame.payload[index])
+                          << (index * 8U);
+            }
+            // 先把连接从会话里摘出来，再 Stop：否则 Stop 会 shutdown 该 fd。
+            TcpConn::Ptr raw_conn = session->DetachConn();
+            session->Stop();
+            if (raw_conn) {
+                BindRawStream(subdomain, raw_id, raw_conn);
+            }
+            return;
+        }
         ErrorPtr start_error;
         if (!session->Start(MuxSession::OnOpen(), &start_error)) {
             Emit("data session start failed: " + ErrorMessage(start_error));
@@ -1132,6 +1162,14 @@ void TunnelServer::HandlePublic(TcpConn::Ptr conn) {
                      "tunnel '" + route.subdomain + "' has no live session\n");
         return;
     }
+    if (RawStreamEnabledFromEnv()) {
+        std::string raw_prefix = RewriteRequestHead(
+            head, route.path, peer_ip_only, route.prefix,
+            m_config.strip_prefix && !route.host_mode);
+        raw_prefix += extra;
+        ServeRawStream(conn, entry, std::move(raw_prefix));
+        return;
+    }
     MuxStream::Ptr stream = session->OpenStream(peer_ip_only, 0);
     if (!stream) {
         SendResponse(conn, 502, "Bad Gateway", "text/plain; charset=utf-8",
@@ -1179,6 +1217,98 @@ void TunnelServer::HandlePublic(TcpConn::Ptr conn) {
     }
     stream->Close();
     conn->Shutdown();
+}
+
+void TunnelServer::ServeRawStream(const TcpConn::Ptr& conn,
+                                 const std::shared_ptr<Entry>& entry,
+                                 std::string prefix) {
+    MuxSession::Ptr control = entry ? entry->session : nullptr;
+    if (!control || !control->alive()) {
+        SendResponse(conn, 502, "Bad Gateway", "text/plain; charset=utf-8",
+                     "tunnel has no live control session\n");
+        return;
+    }
+    const std::uint32_t stream_id = control->AllocateStreamId();
+    if (stream_id == 0) {
+        SendResponse(conn, 503, "Service Unavailable",
+                     "text/plain; charset=utf-8",
+                     "cannot allocate raw stream id\n");
+        return;
+    }
+    auto waiter = std::make_shared<RawWaiter>();
+    {
+        std::lock_guard<std::mutex> lock(entry->mutex);
+        entry->raw_waiters[stream_id] = waiter;
+    }
+    if (!control->SendOpenRaw(stream_id, HostOnly(conn->PeerText()), 0)) {
+        std::lock_guard<std::mutex> lock(entry->mutex);
+        entry->raw_waiters.erase(stream_id);
+        SendResponse(conn, 502, "Bad Gateway", "text/plain; charset=utf-8",
+                     "cannot send OPEN_RAW\n");
+        return;
+    }
+    TcpConn::Ptr data_conn;
+    {
+        std::unique_lock<std::mutex> lock(waiter->mutex);
+        waiter->cv.wait_for(
+            lock,
+            std::chrono::milliseconds(std::max(100, m_config.raw_bind_timeout_ms)),
+            [&waiter] { return waiter->bound; });
+        data_conn = waiter->conn;
+    }
+    {
+        std::lock_guard<std::mutex> lock(entry->mutex);
+        entry->raw_waiters.erase(stream_id);
+    }
+    if (!data_conn) {
+        SendResponse(conn, 504, "Gateway Timeout", "text/plain; charset=utf-8",
+                     "raw data channel bind timeout\n");
+        return;
+    }
+    // 已读走的 HTTP 头（含预读 body）必须先写进数据通道，再交给 splice；
+    // 否则本地服务收到的请求缺头。
+    if (!prefix.empty() &&
+        !data_conn->WriteAll(prefix.data(), prefix.size(), 30000, nullptr)) {
+        data_conn->Shutdown();
+        conn->Shutdown();
+        return;
+    }
+    if (m_metric_streams != nullptr) {
+        m_metric_streams->Inc();
+    }
+    relay::SplicePipe splice_pipe(conn->fd(), data_conn->fd());
+    ErrorPtr splice_error;
+    (void)splice_pipe.Run(nullptr, &splice_error);
+    data_conn->Shutdown();
+    conn->Shutdown();
+}
+
+void TunnelServer::BindRawStream(const std::string& subdomain,
+                                 std::uint32_t stream_id,
+                                 const TcpConn::Ptr& conn) {
+    std::shared_ptr<RawWaiter> waiter;
+    const std::shared_ptr<Entry> entry = Lookup(subdomain);
+    if (entry) {
+        std::lock_guard<std::mutex> lock(entry->mutex);
+        const auto found = entry->raw_waiters.find(stream_id);
+        if (found != entry->raw_waiters.end()) {
+            waiter = found->second;
+        }
+    }
+    if (!waiter) {
+        Emit("[tunnel] raw bind 无等待者: " + subdomain + " stream=" +
+             std::to_string(stream_id));
+        if (conn) {
+            conn->Shutdown();
+        }
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(waiter->mutex);
+        waiter->conn = conn;
+        waiter->bound = true;
+    }
+    waiter->cv.notify_all();
 }
 
 void TunnelServer::Emit(const std::string& message) const {

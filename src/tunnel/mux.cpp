@@ -376,6 +376,42 @@ MuxStream::Ptr MuxSession::OpenStream(const std::string& peer_ip,
     return stream;
 }
 
+std::uint32_t MuxSession::AllocateStreamId() {
+    if (!alive() || draining()) {
+        return 0;
+    }
+    std::uint32_t id = m_next_id.fetch_add(1, std::memory_order_relaxed);
+    if (id == 0) {
+        id = m_next_id.fetch_add(1, std::memory_order_relaxed);
+    }
+    return id;
+}
+
+bool MuxSession::SendOpenRaw(std::uint32_t stream_id,
+                             const std::string& peer_ip,
+                             std::uint16_t peer_port) {
+    if (stream_id == 0 || !alive() || draining()) {
+        return false;
+    }
+    Open open;
+    open.stream_id = stream_id;
+    open.peer_ip = peer_ip;
+    open.peer_port = peer_port;
+    std::vector<std::uint8_t> payload;
+    ErrorPtr encode_error;
+    if (!EncodeOpen(open, &payload, &encode_error)) {
+        return false;
+    }
+    return SendPayload(FrameType::kOpenRaw, payload);
+}
+
+TcpConn::Ptr MuxSession::DetachConn() {
+    std::lock_guard<std::mutex> lock(m_conn_mutex);
+    TcpConn::Ptr conn = m_conn;
+    m_conn.reset();
+    return conn;
+}
+
 bool MuxSession::SendPayload(FrameType type,
                              const std::vector<std::uint8_t>& payload) {
     if (!alive() || !m_conn) {
@@ -498,8 +534,13 @@ void MuxSession::Shutdown(const char* reason) {
         return;
     }
     (void)reason;
-    if (m_conn) {
-        m_conn->Shutdown();
+    TcpConn::Ptr conn;
+    {
+        std::lock_guard<std::mutex> lock(m_conn_mutex);
+        conn = m_conn;
+    }
+    if (conn) {
+        conn->Shutdown();
     }
     MarkAllStreamsClosed(reason);
     m_ack_cv.notify_all();
@@ -621,6 +662,28 @@ void MuxSession::Dispatch(const frame::Frame& frame, bool notify_data) {
             }
             return;
         }
+        case FrameType::kOpenRaw: {
+            Open open;
+            if (!DecodeOpen(frame.payload.data(), frame.payload.size(),
+                            &open, nullptr) ||
+                open.stream_id == 0) {
+                Shutdown("malformed OPEN_RAW");
+                return;
+            }
+            if (!alive()) {
+                return;
+            }
+            if (!m_on_raw_open) {
+                Shutdown("no raw open handler");
+                return;
+            }
+            m_on_raw_open(open.stream_id, open.peer_ip);
+            return;
+        }
+        case FrameType::kRawBind:
+            // 只有服务端会解析 RAW_BIND（数据连接握手阶段同步读）；
+            // 会话层收到它说明对端错发，静默丢弃，不断连接。
+            return;
         case FrameType::kData: {
             DataFrame data;
             if (!DecodeData(frame.payload.data(), frame.payload.size(), &data,

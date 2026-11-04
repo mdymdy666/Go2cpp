@@ -17,7 +17,9 @@
 #include "go2cpp/hash/sha256.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <random>
@@ -199,6 +201,10 @@ const char* FrameTypeName(FrameType type) noexcept {
             return "AUTH";
         case FrameType::kGoAway:
             return "GOAWAY";
+        case FrameType::kOpenRaw:
+            return "OPEN_RAW";
+        case FrameType::kRawBind:
+            return "RAW_BIND";
     }
     return "UNKNOWN";
 }
@@ -644,6 +650,19 @@ std::string MakeRandomSubdomain(std::size_t length) {
         }
     }
     return result;
+}
+
+bool RawStreamEnabledFromEnv() {
+    const char* raw = std::getenv("GO2CPP_TUNNEL_RAW_STREAM");
+    if (raw == nullptr) {
+        return false;
+    }
+    std::string value(raw);
+    for (char& ch : value) {
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    }
+    return value == "1" || value == "true" || value == "on" ||
+           value == "yes";
 }
 
 }  // namespace tunnel

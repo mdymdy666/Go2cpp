@@ -179,8 +179,10 @@ bento::Backoff TunnelClient::MakeBackoff() const {
     return bento::Backoff(config);
 }
 
-bool TunnelClient::ConnectAndRegister(bool data_role, MuxSession::Ptr* session_out,
-                                      HelloAck* ack_out, std::string* err) {
+bool TunnelClient::ConnectAndRegister(bool data_role,
+                                      MuxSession::Ptr* session_out,
+                                      HelloAck* ack_out, std::string* err,
+                                      std::uint32_t raw_stream_id) {
     std::string dial_error;
     TcpConn::Ptr conn = TcpConn::Dial(
         m_config.server_host, m_config.server_port,
@@ -260,6 +262,9 @@ bool TunnelClient::ConnectAndRegister(bool data_role, MuxSession::Ptr* session_o
     Hello hello;
     hello.version = kProtocolVersion;
     hello.flags = data_role ? kHelloFlagDataConnection : 0U;
+    if (raw_stream_id != 0) {
+        hello.flags |= kHelloFlagRawStream;
+    }
     const std::string active_subdomain = subdomain();
     hello.subdomain = active_subdomain.empty() ? m_config.subdomain
                                               : active_subdomain;
@@ -275,23 +280,64 @@ bool TunnelClient::ConnectAndRegister(bool data_role, MuxSession::Ptr* session_o
         session->Stop();
         return false;
     }
-    ErrorPtr start_error;
-    if (!session->Start(
-            [this](MuxStream::Ptr stream) { HandleOpen(stream); },
-            &start_error)) {
-        if (err != nullptr) {
-            *err = "start session failed: " + ErrorMessage(start_error);
+    session->set_on_raw_open([this](std::uint32_t stream_id,
+                                    const std::string& peer_ip) {
+        (void)peer_ip;
+        if (!RawStreamEnabledFromEnv()) {
+            return;
         }
-        session->Stop();
-        return false;
-    }
+        try {
+            std::thread([this, stream_id] { RelayRawStream(stream_id); })
+                .detach();
+        } catch (...) {
+            Emit("[tunnel] raw 流线程启动失败");
+        }
+    });
     HelloAck ack;
-    if (!session->WaitHelloAck(m_config.hello_timeout_ms, &ack)) {
-        if (err != nullptr) {
-            *err = "wait HELLO_ACK failed";
+    if (raw_stream_id != 0) {
+        // per-stream 裸 TCP：先发绑定帧，再同步等 HELLO_ACK；**不** Start
+        // MuxSession，否则心跳 PING 会混进裸字节流。
+        std::vector<std::uint8_t> bind_payload(4);
+        for (std::size_t index = 0; index < 4U; ++index) {
+            bind_payload[index] = static_cast<std::uint8_t>(
+                (raw_stream_id >> (index * 8U)) & 0xFFU);
         }
-        session->Stop();
-        return false;
+        if (!WriteFrame(conn, m_config.with_checksum, FrameType::kRawBind,
+                        bind_payload)) {
+            if (err != nullptr) {
+                *err = "send RAW_BIND failed";
+            }
+            session->Stop();
+            return false;
+        }
+        if (!reader.Next(m_config.hello_timeout_ms, &frame, &read_error) ||
+            static_cast<FrameType>(frame.type) != FrameType::kHelloAck ||
+            !DecodeHelloAck(frame.payload.data(), frame.payload.size(), &ack,
+                            nullptr)) {
+            if (err != nullptr) {
+                *err = "wait HELLO_ACK failed: " + read_error;
+            }
+            session->Stop();
+            return false;
+        }
+    } else {
+        ErrorPtr start_error;
+        if (!session->Start(
+                [this](MuxStream::Ptr stream) { HandleOpen(stream); },
+                &start_error)) {
+            if (err != nullptr) {
+                *err = "start session failed: " + ErrorMessage(start_error);
+            }
+            session->Stop();
+            return false;
+        }
+        if (!session->WaitHelloAck(m_config.hello_timeout_ms, &ack)) {
+            if (err != nullptr) {
+                *err = "wait HELLO_ACK failed";
+            }
+            session->Stop();
+            return false;
+        }
     }
     if (ack_out != nullptr) {
         *ack_out = ack;
@@ -535,6 +581,51 @@ void TunnelClient::RelayLocal(const MuxStream::Ptr& stream) {
     (void)stream->Close();
     local->Shutdown();
 }
+
+void TunnelClient::RelayRawStream(std::uint32_t stream_id) {
+    std::string error;
+    MuxSession::Ptr session;
+    HelloAck ack;
+    if (!ConnectAndRegister(true, &session, &ack, &error, stream_id)) {
+        Emit("[tunnel] raw 数据连接建立失败: " + error);
+        return;
+    }
+    TcpConn::Ptr server_conn = session ? session->DetachConn() : nullptr;
+    if (session) {
+        session->Stop();
+    }
+    if (!server_conn) {
+        return;
+    }
+    TcpConn::Ptr local = TcpConn::Dial(
+        m_config.local_host, m_config.local_port,
+        std::max(100, m_config.dial_timeout_ms), &error);
+    if (!local) {
+        Emit("[tunnel] raw 流本地拨号失败: " + error);
+        server_conn->Shutdown();
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(m_worker_mutex);
+        ++m_workers;
+    }
+    m_streams_total.fetch_add(1, std::memory_order_relaxed);
+    if (m_metric_streams != nullptr) {
+        m_metric_streams->Inc();
+    }
+    // 两端都是内核 socket：整条数据面只有 splice，没有用户态缓冲。
+    relay::SplicePipe splice_pipe(server_conn->fd(), local->fd());
+    ErrorPtr splice_error;
+    (void)splice_pipe.Run(nullptr, &splice_error);
+    server_conn->Shutdown();
+    local->Shutdown();
+    {
+        std::lock_guard<std::mutex> lock(m_worker_mutex);
+        --m_workers;
+    }
+    m_worker_cv.notify_all();
+}
+
 
 }  // namespace tunnel
 }  // namespace go2cpp

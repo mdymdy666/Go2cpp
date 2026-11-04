@@ -47,6 +47,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -89,6 +90,8 @@ struct TunnelServerConfig {
     int accept_timeout_ms = 500;
     /// 优雅关闭时等待在途流结束的上限（毫秒）。
     int drain_timeout_ms = 5000;
+    /// per-stream 裸 TCP 模式下等待客户端回拨数据连接的上限（毫秒）。
+    int raw_bind_timeout_ms = 10000;
 };
 
 /// 一条在线隧道的快照（用于目录页 / 状态查询）。
@@ -180,6 +183,14 @@ private:
     /// @details `session` 是控制连接；`data_sessions` 是可选的数据连接池
     ///          （`HELLO.flags` 带 `kHelloFlagDataConnection` 的会话）。
     ///          开流时优先在数据连接上轮询，把控制面与数据面隔开。
+    /// 一条「等待客户端回拨数据连接」的 raw 流槽位。
+    struct RawWaiter {
+        std::mutex mutex;
+        std::condition_variable cv;
+        TcpConn::Ptr conn;   ///< 绑定成功后的数据连接。
+        bool bound = false;
+    };
+
     struct Entry {
         std::string subdomain;
         MuxSession::Ptr session;
@@ -187,8 +198,9 @@ private:
         std::string local_target;
         std::string scheme;
         std::int64_t started_ms = 0;
-        std::mutex mutex;                              ///< 保护 data_sessions。
+        std::mutex mutex;                              ///< 保护下面两个容器。
         std::vector<MuxSession::Ptr> data_sessions;    ///< 数据连接池。
+        std::map<std::uint32_t, std::shared_ptr<RawWaiter>> raw_waiters;
         std::atomic<std::size_t> round_robin{0};       ///< 轮询下标。
         std::atomic<bool> draining{false};             ///< 正在 drain。
     };
@@ -197,6 +209,13 @@ private:
     void PublicAcceptLoop();
     void HandleControl(TcpConn::Ptr conn);
     void HandlePublic(TcpConn::Ptr conn);
+    /// per-stream 裸 TCP：发 `kOpenRaw` → 等客户端回拨数据连接 → 双向 splice。
+    void ServeRawStream(const TcpConn::Ptr& conn,
+                        const std::shared_ptr<Entry>& entry,
+                        std::string prefix);
+    /// 客户端数据连接绑定到等待中的 raw 流；找不到等待者则关闭连接。
+    void BindRawStream(const std::string& subdomain,
+                       std::uint32_t stream_id, const TcpConn::Ptr& conn);
     void Emit(const std::string& message) const;
 
     std::string BuildPublicUrl(const std::string& subdomain,

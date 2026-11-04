@@ -160,8 +160,13 @@ private:
     bool RunOnce();
 
     /// 完整的「挑战-应答 → HELLO → HELLO_ACK」握手，成功返回已上线的会话。
+    /// @param raw_stream_id 非 0 时走 per-stream 裸 TCP：HELLO 后立刻发
+    ///        `kRawBind`，**不** Start MuxSession，返回的会话只持有连接。
     bool ConnectAndRegister(bool data_role, MuxSession::Ptr* session,
-                            HelloAck* ack, std::string* err);
+                            HelloAck* ack, std::string* err,
+                            std::uint32_t raw_stream_id = 0);
+    /// per-stream 裸 TCP：拨数据连接 → 绑定 → 本地拨号 → splice。
+    void RelayRawStream(std::uint32_t stream_id);
     /// 启动数据连接线程（只启动一次）。
     void StartDataConnections();
     /// 一条数据连接的「连接 → 在线 → 重连」循环。

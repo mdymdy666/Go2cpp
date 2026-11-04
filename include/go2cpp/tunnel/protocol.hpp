@@ -103,11 +103,25 @@ enum class FrameType : std::uint8_t {
     kChallenge = 8, ///< 服务端 → 客户端：鉴权挑战（16B 随机数）。
     kAuth = 9,      ///< 客户端 → 服务端：挑战应答（16B AEAD tag）。
     kGoAway = 10,   ///< 双向：优雅关闭（不再接受新流，等待在途流结束）。
+    kOpenRaw = 11,  ///< 服务端 → 客户端：per-stream 裸 TCP 数据通道（载荷同 OPEN）。
+    kRawBind = 12,  ///< 客户端 → 服务端：数据连接绑定到某个 stream_id（载荷 4B id）。
 };
 
 /// `HELLO.flags` 的 bit0：本连接是「数据连接」（对应 frp 的 work conn /
 /// rathole 的 data channel）。控制连接负责注册与心跳，数据连接只承载流。
 inline constexpr std::uint32_t kHelloFlagDataConnection = 1U << 0U;
+/// HELLO.flags 的 bit1：本数据连接是 **per-stream 裸 TCP 通道**——握手完成后
+/// 只发一个 kRawBind 帧，随后该 TCP 直接承载一个流的原始字节（两端 socket
+/// 之间走 splice(2)，不再有任何帧头）。控制连接只传 kOpenRaw / kClose。
+inline constexpr std::uint32_t kHelloFlagRawStream = 1U << 1U;
+
+/**
+ * @brief 读环境变量 GO2CPP_TUNNEL_RAW_STREAM（1/true/on/yes，大小写不敏感）。
+ *
+ * @return 开关状态；默认 false（保持旧的 mux 帧化路径）。两端必须同时开启：
+ *         服务端决定是否发 kOpenRaw，客户端决定是否响应。
+ */
+bool RawStreamEnabledFromEnv();
 
 /// PSK 字节数，与 Bento 的 32B PSK 约定一致。
 inline constexpr std::size_t kPskBytes = 32;

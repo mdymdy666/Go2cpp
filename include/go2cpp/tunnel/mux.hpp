@@ -226,6 +226,40 @@ public:
     MuxStream::Ptr OpenStream(const std::string& peer_ip = {},
                               std::uint16_t peer_port = 0);
 
+    /// raw 流回调：在**接收线程**里调用 `(stream_id, peer_ip)`；实现必须
+    /// 立即返回（例如起一条工作线程去拨数据连接）。
+    using OnRawOpen = std::function<void(std::uint32_t, const std::string&)>;
+
+    /// 设置 raw 流回调；必须在 `Start()` 之前调用（接收线程启动后只读）。
+    void set_on_raw_open(OnRawOpen handler) { m_on_raw_open = std::move(handler); }
+
+    /**
+     * @brief 分配一个流 id（发送 `kOpenRaw` 前用）。
+     * @return 流 id；会话已关闭 / 正在 drain 时返回 0。
+     * @note 分配后必须紧接 `SendOpenRaw`，否则 id 空洞（对端不会知道）。
+     */
+    std::uint32_t AllocateStreamId();
+
+    /**
+     * @brief 通知对端「这个流走 per-stream 裸 TCP 数据通道」（不创建 MuxStream）。
+     * @param stream_id [in] 已由 `AllocateStreamId()` 分配的 id；0 返回 false。
+     * @param peer_ip [in] 公网对端 IP（仅展示）。
+     * @param peer_port [in] 公网对端端口。
+     * @return 帧已写出返回 true；连接不可用 / 编码失败返回 false。
+     */
+    bool SendOpenRaw(std::uint32_t stream_id, const std::string& peer_ip = {},
+                     std::uint16_t peer_port = 0);
+
+    /**
+     * @brief 把底层连接从会话里摘出来（per-stream 裸 TCP 数据通道用）。
+     *
+     * @return 被摘出的连接；调用后会话不再持有它，`Shutdown()` 不会
+     *         `shutdown` 这条连接的 fd——所有权移交给调用方，由调用方
+     *         负责关闭。
+     * @note 仅用于**尚未 `Start()`** 的连接（无接收/心跳线程）；线程安全。
+     */
+    TcpConn::Ptr DetachConn();
+
     /// 发送一帧（线程安全）；返回 false 表示连接已不可用。
     bool SendPayload(FrameType type, const std::vector<std::uint8_t>& payload);
 
@@ -282,8 +316,11 @@ public:
 
     bool alive() const noexcept { return m_alive.load(std::memory_order_acquire); }
 
-    /// 底层控制连接。
-    const TcpConn::Ptr& conn() const noexcept { return m_conn; }
+    /// 底层控制连接（按值返回：`DetachConn()` 会并发清空 `m_conn`）。
+    TcpConn::Ptr conn() const {
+        std::lock_guard<std::mutex> lock(m_conn_mutex);
+        return m_conn;
+    }
 
     /// 最近一次收到帧的时间（毫秒时间戳，诊断用）。
     std::int64_t last_rx_ms() const noexcept {
@@ -333,9 +370,11 @@ private:
     void MarkAllStreamsClosed(const char* reason);
     static std::int64_t NowMs();
 
+    mutable std::mutex m_conn_mutex;
     TcpConn::Ptr m_conn;
     MuxConfig m_config;
     OnOpen m_on_open;
+    OnRawOpen m_on_raw_open;
 
     std::atomic<bool> m_alive{true};
     std::atomic<bool> m_started{false};
