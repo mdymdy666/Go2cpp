@@ -1,9 +1,10 @@
 /**
  * @file test_fiber_growable_stack.cpp
- * @brief 验证 Fiber 大栈预留 + 2KB 初始提交（归一化 1 页）+ SIGSEGV 按需增长。
+ * @brief 验证 Fiber 大栈预留 + 统一 128KiB 默认初始提交 + SIGSEGV 按需增长。
  *
  * 覆盖：
- *   1. 默认配置（2048 初始 / 8MiB 预留）下普通 Fiber 与 Scheduler 任务完成；
+ *   1. 默认配置（统一 128KiB 初始 / 8MiB 预留）下普通 Fiber 与 Scheduler
+ *      任务完成，且任务内栈容量等于 Fiber::DefaultStackSize()；
  *   2. 深递归 256KiB / 1MiB（volatile 局部数组防止优化），不崩且结果正确；
  *   3. 增长后从深帧返回，外层帧局部变量值与地址不变（验证栈不搬家）；
  *   4. 4 个 worker、每个约 8 个 Fiber 并发增长，互不干扰；
@@ -19,6 +20,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -98,11 +100,12 @@ void run_deep_case(std::size_t frames, const char* label) {
 void test_default_config_and_normal_fiber() {
     const std::size_t page = page_size();
     go2cpp::SchedulerConfig config;
-    GO2CPP_CHECK(config.fiber_stack_size == 2048U);
+    GO2CPP_CHECK(config.fiber_stack_size ==
+                 go2cpp::Fiber::DefaultStackSize());
     GO2CPP_CHECK(config.fiber_stack_reserve_size == 8U * 1024U * 1024U);
     GO2CPP_CHECK(config.fiber_stack_growable);
 
-    // 2048 请求页对齐后是 4096；普通 Fiber 只使用远小于 4KiB 的栈。
+    // 显式请求 2048 仍是页对齐下限（归一化到 1 页），不是默认值。
     bool ran = false;
     go2cpp::Fiber normal([&] { ran = true; }, 2048);
     GO2CPP_CHECK(normal.stack_size() == page);
@@ -118,9 +121,17 @@ void test_default_config_and_normal_fiber() {
     go2cpp::Scheduler scheduler(scheduler_config);
     scheduler.start();
     std::atomic<int> completed{0};
-    auto task = scheduler.spawn([&] { completed.fetch_add(1); });
+    std::atomic<std::size_t> task_stack_bytes{0};
+    auto task = scheduler.spawn([&] {
+        if (const auto* current = go2cpp::Fiber::Current()) {
+            task_stack_bytes.store(current->stack_size());
+        }
+        completed.fetch_add(1);
+    });
     GO2CPP_REQUIRE(task->wait_for(5s));
     GO2CPP_CHECK(completed.load() == 1);
+    // 调度器任务默认栈与直接构造的 Fiber 同源，不再是 2KiB/4KiB。
+    GO2CPP_CHECK(task_stack_bytes.load() == go2cpp::Fiber::DefaultStackSize());
     scheduler.shutdown();
 }
 
@@ -230,6 +241,17 @@ void test_fixed_fallback() {
         GO2CPP_CHECK(fixed.state() == go2cpp::FiberState::Completed);
         GO2CPP_CHECK(ran);
     }
+    // 1b) 默认容量在增长关闭时就是固定栈容量：统一默认值 128KiB 生效，
+    //     不再退化成 4KiB 小栈（大栈帧不会直接踩 guard）。
+    {
+        bool ran = false;
+        go2cpp::Fiber fixed_default([&] { ran = true; });
+        GO2CPP_CHECK(fixed_default.stack_size() ==
+                     go2cpp::Fiber::DefaultStackSize());
+        GO2CPP_CHECK(fixed_default.resume());
+        GO2CPP_CHECK(fixed_default.state() == go2cpp::FiberState::Completed);
+        GO2CPP_CHECK(ran);
+    }
 
     // 2) reserve == 初始提交量：即使 growable=true 也退化为固定栈。
     {
@@ -256,7 +278,7 @@ void test_fixed_fallback() {
 
 void run_fiber_growable_stack_tests() {
     go2cpp_tests::announce(
-        "fiber growable stack: reserve + 2KiB initial commit + SIGSEGV growth");
+        "fiber growable stack: unified 128KiB default + SIGSEGV growth");
 #if defined(__linux__) && defined(__x86_64__)
     test_default_config_and_normal_fiber();
     test_deep_recursion_256k();

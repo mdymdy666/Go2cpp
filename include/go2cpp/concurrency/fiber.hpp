@@ -280,7 +280,22 @@ class Fiber {
 public:
     using Function = std::function<void()>;
 
-    /** @brief 返回默认用户栈大小（字节）。 */
+    /**
+     * @brief 返回默认用户栈大小（字节）。
+     *
+     * @details 这是**全项目唯一的栈默认值**：直接构造的 Fiber 与调度器
+     *          任务（`SchedulerConfig::fiber_stack_size`）都取这个常量，
+     *          不再出现「直接构造 128 KiB、spawn 任务 2 KiB（页对齐 4 KiB）」
+     *          的双默认值。
+     *
+     *          取 128 KiB 的理由：可增长栈不可用时（非 Linux/x86_64、
+     *          sanitizer 构建、用户关闭增长或预留不足）它必须独立支撑
+     *          整条调用链，128 KiB 是原直接构造路径已验证的固定栈下限；
+     *          可增长栈生效时它只是初始提交量，深栈仍按需增长。
+     *
+     *          需要不同容量的调用方通过构造参数 `stack_size` 或
+     *          `SchedulerConfig::fiber_stack_size` 覆盖。
+     */
     static constexpr std::size_t DefaultStackSize() noexcept {
         return 128U * 1024U;
     }

@@ -38,6 +38,12 @@
 #if defined(__linux__) && defined(__x86_64__)
 #define GO2CPP_FIBER_GROWABLE_STACK 1
 #include <ucontext.h>
+#else
+// 非 Linux/x86_64 没有 SIGSEGV 增长后端：Fiber 栈退化为固定容量。这里在
+// 编译期显式告警，避免调用方误以为默认栈仍会按需增长。固定栈容量取
+// Fiber::DefaultStackSize()（128 KiB，与调度器任务同源），可被
+// SchedulerConfig::fiber_stack_size / Fiber 构造参数覆盖。
+#warning "go2cpp: growable fiber stack requires Linux/x86_64; falling back to fixed-size stacks (default 128 KiB)"
 #endif
 
 #include <sys/mman.h>
@@ -544,10 +550,10 @@ std::size_t align_stack_size(std::size_t requested, std::size_t page_size) {
     return requested + padding;
 }
 
-// 归一化初始提交量：0 用 Fiber::DefaultStackSize()（直接构造 Fiber 的
-// 默认值 128KiB）；页对齐；下限 1 页。注意调度器配置的默认请求是 2048，
-// 页对齐后是 4096（1 页），符合 Go 的 2KB 初始栈在 4KB 页上的归一化规则：
-//   initial_usable = max(page_align_up(fiber_stack_size), 1 * page)
+// 归一化初始提交量：0 用 Fiber::DefaultStackSize()（直接构造 Fiber 与
+// 调度器任务共用的唯一默认值 128KiB）；页对齐；下限 1 页。归一化规则：
+//   initial_usable = max(page_align_up(requested), 1 * page)
+// 显式的小请求（如 2048）仍会被提升到 1 页，这是页粒度决定的，不是默认值。
 // 固定栈回退仍需要额外的 guard page，所以上限检查保留 checked_mapping_size。
 std::size_t normalize_stack_size(std::size_t requested) {
     if (requested == 0) {
@@ -568,6 +574,24 @@ std::size_t normalize_stack_size(std::size_t requested) {
     // 也不会保存一个随后会回绕的映射尺寸。
     (void)checked_stack_mapping_size(aligned, page_size);
     return aligned;
+}
+
+// 固定栈退化告警。
+//
+// 可增长栈是默认安全网：一旦平台、sanitizer 或信号处理器的安装条件不满足，
+// 栈就没有「按需增长」这条后路。此时必须让使用者看见退化事实，而不是静默
+// 把每个任务压进小固定栈（历史缺陷：调度器默认 2048 → 固定 4KiB，大栈帧
+// 直接踩 guard）。每个进程只打印一次，避免高任务 churn 刷屏。
+void warn_fixed_stack_fallback_once(const char* reason) noexcept {
+    static std::once_flag once;
+    std::call_once(once, [reason] {
+        std::fprintf(stderr,
+                     "[go2cpp] warning: growable fiber stack unavailable (%s); "
+                     "using fixed stacks of default %zu KiB. Increase "
+                     "SchedulerConfig::fiber_stack_size or the Fiber "
+                     "stack_size argument if deep stacks are expected.\n",
+                     reason, Fiber::DefaultStackSize() / 1024U);
+    });
 }
 
 #if defined(GO2CPP_FIBER_GROWABLE_STACK)
@@ -1050,8 +1074,11 @@ private:
         // 避免 sanitizer 把增长后的页误判为越界/泄漏。
         (void)usable;
         (void)requested_reserve;
-        (void)requested_growable;
         (void)page;
+        if (requested_growable) {
+            warn_fixed_stack_fallback_once(
+                "sanitizer build manages stack bounds itself");
+        }
         return 0;
 #elif defined(GO2CPP_FIBER_GROWABLE_STACK)
         if (!requested_growable || !growable_stack_env_enabled()) {
@@ -1066,13 +1093,21 @@ private:
             return 0;
         }
         if (!ensure_growable_thread_support()) {
+            // 没有处理器/备用栈时继续按增长方式使用会在 PROT_NONE 页上
+            // 直接崩，因此这里退回固定栈，并把原因告诉使用者一次。
+            warn_fixed_stack_fallback_once(
+                "SIGSEGV handler or sigaltstack installation failed");
             return 0;
         }
         return reserve;
 #else
+        (void)usable;
         (void)requested_reserve;
-        (void)requested_growable;
         (void)page;
+        if (requested_growable) {
+            warn_fixed_stack_fallback_once(
+                "platform has no SIGSEGV-backed stack growth");
+        }
         return 0;
 #endif
     }

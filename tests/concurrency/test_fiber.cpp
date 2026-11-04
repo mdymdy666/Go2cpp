@@ -86,6 +86,37 @@ void run_fiber_tests() {
     using go2cpp::SuspendReason;
     using namespace std::chrono_literals;
 
+    // 栈默认值统一（心智负担审查 98d6798）：直接构造的 Fiber 与调度器任务
+    // 必须取同一个常量，避免「直接 128KiB、spawn 任务 4KiB」的双默认值。
+    GO2CPP_CHECK(Fiber::DefaultStackSize() == 128U * 1024U);
+    {
+        const go2cpp::SchedulerConfig default_config;
+        GO2CPP_CHECK(default_config.fiber_stack_size ==
+                     Fiber::DefaultStackSize());
+
+        Fiber default_fiber([] {});
+        GO2CPP_CHECK(default_fiber.stack_size() == Fiber::DefaultStackSize());
+        GO2CPP_CHECK(default_fiber.resume());
+        GO2CPP_CHECK(default_fiber.state() == FiberState::Completed);
+
+        // 调度器任务同样是 Fiber：任务内看到的栈容量等于统一默认值。
+        go2cpp::SchedulerConfig scheduler_config;
+        scheduler_config.processor_count = 2;
+        scheduler_config.min_workers = 2;
+        scheduler_config.max_workers = 2;
+        go2cpp::Scheduler scheduler(scheduler_config);
+        scheduler.start();
+        std::atomic<std::size_t> observed_stack{0};
+        auto task = scheduler.spawn([&] {
+            if (const Fiber* current = Fiber::Current()) {
+                observed_stack.store(current->stack_size());
+            }
+        });
+        GO2CPP_REQUIRE(task->wait_for(5s));
+        GO2CPP_CHECK(observed_stack.load() == Fiber::DefaultStackSize());
+        scheduler.shutdown();
+    }
+
     GO2CPP_CHECK(!Fiber::Suspend());
     GO2CPP_CHECK(!Fiber::CancellationRequested());
 

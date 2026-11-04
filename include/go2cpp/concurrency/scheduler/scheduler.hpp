@@ -31,6 +31,7 @@
 
 #include "go2cpp/core/parking_condition.hpp"
 #include "go2cpp/core/timer.hpp"
+#include "go2cpp/fiber.hpp"
 #include "go2cpp/thread_policy.hpp"
 
 #include <atomic>
@@ -253,12 +254,16 @@ struct SchedulerConfig {
     // 只决定补充 M 在等待唤醒时多久复查一次 blocking_workers 是否归零；
     // leave_blocking() 会主动 notify，正常情况下无需等满一个周期。
     std::chrono::milliseconds idle_worker_timeout{250};
-    // Fiber 栈的初始提交量（字节）。默认 2048（Go 的 2KB 初始栈）；
-    // Linux 页粒度是 4KB，所以归一化规则是
+    // Fiber 栈的初始提交量（字节）。默认与直接构造的 Fiber 同源：
+    // Fiber::DefaultStackSize()（128 KiB），全项目只有一个栈默认值。
+    // Linux 页粒度是 4KB，归一化规则是
     //   initial_usable = max(page_align_up(requested), 1 * page)
-    // 请求 2048 时实际初始可用 4096 字节（1 页）。其余部分属于
-    // fiber_stack_reserve_size 预留区，初始为 PROT_NONE，按需增长。
-    std::size_t fiber_stack_size = 2048;
+    // 可增长栈生效时这只是初始提交量，其余部分属于
+    // fiber_stack_reserve_size 预留区（初始 PROT_NONE），按需增长；
+    // 退化时它就是固定栈容量——128 KiB 足以容纳常见调用链，不会像旧
+    // 默认（2048 → 页对齐 4096）那样被一个稍大的栈帧踩穿。
+    // 需要不同容量时显式覆盖本字段（或 TaskOptions::stack_size）。
+    std::size_t fiber_stack_size = Fiber::DefaultStackSize();
     // 每个 Fiber 预留的虚拟地址空间（字节），默认 8MiB。初始只提交
     // fiber_stack_size 对应的一页，SIGSEGV handler 以 64KiB 为粒度向下
     // mprotect，上限是这块预留区。reserve 不大于初始提交量时退化为固定栈。
