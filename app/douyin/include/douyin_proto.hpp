@@ -49,6 +49,7 @@ struct Comment {
     std::int64_t user_id{0};
     std::string content;
     std::int64_t created_at{0};
+    std::int64_t parent_id{0};  ///< 二级回复的父评论 id；0=顶层评论。
 };
 
 /// @brief 点赞（video_id + user_id 唯一）。

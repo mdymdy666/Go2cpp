@@ -76,6 +76,7 @@ struct StoredComment {
     std::int64_t user_id{0};     ///< 评论者。
     std::string content;         ///< 正文（1~500 字，由 service 校验）。
     std::int64_t created_at{0};  ///< Unix 秒。
+    std::int64_t parent_id{0};   ///< 二级回复的父评论 id；0=顶层评论。
 };
 
 /**
@@ -205,6 +206,28 @@ class Store {
                    std::string* error);
 
     /**
+     * @brief 关注数 / 粉丝数（单条 SQL 两个 COUNT 子查询）。
+     * @param id 用户 id。
+     * @param followers [out] 粉丝数——成功时写入；失败时保持原值。
+     * @param following [out] 关注数——成功时写入；失败时保持原值。
+     * @param error [out] 失败时写错误文本。
+     * @return 成功返回 true。
+     */
+    bool FollowCounts(std::int64_t id, std::int64_t* followers,
+                      std::int64_t* following, std::string* error);
+
+    /**
+     * @brief 是否已关注（用于个人主页按钮初始状态）。
+     * @param follower 关注者（通常为当前登录用户）。
+     * @param followee 被关注者。
+     * @param out [out] 结果——成功时写入。
+     * @param error [out] 数据库错误时写文本。
+     * @return 查询成功返回 true（未关注时 out=false 且 error 为空）。
+     */
+    bool IsFollowing(std::int64_t follower, std::int64_t followee, bool* out,
+                     std::string* error);
+
+    /**
      * @brief 发布视频。
      * @param user_id 作者 id。
      * @param title 标题（非空由 service 校验）。
@@ -279,14 +302,16 @@ class Store {
     bool HasLiked(std::int64_t video_id, std::int64_t user_id, std::string* error);
 
     /**
-     * @brief 发评论。
+     * @brief 发评论（`parent_id` 非 0 表示二级回复）。
+     * @param parent_id 父评论 id；0=顶层评论（父评论归属由 service 校验）。
      * @return 新评论 id；失败返回 -1。
      */
     std::int64_t AddComment(std::int64_t video_id, std::int64_t user_id,
-                            const std::string& content, std::string* error);
+                            const std::string& content, std::string* error,
+                            std::int64_t parent_id = 0);
 
     /**
-     * @brief 某视频的评论，`created_at` 倒序（同秒按 id 倒序）keyset 分页。
+     * @brief 某视频的顶层评论（`parent_id=0`），`created_at` 倒序 keyset 分页。
      * @param cursor 空串表示第一页；否则为本页最后一条的游标。
      * @param out 追加到末尾。
      * @param next_cursor 还有下一页时写游标，否则空串。
@@ -294,6 +319,22 @@ class Store {
     bool ListComments(std::int64_t video_id, const std::string& cursor,
                       std::int64_t limit, std::vector<StoredComment>* out,
                       std::string* next_cursor, std::string* error);
+
+    /**
+     * @brief 某条顶层评论的二级回复，按 `created_at` 正序（同秒按 id 正序）。
+     * @param video_id 视频 id（与 parent_id 同时作为 SQL 条件，防止跨视频串号）。
+     * @param parent_id 顶层评论 id。
+     * @param limit 最多返回条数（调用方传上限）。
+     * @param out 追加到末尾。
+     * @param error 失败时写错误文本。
+     * @return 成功返回 true。
+     */
+    bool ListReplies(std::int64_t video_id, std::int64_t parent_id,
+                     std::int64_t limit, std::vector<StoredComment>* out,
+                     std::string* error);
+
+    /// @brief 按 id 查评论；未找到返回 false 且 error 为空。
+    bool FindComment(std::int64_t id, StoredComment* out, std::string* error);
 
     /// @brief 删除评论（仅作者）；返回受影响行数，出错 -1。
     int DeleteComment(std::int64_t id, std::int64_t user_id, std::string* error);

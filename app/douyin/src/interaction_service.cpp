@@ -188,6 +188,7 @@ douyin::Comment PublicComment(const douyin::StoredComment& stored) {
     comment.user_id = stored.user_id;
     comment.content = stored.content;
     comment.created_at = stored.created_at;
+    comment.parent_id = stored.parent_id;
     return comment;
 }
 
@@ -313,7 +314,34 @@ bool HandleComment(douyin::Store& store, const douyin::HttpRequest& request,
         return Fail(response, 404, "视频不存在");
     }
 
-    const std::int64_t id = store.AddComment(video_id, actor, content, &error);
+    // step3: 可选 parent_id——必须是同一视频下的顶层评论；对回复再回复时
+    //        提升到它所属的顶层评论，保证只有两级、不产生悬挂链。
+    std::int64_t parent_id = 0;
+    if (JsonIntField(request.body, "parent_id", &parent_id) && parent_id != 0) {
+        if (parent_id < 0) {
+            return Fail(response, 400, "parent_id 非法");
+        }
+        douyin::StoredComment parent;
+        if (!store.FindComment(parent_id, &parent, &error)) {
+            if (!error.empty()) {
+                std::fprintf(stderr, "[%s] 查询父评论失败: %s\n", kServiceName,
+                             error.c_str());
+                return Fail(response, 500, "数据库错误");
+            }
+            return Fail(response, 404, "父评论不存在");
+        }
+        if (parent.video_id != video_id) {
+            return Fail(response, 400, "父评论不属于该视频");
+        }
+        if (parent.parent_id != 0) {
+            parent_id = parent.parent_id;
+        }
+    }
+    // 写前清空 ORM 语句缓存：FindComment 提前结束会残留读游标，
+    // 多服务共享 WAL 库时会让本进程的写触发 SQLITE_BUSY_SNAPSHOT。
+    store.ResetStatements();
+    const std::int64_t id =
+        store.AddComment(video_id, actor, content, &error, parent_id);
     if (id <= 0) {
         std::fprintf(stderr, "[%s] 发评论失败: %s\n", kServiceName,
                      error.c_str());
@@ -331,6 +359,7 @@ bool HandleComment(douyin::Store& store, const douyin::HttpRequest& request,
     stored.user_id = actor;
     stored.content = content;
     stored.created_at = NowSeconds();
+    stored.parent_id = parent_id;
 
     response->status = 200;
     response->body = "{\"ok\":true,\"comment\":" +
@@ -375,7 +404,22 @@ bool HandleComments(douyin::Store& store, const douyin::HttpRequest& request,
             body += ',';
         }
         body += "{\"comment\":" +
-                douyin::ToJson(PublicComment(comments[i])) + "}";
+                douyin::ToJson(PublicComment(comments[i]));
+        // 二级回复：每条顶层评论附前 50 条回复，前端负责折叠/展开。
+        std::vector<douyin::StoredComment> replies;
+        if (!store.ListReplies(video_id, comments[i].id, 50, &replies, &error)) {
+            std::fprintf(stderr, "[%s] 查询回复失败: %s\n", kServiceName,
+                         error.c_str());
+            replies.clear();
+        }
+        body += ",\"replies\":[";
+        for (std::size_t j = 0; j < replies.size(); ++j) {
+            if (j != 0) {
+                body += ',';
+            }
+            body += douyin::ToJson(PublicComment(replies[j]));
+        }
+        body += "]}";
     }
     body += "],\"next_cursor\":\"" + douyin::JsonEscape(next_cursor) + "\"}";
     response->status = 200;

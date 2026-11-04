@@ -132,7 +132,8 @@ bool VerifyBearer(const Request& request, std::string* user_id, std::string* err
  *
  * ## 并发/失败语义
  * - 调用约束：worker 线程并发调用，本类无状态，可安全共享；
- * - 不变量：仅当路径完全等于 `/` 或 `/index.html` 且方法为 GET/HEAD 时返回 true。
+ * - 不变量：路径为 `/`、`/index.html` 或 `/v/<数字>`（可带尾斜杠）、
+ *   且方法为 GET/HEAD 时返回 true。
  */
 class HomeMatcher final : public Matcher {
 public:
@@ -147,7 +148,21 @@ public:
         }
         // step2: 完全相等匹配——`/` 与 `/index.html` 两种入口都指向同一页面。
         const std::string_view path = request.path_view();
-        return path == "/" || path == "/index.html";
+        if (path == "/" || path == "/index.html") {
+            return true;
+        }
+        // step3: 短视频直达 `/v/<数字>`（允许一个尾斜杠），页面按 pathname 解析 id。
+        if (path.size() > 3 && path.compare(0, 3, "/v/") == 0) {
+            std::size_t i = 3;
+            while (i < path.size() && path[i] >= '0' && path[i] <= '9') {
+                ++i;
+            }
+            if (i > 3 && (i == path.size() ||
+                          (i + 1 == path.size() && path[i] == '/'))) {
+                return true;
+            }
+        }
+        return false;
     }
 };
 

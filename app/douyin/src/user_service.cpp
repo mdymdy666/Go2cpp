@@ -159,9 +159,9 @@ bool HandleLogin(douyin::Store& store, const douyin::HttpRequest& request,
     return true;
 }
 
-/// @brief 取资料。
-bool HandleProfile(douyin::Store& store, std::int64_t id,
-                   douyin::HttpResponse* response) {
+/// @brief 取资料（含关注数/粉丝数/当前登录者的关注状态）。
+bool HandleProfile(douyin::Store& store, const douyin::HttpRequest& request,
+                   std::int64_t id, douyin::HttpResponse* response) {
     douyin::StoredUser stored;
     std::string error;
     const bool found = store.FindUserById(id, &stored, &error);
@@ -172,8 +172,35 @@ bool HandleProfile(douyin::Store& store, std::int64_t id,
     if (!found) {
         return Fail(response, 404, "用户不存在");
     }
+    std::int64_t followers = 0;
+    std::int64_t following = 0;
+    if (!store.FollowCounts(id, &followers, &following, &error)) {
+        std::fprintf(stderr, "[%s] 统计关注失败: %s\n", kServiceName,
+                     error.c_str());
+        return Fail(response, 500, "数据库错误");
+    }
+    // 未登录也能看资料：token 缺失或非法时 is_following 一律 false。
+    bool is_following = false;
+    const std::string token = douyin::BearerToken(request);
+    if (!token.empty()) {
+        douyin::TokenInfo info;
+        std::string token_error;
+        if (douyin::VerifyToken(token, NowSeconds(), &info, &token_error) &&
+            info.user_id != id &&
+            !store.IsFollowing(info.user_id, id, &is_following, &error)) {
+            std::fprintf(stderr, "[%s] 查询关注关系失败: %s\n", kServiceName,
+                         error.c_str());
+            is_following = false;
+        }
+    }
+    std::string user_json = douyin::ToJson(PublicUser(stored));
+    user_json.pop_back();  // 去掉结尾 '}'，追加计数字段
+    user_json += ",\"followers\":" + std::to_string(followers) +
+                 ",\"following\":" + std::to_string(following) + "}";
     response->status = 200;
-    response->body = "{\"ok\":true,\"user\":" + douyin::ToJson(PublicUser(stored)) + "}";
+    response->body = std::string("{\"ok\":true,\"is_following\":") +
+                     (is_following ? "true" : "false") + ",\"user\":" +
+                     user_json + "}";
     return true;
 }
 
@@ -224,9 +251,18 @@ bool HandleFollow(douyin::Store& store, const douyin::HttpRequest& request,
         std::fprintf(stderr, "[%s] 关注操作失败: %s\n", kServiceName, error.c_str());
         return Fail(response, 500, "数据库错误");
     }
+    // 响应带上目标用户的最新粉丝数，前端可直接刷新按钮旁的数字。
+    std::int64_t followers = 0;
+    std::int64_t following_count = 0;
+    std::string count_error;
+    if (!store.FollowCounts(target_id, &followers, &following_count,
+                            &count_error)) {
+        followers = 0;
+    }
     response->status = 200;
-    response->body = follow ? "{\"ok\":true,\"following\":true}"
-                            : "{\"ok\":true,\"following\":false}";
+    response->body = std::string("{\"ok\":true,\"following\":") +
+                     (follow ? "true" : "false") +
+                     ",\"followers\":" + std::to_string(followers) + "}";
     return true;
 }
 
@@ -347,7 +383,7 @@ bool Handle(douyin::Store& store, const douyin::HttpRequest& request,
     }
     if (suffix.empty()) {
         if (request.method == "GET") {
-            return HandleProfile(store, id, response);
+            return HandleProfile(store, request, id, response);
         }
         return Fail(response, 405, "方法不允许");
     }

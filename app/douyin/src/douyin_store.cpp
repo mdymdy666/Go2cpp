@@ -132,7 +132,8 @@ constexpr const char* kSchemaSql =
     "  video_id INTEGER NOT NULL,"
     "  user_id INTEGER NOT NULL,"
     "  content TEXT NOT NULL,"
-    "  created_at INTEGER NOT NULL"
+    "  created_at INTEGER NOT NULL,"
+    "  parent_id INTEGER NOT NULL DEFAULT 0"
     ");"
     "CREATE INDEX IF NOT EXISTS idx_comments_video "
     "ON comments(video_id, created_at DESC);"
@@ -188,7 +189,8 @@ void ReadVideoRow(go2cpp::storage::Rows* rows, StoredVideo* out) {
 }
 
 /// @brief comments 查询的固定列顺序（与 `ReadCommentRow` 的下标对应）。
-constexpr const char* kCommentColumns = "id, video_id, user_id, content, created_at";
+constexpr const char* kCommentColumns =
+    "id, video_id, user_id, content, created_at, parent_id";
 
 /// @brief 读当前行（列顺序必须为 `kCommentColumns`）。
 void ReadCommentRow(go2cpp::storage::Rows* rows, StoredComment* out) {
@@ -197,6 +199,7 @@ void ReadCommentRow(go2cpp::storage::Rows* rows, StoredComment* out) {
     out->user_id = rows->Int64(2);
     out->content = rows->Text(3);
     out->created_at = rows->Int64(4);
+    out->parent_id = rows->Int64(5);
 }
 
 /**
@@ -338,6 +341,14 @@ bool Store::EnsureSchema(std::string* error) {
         }
         return false;
     }
+    // step2: 旧库迁移——CREATE TABLE IF NOT EXISTS 不会给已有表加列，
+    //        所以先补 parent_id；列已存在时 ALTER 报 duplicate column，属预期。
+    (void)m_db->Exec(
+        "ALTER TABLE comments ADD COLUMN parent_id INTEGER NOT NULL DEFAULT 0");
+    // step3: 列补齐后再建索引（放在建表脚本里会在旧库上报 no such column）。
+    (void)m_db->Exec(
+        "CREATE INDEX IF NOT EXISTS idx_comments_parent "
+        "ON comments(video_id, parent_id, created_at)");
     return true;
 }
 
@@ -557,6 +568,57 @@ bool Store::Followers(std::int64_t id, std::vector<std::int64_t>* out,
         "SELECT follower_id FROM follows WHERE followee_id = ? "
         "ORDER BY created_at DESC, follower_id DESC",
         id, out, error);
+}
+
+bool Store::FollowCounts(std::int64_t id, std::int64_t* followers,
+                         std::int64_t* following, std::string* error) {
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return false;
+    }
+    auto rows = m_db->Query(
+        "SELECT"
+        " (SELECT COUNT(*) FROM follows WHERE followee_id = ?),"
+        " (SELECT COUNT(*) FROM follows WHERE follower_id = ?)",
+        id, id);
+    if (!rows) {
+        if (error != nullptr) {
+            *error = "统计关注失败: " + DescribeError(rows.Err());
+        }
+        return false;
+    }
+    if (!rows.Value().Next()) {
+        if (error != nullptr) {
+            *error = "统计关注失败: 空结果";
+        }
+        return false;
+    }
+    *followers = rows.Value().Int64(0);
+    *following = rows.Value().Int64(1);
+    return true;
+}
+
+bool Store::IsFollowing(std::int64_t follower, std::int64_t followee, bool* out,
+                        std::string* error) {
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return false;
+    }
+    auto rows = m_db->Query(
+        "SELECT 1 FROM follows WHERE follower_id = ? AND followee_id = ?", follower,
+        followee);
+    if (!rows) {
+        if (error != nullptr) {
+            *error = "查询关注关系失败: " + DescribeError(rows.Err());
+        }
+        return false;
+    }
+    *out = rows.Value().Next();
+    return true;
 }
 
 std::int64_t Store::CreateVideo(std::int64_t user_id, const std::string& title,
@@ -821,7 +883,8 @@ bool Store::HasLiked(std::int64_t video_id, std::int64_t user_id,
 }
 
 std::int64_t Store::AddComment(std::int64_t video_id, std::int64_t user_id,
-                               const std::string& content, std::string* error) {
+                               const std::string& content, std::string* error,
+                               std::int64_t parent_id) {
     if (!Ok()) {
         if (error != nullptr) {
             *error = "数据库尚未打开";
@@ -829,10 +892,10 @@ std::int64_t Store::AddComment(std::int64_t video_id, std::int64_t user_id,
         return -1;
     }
     auto inserted = m_db->Exec(
-        "INSERT INTO comments(video_id, user_id, content, created_at) "
-        "VALUES(?, ?, ?, ?)",
+        "INSERT INTO comments(video_id, user_id, content, created_at, parent_id) "
+        "VALUES(?, ?, ?, ?, ?)",
         video_id, user_id, content,
-        static_cast<std::int64_t>(std::time(nullptr)));
+        static_cast<std::int64_t>(std::time(nullptr)), parent_id);
     if (!inserted) {
         if (error != nullptr) {
             *error = "插入评论失败: " + DescribeError(inserted.Err());
@@ -867,7 +930,7 @@ bool Store::ListComments(std::int64_t video_id, const std::string& cursor,
     }
 
     std::string sql = std::string("SELECT ") + kCommentColumns +
-                      " FROM comments WHERE video_id = ?";
+                      " FROM comments WHERE video_id = ? AND parent_id = 0";
     if (has_cursor) {
         sql += " AND (created_at < ? OR (created_at = ? AND id < ?))";
     }
@@ -904,6 +967,66 @@ bool Store::ListComments(std::int64_t video_id, const std::string& cursor,
     for (StoredComment& comment : page) {
         out->push_back(std::move(comment));
     }
+    return true;
+}
+
+bool Store::ListReplies(std::int64_t video_id, std::int64_t parent_id,
+                        std::int64_t limit, std::vector<StoredComment>* out,
+                        std::string* error) {
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return false;
+    }
+    if (limit <= 0) {
+        return true;
+    }
+    auto rows = m_db->Query(std::string("SELECT ") + kCommentColumns +
+                                " FROM comments WHERE video_id = ? AND parent_id = ?"
+                                " ORDER BY created_at ASC, id ASC LIMIT ?",
+                            video_id, parent_id, limit);
+    if (!rows) {
+        if (error != nullptr) {
+            *error = "查询回复失败: " + DescribeError(rows.Err());
+        }
+        return false;
+    }
+    while (rows.Value().Next()) {
+        StoredComment comment;
+        ReadCommentRow(&rows.Value(), &comment);
+        out->push_back(std::move(comment));
+    }
+    if (rows.Value().Err()) {
+        if (error != nullptr) {
+            *error = "遍历回复失败: " + DescribeError(rows.Value().Err());
+        }
+        return false;
+    }
+    return true;
+}
+
+bool Store::FindComment(std::int64_t id, StoredComment* out,
+                        std::string* error) {
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return false;
+    }
+    auto rows = m_db->Query(std::string("SELECT ") + kCommentColumns +
+                                " FROM comments WHERE id = ?",
+                            id);
+    if (!rows) {
+        if (error != nullptr) {
+            *error = "查询评论失败: " + DescribeError(rows.Err());
+        }
+        return false;
+    }
+    if (!rows.Value().Next()) {
+        return false;
+    }
+    ReadCommentRow(&rows.Value(), out);
     return true;
 }
 

@@ -139,7 +139,8 @@ std::string ToJson(const Comment& value) {
            std::to_string(value.video_id) + "," + Key("user_id") +
            std::to_string(value.user_id) + "," + Key("content") + "\"" +
            EscapeJson(value.content) + "\"," + Key("created_at") +
-           std::to_string(value.created_at) + "}";
+           std::to_string(value.created_at) + "," + Key("parent_id") +
+           std::to_string(value.parent_id) + "}";
 }
 
 std::string ToJson(const Like& value) {
@@ -211,6 +212,7 @@ bool FromJson(const std::string& text, Comment* out) {
     ReadInt(text, "user_id", &value.user_id);
     ReadString(text, "content", &value.content);
     ReadInt(text, "created_at", &value.created_at);
+    ReadInt(text, "parent_id", &value.parent_id);
     *out = std::move(value);
     return true;
 }

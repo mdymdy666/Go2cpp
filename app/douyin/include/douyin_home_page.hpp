@@ -361,6 +361,78 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
   }
   .profile-note { margin-top: 16px; color: var(--muted); font-size: 13.5px; }
 
+  /* ---------- 视频工具行：画幅 + 声音 ---------- */
+  .tools { margin-top: 10px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .tools .fit-btn { margin-top: 0; }
+  .sound-btn {
+    display: inline-flex; align-items: center; gap: 4px;
+    padding: 4px 11px; border-radius: 999px;
+    font-size: 12px; font-weight: 600; line-height: 1.5;
+    color: rgba(255, 255, 255, .86);
+    background: rgba(0, 0, 0, .42);
+    border: 1px solid rgba(255, 255, 255, .26);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    text-shadow: none;
+  }
+  .sound-btn[aria-pressed="true"] {
+    border-color: rgba(37, 244, 238, .6); color: #d9fffd;
+  }
+  .vol { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+  .vol input { width: 72px; accent-color: var(--pink); }
+  @media (max-width: 640px) { .vol input { width: 52px; } }
+
+  /* ---------- 评论二级回复 ---------- */
+  .cp-replies {
+    margin: 7px 0 0 10px; padding-left: 10px;
+    border-left: 2px solid rgba(255, 255, 255, .12);
+  }
+  .cp-replies[hidden] { display: none; }
+  .cp-reply { padding: 5px 0; }
+  .cp-reply .cp-who { margin-bottom: 1px; font-size: 11.5px; }
+  .cp-reply .cp-txt { font-size: 13px; }
+  .cp-more {
+    margin-top: 6px; padding: 4px 10px; border-radius: 8px;
+    font-size: 12px; color: #9fe9e5; background: rgba(37, 244, 238, .1);
+    border: 1px solid rgba(37, 244, 238, .25);
+  }
+  .cp-reply-btn {
+    margin-left: 8px; padding: 0; font-size: 12px; color: var(--muted);
+    background: transparent;
+  }
+  .cp-reply-btn:hover { color: var(--text); }
+  .cp-reply-form { display: flex; gap: 6px; margin: 8px 0 2px 10px; }
+  .cp-reply-form input {
+    flex: 1; min-width: 0; padding: 6px 10px; font-size: 13px;
+    background: #1e1e29; color: var(--text);
+    border: 1px solid var(--line); border-radius: 8px; outline: none;
+  }
+  .cp-reply-form input:focus { border-color: rgba(254, 44, 85, .55); }
+  .cp-reply-form button { padding: 0 12px; font-size: 12px; border-radius: 8px; }
+  .cp-reply-form .send { color: #fff; background: linear-gradient(92deg, var(--pink), #ff5c7a); }
+  .cp-reply-form .cancel { color: var(--muted); background: #23232e; }
+  .cp-reply-form button:disabled { opacity: .5; cursor: default; }
+
+  /* ---------- 主页关注按钮与数据 ---------- */
+  .p-stats { display: flex; gap: 22px; margin: 10px 0 2px; font-size: 12.5px; color: var(--muted); }
+  .p-stats b { display: block; font-size: 17px; color: var(--text); font-weight: 700; }
+  .p-actions { display: flex; gap: 8px; margin-top: 12px; }
+  .follow-btn {
+    padding: 8px 22px; border-radius: 999px;
+    font-size: 13.5px; font-weight: 700; color: #fff;
+    background: linear-gradient(92deg, var(--pink), #ff5c7a);
+  }
+  .follow-btn.following {
+    color: var(--text); background: #23232e; border: 1px solid var(--line);
+  }
+  .follow-btn:disabled { opacity: .6; cursor: default; }
+  .p-self-tag {
+    display: inline-block; margin-top: 8px; padding: 3px 10px;
+    font-size: 12px; color: var(--muted);
+    background: rgba(255, 255, 255, .06); border: 1px solid var(--line);
+    border-radius: 999px;
+  }
+
   /* ---------- 主页视频弹层 ---------- */
   .video-modal {
     position: fixed; inset: 0; z-index: 80;
@@ -414,14 +486,19 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
 <header class="topbar" id="topbar">
   <div class="brand">Go2Cpp 抖音<small>FEED · PLAY · LIKE · COMMENT</small></div>
   <div class="auth">
-    <span class="who" id="who"><span class="dot"></span><b id="whoName"></b></span>
+    <span class="who" id="who" title="点击进入我的主页"><span class="dot"></span><b id="whoName"></b></span>
     <input class="login-only" id="email" type="email" value="admin@demo.local"
            placeholder="邮箱" autocomplete="username" spellcheck="false">
     <input class="login-only" id="password" type="password" value="123456"
            placeholder="密码" autocomplete="current-password">
     <button class="btn-primary login-only" id="loginBtn" type="button">登录</button>
+    <span class="vol" title="视频音量">
+      <span id="volIcon">🔊</span>
+      <input id="volumeSlider" type="range" min="0" max="100" value="100" aria-label="音量">
+    </span>
     <input type="file" id="uploadInput" accept="video/mp4" hidden>
     <button class="btn-ghost upload-btn" id="uploadBtn" type="button">上传</button>
+    <button class="btn-ghost mine-btn" id="mineBtn" type="button" style="display:none">我的主页</button>
     <button class="btn-ghost" id="logoutBtn" type="button" style="display:none">退出</button>
   </div>
 </header>
@@ -464,17 +541,23 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
 (function () {
   'use strict';
 
-  /* 公网前缀可能被访问成 /douyin（无尾斜杠），此时相对路径会解析到根路径；
-     先补一个尾斜杠再继续，保证 api/ 与 videos/ 都落在同一前缀下。 */
-  if (location.pathname.slice(-1) !== '/' &&
-      !/\.[a-z0-9]+$/i.test(location.pathname)) {
-    location.replace(location.pathname + '/' + location.search + location.hash);
-  }
+  /* 计算页面根前缀：本机 `/`、公网 `/douyin/`、直达链接 `/v/12` 或
+     `/douyin/v/12` 都归一到页面所在目录。所有 api/videos 请求都拼这个前缀，
+     因此 `/v/<id>` 直达页里的相对路径不会错位（不再靠重定向补尾斜杠）。 */
+  var BASE = (function () {
+    var p = location.pathname;
+    var m = p.match(/^(.*)\/v\/\d+\/?$/);
+    if (m) return m[1] + '/';
+    if (p.slice(-1) !== '/' && !/\.[a-z0-9]+$/i.test(p)) return p + '/';
+    return p;
+  })();
 
   var TOKEN_KEY = 'douyin_token';
   var USER_KEY = 'douyin_user';
   var LIKES_KEY = 'douyin_likes';
   var FIT_KEY = 'douyin_fit';
+  var MUTE_KEY = 'douyin_muted';
+  var VOL_KEY = 'douyin_volume';
 
   var state = {
     token: localStorage.getItem(TOKEN_KEY) || '',
@@ -487,7 +570,10 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     panelSlide: null,
     profileUserId: '',
     modalOpen: false,
-    fit: 'contain'
+    fit: 'contain',
+    muted: true,
+    volume: 1,
+    deepLink: ''
   };
   try {
     state.user = JSON.parse(localStorage.getItem(USER_KEY) || 'null');
@@ -498,6 +584,15 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
   }
   /* 画幅持久化：cover=铺满裁切，其余一律按默认 contain（完整显示） */
   state.fit = localStorage.getItem(FIT_KEY) === 'cover' ? 'cover' : 'contain';
+  /* 声音偏好：默认静音（浏览器自动播放策略要求），点过「开声音」后记住。 */
+  state.muted = localStorage.getItem(MUTE_KEY) !== '0';
+  var savedVol = Number(localStorage.getItem(VOL_KEY));
+  state.volume = isFinite(savedVol) && savedVol >= 0 ? Math.min(savedVol, 1) : 1;
+  /* 直达链接：/v/<id> 或 ?video=<id> */
+  var deepPath = location.pathname.match(/\/v\/(\d+)\/?$/);
+  var deepQuery = '';
+  try { deepQuery = new URLSearchParams(location.search).get('video') || ''; } catch (e) {}
+  state.deepLink = deepPath ? deepPath[1] : (/^\d+$/.test(deepQuery) ? deepQuery : '');
 
   var feedEl = document.getElementById('feed');
   var toastEl = document.getElementById('toast');
@@ -572,7 +667,7 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     var headers = { 'Accept': 'application/json' };
     if (options.body !== undefined) headers['Content-Type'] = 'application/json';
     if (state.token) headers['Authorization'] = 'Bearer ' + state.token;
-    return fetch(path, {
+    return fetch(BASE + path, {
       method: options.method || 'GET',
       headers: headers,
       body: options.body === undefined ? undefined : JSON.stringify(options.body)
@@ -600,6 +695,8 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     logoutBtn.style.display = isIn ? '' : 'none';
     whoName.textContent = isIn ? (user.name || user.email || '已登录') : '';
     cpInput.placeholder = isIn ? '说点什么…' : '登录后参与评论';
+    var mineBtn = document.getElementById('mineBtn');
+    if (mineBtn) mineBtn.style.display = isIn ? '' : 'none';
   }
 
   function clearAuth() {
@@ -636,8 +733,8 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
         localStorage.setItem(USER_KEY, JSON.stringify(state.user));
         setSignedIn(state.user);
         toast('登录成功，欢迎 ' + (state.user.name || email), 'ok');
-        if (state.profileUserId === String(state.user.id) && !profileEl.hidden) {
-          renderProfile(state.user);
+        if (!profileEl.hidden && state.profileUserId) {
+          showProfile(state.profileUserId);
         }
       })
       .catch(function (err) { toast('登录失败：' + (err.message || '网络错误'), 'err'); })
@@ -689,26 +786,82 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
 
   /* ---------- 评论面板 ---------- */
 
-  function commentItem(c) {
+  var REPLY_FOLD = 2;  /* 二级回复默认显示条数，超出折叠 */
+
+  function commentItem(c, replies, expandAll) {
     var row = document.createElement('div');
     row.className = 'cp-item';
+    row.dataset.cid = String(c.id === undefined ? '' : c.id);
     var who = document.createElement('div');
     who.className = 'cp-who';
     var uid = document.createElement('b');
     uid.textContent = '用户 #' + (c.user_id === undefined ? '—' : c.user_id);
     who.appendChild(uid);
     who.appendChild(document.createTextNode(' · ' + fmtTime(c.created_at)));
+    var replyBtn = document.createElement('button');
+    replyBtn.type = 'button';
+    replyBtn.className = 'cp-reply-btn';
+    replyBtn.textContent = '回复';
+    replyBtn.addEventListener('click', function () { openReplyForm(row, c); });
+    who.appendChild(replyBtn);
+
     var txt = document.createElement('div');
     txt.className = 'cp-txt';
     txt.textContent = c.content || '';
     row.appendChild(who);
     row.appendChild(txt);
+
+    var box = document.createElement('div');
+    box.className = 'cp-replies';
+    row.appendChild(box);
+    renderReplies(row, replies || [], !!expandAll);
     return row;
+  }
+
+  /* 渲染某条顶层评论下的回复；超过 REPLY_FOLD 条折叠成「展开更多 N 条」。 */
+  function renderReplies(row, replies, expandAll) {
+    var box = row.querySelector('.cp-replies');
+    if (!box) return;
+    row._replies = replies;
+    box.innerHTML = '';
+    if (!replies.length) {
+      box.hidden = true;
+      return;
+    }
+    box.hidden = false;
+    var show = expandAll ? replies.length : Math.min(replies.length, REPLY_FOLD);
+    for (var i = 0; i < show; i++) {
+      var r = replies[i] || {};
+      var item = document.createElement('div');
+      item.className = 'cp-reply';
+      var who = document.createElement('div');
+      who.className = 'cp-who';
+      var b = document.createElement('b');
+      b.textContent = '用户 #' + (r.user_id === undefined ? '—' : r.user_id);
+      who.appendChild(b);
+      who.appendChild(document.createTextNode(' · ' + fmtTime(r.created_at)));
+      var t = document.createElement('div');
+      t.className = 'cp-txt';
+      t.textContent = r.content || '';
+      item.appendChild(who);
+      item.appendChild(t);
+      box.appendChild(item);
+    }
+    if (show < replies.length) {
+      var more = document.createElement('button');
+      more.type = 'button';
+      more.className = 'cp-more';
+      more.textContent = '展开更多 ' + (replies.length - show) + ' 条回复';
+      more.addEventListener('click', function () {
+        renderReplies(row, row._replies || [], true);
+      });
+      box.appendChild(more);
+    }
   }
 
   function renderComments(items) {
     cpList.innerHTML = '';
-    var list = (items || []).map(function (it) { return it.comment || it; });
+    var list = items || [];
     if (!list.length) {
       var empty = document.createElement('div');
       empty.className = 'cp-empty';
@@ -716,7 +869,65 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
       cpList.appendChild(empty);
       return;
     }
-    list.forEach(function (c) { cpList.appendChild(commentItem(c)); });
+    list.forEach(function (it) {
+      var c = it.comment || it;
+      cpList.appendChild(commentItem(c, it.replies || [], false));
+    });
+  }
+
+  /* 在指定评论下展开回复输入框（同一时间只保留一个）。 */
+  function openReplyForm(row, c) {
+    var old = cpList.querySelector('.cp-reply-form');
+    if (old) old.remove();
+    if (!state.token) { toast('请先登录再回复', 'err'); return; }
+    var form = document.createElement('div');
+    form.className = 'cp-reply-form';
+    var input = document.createElement('input');
+    input.type = 'text';
+    input.maxLength = 500;
+    input.placeholder = '回复 用户 #' + (c.user_id === undefined ? '—' : c.user_id) + '…';
+    var send = document.createElement('button');
+    send.type = 'button';
+    send.className = 'send';
+    send.textContent = '发送';
+    var cancel = document.createElement('button');
+    cancel.type = 'button';
+    cancel.className = 'cancel';
+    cancel.textContent = '取消';
+    cancel.addEventListener('click', function () { form.remove(); });
+    send.addEventListener('click', function () {
+      var content = (input.value || '').trim();
+      if (!content) { toast('回复内容不能为空', 'err'); return; }
+      send.disabled = true;
+      api('api/comment', {
+        method: 'POST',
+        body: {
+          video_id: Number(state.panelVideoId),
+          content: content,
+          parent_id: Number(c.id)
+        }
+      }).then(function (data) {
+        var reply = (data && data.comment) || {
+          user_id: state.user ? state.user.id : 0,
+          content: content,
+          created_at: Math.floor(Date.now() / 1000),
+          parent_id: c.id
+        };
+        var list = (row._replies || []).slice();
+        list.push(reply);
+        renderReplies(row, list, true);
+        form.remove();
+        bumpCommentCount(state.panelVideoId);
+        toast('回复已发送', 'ok');
+      }).catch(function (err) {
+        if (!handleAuthError(err)) toast('回复失败：' + (err.message || '网络错误'), 'err');
+      }).then(function () { send.disabled = false; });
+    });
+    form.appendChild(input);
+    form.appendChild(send);
+    form.appendChild(cancel);
+    row.appendChild(form);
+    input.focus();
   }
 
   function openComments(slide) {
@@ -797,12 +1008,123 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
       };
       var empty = cpList.querySelector('.cp-empty');
       if (empty) cpList.removeChild(empty);
-      cpList.insertBefore(commentItem(c), cpList.firstChild);
+      cpList.insertBefore(commentItem(c, [], false), cpList.firstChild);
       bumpCommentCount(state.panelVideoId);
       toast('评论已发送', 'ok');
     }).catch(function (err) {
       if (!handleAuthError(err)) toast('评论失败：' + (err.message || '网络错误'), 'err');
     }).then(function () { cpSend.disabled = false; });
+  }
+
+  /* ---------- 声音控制 ---------- */
+
+  /* 把全局静音/音量状态套到所有视频与按钮上（新插入的 slide 也要调用）。 */
+  function applySound() {
+    feedEl.querySelectorAll('video').forEach(function (v) {
+      v.muted = state.muted;
+      v.volume = state.volume;
+    });
+    document.querySelectorAll('.sound-btn').forEach(function (b) {
+      b.textContent = state.muted ? '🔇 开声音' : '🔊 声音开';
+      b.setAttribute('aria-pressed', state.muted ? 'false' : 'true');
+    });
+    var slider = document.getElementById('volumeSlider');
+    if (slider) slider.value = String(Math.round(state.volume * 100));
+    var icon = document.getElementById('volIcon');
+    if (icon) {
+      icon.textContent = (state.muted || state.volume === 0)
+        ? '🔇' : (state.volume < 0.5 ? '🔈' : '🔊');
+    }
+  }
+
+  /* 切换静音；silent=true 时不弹 toast（拖动音量条时用）。 */
+  function setMuted(muted, silent) {
+    state.muted = !!muted;
+    try { localStorage.setItem(MUTE_KEY, state.muted ? '1' : '0'); } catch (e) {}
+    applySound();
+    if (!state.muted) {
+      var active = state.activeVideo || feedEl.querySelector('.slide.active video');
+      if (active) {
+        var p = active.play();
+        if (p && p.catch) p.catch(function () {});
+      }
+    }
+    if (!silent) toast(state.muted ? '已静音' : '已开启声音');
+  }
+
+  /* ---------- 分享链接 / 直达 ---------- */
+
+  function videoLink(id) {
+    return location.origin + BASE + 'v/' + id;
+  }
+
+  function fallbackCopy(text, done) {
+    var area = document.createElement('textarea');
+    area.value = text;
+    area.style.position = 'fixed';
+    area.style.top = '-1000px';
+    area.style.opacity = '0';
+    document.body.appendChild(area);
+    area.select();
+    var ok = false;
+    try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+    document.body.removeChild(area);
+    if (ok) { done(); } else { toast('复制失败，链接：' + text, 'err'); }
+  }
+
+  function copyVideoLink(id) {
+    var url = videoLink(id);
+    var done = function () { toast('链接已复制：' + url, 'ok'); };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(url).then(done, function () {
+        fallbackCopy(url, done);
+      });
+    } else {
+      fallbackCopy(url, done);
+    }
+  }
+
+  /* 打开分享链接后滚到对应视频并播放；不在当前 feed 时提示。 */
+  function jumpToVideo(id) {
+    var slide = slideById(id);
+    if (!slide) {
+      toast('视频 #' + id + ' 不在当前推荐流中', 'err');
+      return;
+    }
+    /* 用 scrollIntoView 交给浏览器处理滚动容器，避免 offsetParent 差异 */
+    if (slide.scrollIntoView) {
+      slide.scrollIntoView({ block: 'start' });
+    } else {
+      feedEl.scrollTop = slide.offsetTop;
+    }
+    var video = slide.querySelector('video');
+    if (video) playOnly(video);
+  }
+
+  /* ---------- 关注 / 取关 ---------- */
+
+  function toggleFollow(user, btn, stats) {
+    if (!state.token) { toast('请先登录再关注', 'err'); return; }
+    var following = btn.classList.contains('following');
+    btn.disabled = true;
+    api('api/user/' + user.id + '/follow', { method: following ? 'DELETE' : 'POST' })
+      .then(function (data) {
+        var now = !following;
+        btn.classList.toggle('following', now);
+        btn.textContent = now ? '已关注' : '+ 关注';
+        if (data && typeof data.followers === 'number') {
+          user.followers = data.followers;
+          var el = stats.querySelector('.p-followers');
+          if (el) el.textContent = fmt(data.followers);
+        }
+        toast(now ? '已关注 @' + (user.name || user.id) : '已取消关注');
+      })
+      .catch(function (err) {
+        if (!handleAuthError(err)) {
+          toast('关注失败：' + (err.message || '网络错误'), 'err');
+        }
+      })
+      .then(function () { btn.disabled = false; });
   }
 
   /* ---------- 播放控制 ---------- */
@@ -817,7 +1139,17 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     });
     var p = video.play();
     if (p && p.catch) {
-      p.catch(function () { /* 浏览器策略拒绝时保持静音状态，不弹错 */ });
+      p.catch(function () {
+        /* 未静音时自动播放会被策略拒绝：回退静音并提示一次。 */
+        if (!state.muted) {
+          state.muted = true;
+          try { localStorage.setItem(MUTE_KEY, '1'); } catch (e) {}
+          applySound();
+          var retry = video.play();
+          if (retry && retry.catch) retry.catch(function () {});
+          toast('浏览器限制自动播放，已暂时静音；点「开声音」恢复', 'err');
+        }
+      });
     }
   }
 
@@ -875,12 +1207,13 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     feedEl.appendChild(frag);
     feedEl.scrollTop = 0;
     setupObserver();
+    applySound();
   }
 
   function uploadVideo(file) {
     var title = file.name || '未命名视频';
     var xhr = new XMLHttpRequest();
-    xhr.open('POST', 'api/video/upload?title=' + encodeURIComponent(title));
+    xhr.open('POST', BASE + 'api/video/upload?title=' + encodeURIComponent(title));
     xhr.setRequestHeader('Authorization', 'Bearer ' + state.token);
     xhr.setRequestHeader('Content-Type', 'video/mp4');
     uploadBtn.disabled = true;
@@ -917,12 +1250,13 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
 
   /* ---------- feed 渲染 ---------- */
 
-  /* 上传的视频用服务端返回的 videos/upload_* 相对路径；其余沿用 1..3 演示源。 */
+  /* 上传的视频用服务端返回的 videos/upload_* 路径；其余按 id 映射到
+     demo1..5.mp4（五个素材都带音轨，id%5 分布均匀）。 */
   function videoSrc(v) {
     v = v || {};
     var url = String(v.url || '');
-    if (/^videos\/[A-Za-z0-9_.-]+$/.test(url)) return url;
-    return 'videos/' + ((Number(v.id) % 3) + 1) + '.mp4';
+    if (/^videos\/[A-Za-z0-9_.-]+$/.test(url)) return BASE + url;
+    return BASE + 'videos/demo' + ((Number(v.id) % 5) + 1) + '.mp4';
   }
 
   function authorName(item) {
@@ -942,11 +1276,11 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     var video = document.createElement('video');
     video.className = 'main-video' + (state.fit === 'cover' ? ' cover' : '');
     video.src = videoSrc(v);
-    video.muted = true;
+    video.muted = state.muted;
+    video.volume = state.volume;
     video.loop = true;
     video.playsInline = true;
     video.preload = 'metadata';
-    video.setAttribute('muted', '');
     video.setAttribute('playsinline', '');
     video.setAttribute('webkit-playsinline', '');
 
@@ -999,10 +1333,26 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
       setFit(state.fit === 'cover' ? 'contain' : 'cover');
     });
 
+    var soundBtn = document.createElement('button');
+    soundBtn.type = 'button';
+    soundBtn.className = 'sound-btn';
+    soundBtn.textContent = state.muted ? '🔇 开声音' : '🔊 声音开';
+    soundBtn.setAttribute('aria-pressed', state.muted ? 'false' : 'true');
+    soundBtn.title = '切换静音/取消静音';
+    soundBtn.addEventListener('click', function (e) {
+      e.stopPropagation();
+      setMuted(!state.muted);
+    });
+
+    var tools = document.createElement('div');
+    tools.className = 'tools';
+    tools.appendChild(fitBtn);
+    tools.appendChild(soundBtn);
+
     meta.appendChild(title);
     meta.appendChild(authorRow);
     meta.appendChild(stats);
-    meta.appendChild(fitBtn);
+    meta.appendChild(tools);
 
     var rail = document.createElement('div');
     rail.className = 'rail';
@@ -1029,9 +1379,20 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
       openComments(slide);
     });
 
+    var shareBtn = document.createElement('button');
+    shareBtn.type = 'button';
+    shareBtn.className = 'share-btn';
+    shareBtn.innerHTML = '<span class="ico">🔗</span><span>分享</span>';
+    shareBtn.title = '复制这条视频的分享链接';
+    shareBtn.addEventListener('click', function (e) {
+      e.stopPropagation();
+      copyVideoLink(id);
+    });
+
     rail.appendChild(railAvatar);
     rail.appendChild(likeBtn);
     rail.appendChild(cmtBtn);
+    rail.appendChild(shareBtn);
 
     var openProfile = function (e) {
       e.stopPropagation();
@@ -1116,6 +1477,11 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
         feedEl.appendChild(frag);
         feedEl.scrollTop = 0;
         setupObserver();
+        applySound();
+        if (state.deepLink) {
+          jumpToVideo(state.deepLink);
+          toast('已定位到分享的视频 #' + state.deepLink, 'ok');
+        }
       })
       .catch(function (err) {
         showNotice('feed 加载失败：' + (err.message || '网络错误'), true);
@@ -1124,9 +1490,10 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
 
   /* ---------- 用户主页 ---------- */
 
-  function renderProfile(user) {
+  function renderProfile(user, isFollowing) {
     var name = user.name || ('user' + (user.id || ''));
     var isVip = !!(user.vip || user.is_vip || Number(user.vip_level) > 0);
+    var self = !!(state.user && String(state.user.id) === String(user.id));
     profileBody.innerHTML = '';
 
     var card = document.createElement('div');
@@ -1144,13 +1511,45 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     var created = document.createElement('div');
     created.className = 'p-line';
     created.textContent = '注册时间：' + fmtTime(user.created_at);
+
+    /* 数据行：作品 / 关注 / 粉丝（作品数加载完视频再填） */
+    var stats = document.createElement('div');
+    stats.className = 'p-stats';
+    stats.innerHTML = '<span><b class="p-videos">—</b>作品</span>' +
+                      '<span><b class="p-following"></b>关注</span>' +
+                      '<span><b class="p-followers"></b>粉丝</span>';
+    stats.querySelector('.p-following').textContent = fmt(user.following);
+    stats.querySelector('.p-followers').textContent = fmt(user.followers);
+
     var vip = document.createElement('span');
     vip.className = 'vip' + (isVip ? '' : ' off');
     vip.textContent = isVip ? 'VIP 会员' : '普通用户（非 VIP）';
+
     info.appendChild(h3);
     info.appendChild(email);
     info.appendChild(created);
+    info.appendChild(stats);
     info.appendChild(vip);
+
+    if (self) {
+      var tag = document.createElement('span');
+      tag.className = 'p-self-tag';
+      tag.textContent = '这是你的主页';
+      info.appendChild(tag);
+    } else {
+      var actions = document.createElement('div');
+      actions.className = 'p-actions';
+      var followBtn = document.createElement('button');
+      followBtn.type = 'button';
+      followBtn.className = 'follow-btn' + (isFollowing ? ' following' : '');
+      followBtn.textContent = isFollowing ? '已关注' : '+ 关注';
+      followBtn.addEventListener('click', function () {
+        toggleFollow(user, followBtn, stats);
+      });
+      actions.appendChild(followBtn);
+      info.appendChild(actions);
+    }
+
     card.appendChild(bigAvatar);
     card.appendChild(info);
     profileBody.appendChild(card);
@@ -1164,19 +1563,25 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     profileBody.appendChild(note);
 
     var uid = String(user.id);
-    api('api/feed?limit=100').then(function (data) {
+    /* 自己的主页走 /api/video/mine（只取自己的，不受 feed 热度排序影响）；
+       别人的主页仍走 feed 过滤，与既有数据路径兼容。 */
+    var source = self ? api('api/video/mine?limit=30') : api('api/feed?limit=100');
+    source.then(function (data) {
       var all = data.items || [];
-      var mine = all.filter(function (it) {
+      var mine = self ? all : all.filter(function (it) {
         return String((it.video || {}).user_id) === uid;
       }).slice(0, 30);
+      var vcount = stats.querySelector('.p-videos');
+      if (vcount) vcount.textContent = fmt(mine.length);
       grid.innerHTML = '';
       if (!mine.length) {
-        note.textContent = '该用户暂时没有视频';
+        note.textContent = self ? '你还没有发过视频，点右上角「上传」发一条' :
+                                  '该用户暂时没有视频';
         return;
       }
       note.textContent = '共 ' + mine.length + ' 条视频 · 点击播放';
       mine.forEach(function (item) {
-        var v = item.video || {};
+        var v = item.video || item;
         var cardBtn = document.createElement('button');
         cardBtn.type = 'button';
         cardBtn.className = 'pv-card';
@@ -1214,7 +1619,9 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     loading.textContent = '加载 ' + (fallbackName ? '@' + fallbackName : '用户') + ' 的主页…';
     profileBody.appendChild(loading);
     api('api/user/' + state.profileUserId)
-      .then(function (data) { renderProfile(data.user || {}); })
+      .then(function (data) {
+        renderProfile(data.user || {}, !!data.is_following);
+      })
       .catch(function (err) {
         profileBody.innerHTML = '';
         var box = document.createElement('div');
@@ -1281,6 +1688,24 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     sendComment();
   });
   document.getElementById('profileBack').addEventListener('click', hideProfile);
+  document.getElementById('mineBtn').addEventListener('click', function () {
+    if (!state.user) { toast('请先登录', 'err'); return; }
+    showProfile(state.user.id, state.user.name);
+  });
+  document.getElementById('who').addEventListener('click', function () {
+    if (!state.user) return;
+    showProfile(state.user.id, state.user.name);
+  });
+  var volSlider = document.getElementById('volumeSlider');
+  volSlider.addEventListener('input', function () {
+    state.volume = Math.max(0, Math.min(1, Number(volSlider.value) / 100));
+    try { localStorage.setItem(VOL_KEY, String(state.volume)); } catch (e) {}
+    if (state.volume > 0 && state.muted) {
+      setMuted(false, true);
+    } else {
+      applySound();
+    }
+  });
   document.getElementById('vmClose').addEventListener('click', closeVideoModal);
   modalEl.addEventListener('click', function (e) {
     if (e.target === modalEl) closeVideoModal();
@@ -1295,6 +1720,7 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
   if (state.token && state.user) {
     setSignedIn(state.user);
   }
+  applySound();
   loadFeed();
 })();
 </script>
