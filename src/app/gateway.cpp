@@ -29,6 +29,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
+#include <exception>
 #include <fstream>
 #include <memory>
 #include <mutex>
@@ -172,7 +173,10 @@ std::string SerializeResponse(http::Method method, const Response& response) {
     if (!body_forbidden) {
         wire += "Content-Length: " + std::to_string(response.body.size()) + "\r\n";
     }
-    wire += "Connection: close\r\n\r\n";
+    // 连接去留由调用方按「是否还有流水线请求/对端是否要求关闭」决定，
+    // 序列化器只忠实反映该决定，避免响应头与实际关闭行为不一致。
+    wire += response.close ? "Connection: close\r\n\r\n"
+                           : "Connection: keep-alive\r\n\r\n";
     if (!body_forbidden && method != http::Method::Head) {
         wire += response.body;
     }
@@ -1142,7 +1146,25 @@ struct Gateway::Impl {
                 queue.pop_front();
             }
             if (connection) {
-                ServeConnection(connection);
+                // 兜底：ServeConnection 已把 Dispatch 的异常转成 500；这里防的是
+                // 序列化/写回等边缘路径漏出的异常，绝不允许穿过 worker 线程触发 terminate。
+                try {
+                    ServeConnection(connection);
+                } catch (const std::exception& error) {
+                    internal_errors.fetch_add(1, std::memory_order_relaxed);
+                    GO2CPP_LOG_ERROR(GO2CPP_LOG_NAME("app"))
+                        << "gateway connection handler threw: " << error.what();
+                    WriteAll(connection,
+                             "HTTP/1.1 500 Internal Server Error\r\n"
+                             "Content-Length: 0\r\nConnection: close\r\n\r\n");
+                } catch (...) {
+                    internal_errors.fetch_add(1, std::memory_order_relaxed);
+                    GO2CPP_LOG_ERROR(GO2CPP_LOG_NAME("app"))
+                        << "gateway connection handler threw unknown exception";
+                    WriteAll(connection,
+                             "HTTP/1.1 500 Internal Server Error\r\n"
+                             "Content-Length: 0\r\nConnection: close\r\n\r\n");
+                }
                 connection->close();
             }
             {
@@ -1152,57 +1174,127 @@ struct Gateway::Impl {
         }
     }
 
-    /// @brief 单连接循环：Parser 解析一个请求 → Dispatch → 显式序列化写回 → 关闭。
+    /// @brief 单连接循环：逐个处理已到达请求（含同包流水线）→ Dispatch → 写回。
     /**
-     * @brief 在一条已 accept 的连接上读一个请求、分发、写回响应（每连接一次请求，不支持 keep-alive 循环）。
+     * @brief 在一条已 accept 的连接上按序处理所有已到达的请求；每个请求带读取总时限，Dispatch 异常兜底为 500。
      * @param connection [in] 已就绪的连接——借用，生命周期由 worker 持有；不可为 nullptr；函数返回后由调用方 close。
-     * @return 无返回值；任何 I/O 或解析失败都直接 return（连接留给调用方关闭），不产生错误响应。
+     *
+     * @return 无返回值；任何 I/O、解析或总时限失败都直接 return（连接留给调用方关闭），不向调用方抛异常。
+     *
      * ## 定位
      * 网关连接处理的唯一入口（WorkerLoop → ServeConnection）：请求解析、Dispatch、序列化、写回全在这里。
-     * 若解析失败仍尝试写响应，会对半包/恶意连接写脏数据；若 recv 不设超时，慢连接会永久占住 worker。
+     * 写错会直接造成生产事故：① handler 异常穿过 worker 线程 → std::terminate 进程崩溃；
+     * ② 单次 recv 超时被慢连接无限续期 → 少量半开连接占满 worker，全站拒绝服务。
+     *
      * ## 步骤
-     * step1. 优先消费 pending 里上次 recv 的剩余字节，否则带 30s 超时 recv 新数据；
-     * step2. 解析到完整请求为止；NeedMore 继续读，Error 立即返回；
-     * step3. Dispatch 得到响应（路由/鉴权/限流/转发都在其中）；
-     * step4. 按方法序列化（HEAD 去体）；
-     * step5. WriteAll 一次性写回，失败由调用方关闭连接。
+     * step1. 为本请求建立 `request_timeout` 总 deadline（第一次 recv 前起算），
+     *        每次 recv 只等「剩余时间」与 30s 的较小值，到期立即关闭；
+     * step2. 解析到完整请求为止：NeedMore 继续读，Error 立即返回；
+     *        首个请求允许阻塞等数据，后续流水线请求只消费已缓冲字节（残包仍可续读）；
+     * step3. 同一 recv 的剩余字节交给下一条请求（`take_remaining()`），不再丢弃；
+     * step4. Dispatch 外包 try/catch：handler/中间件任何异常 → 500 + close + 计数；
+     * step5. 按方法序列化（HEAD 去体），`Connection` 头与实际是否关闭保持一致；
+     * step6. 写回；要求关闭或流水线已耗尽则返回，否则继续处理下一条。
+     *
      * ## 并发/失败语义
-     * - 调用约束：每个连接只由一个 worker 线程处理；parser/buffer 都是栈上局部对象，天然线程隔离。
+     * - 调用约束：每个连接只由一个 worker 线程处理；parser/buffer 都是循环内局部对象，天然线程隔离。
      * - 原子性：响应在内存中完整构造后才写 socket，不会写出半个响应。
-     * - 失败语义：不抛异常；读写失败静默返回，调用方统一 close 并回收 active 表项。
-     * - 不变量：返回时该连接的状态要么已写完整响应，要么确定不可继续使用。
+     * - 失败语义：不抛异常；I/O/解析失败静默返回，Dispatch 异常转 500；调用方统一 close 并回收 active 表项。
+     * - 不变量：返回时该连接要么已写完整响应且确定不可继续，要么已无缓冲请求。
      */
     void ServeConnection(const net::Socket::Ptr& connection) {
-        // step1/step2: 循环读取并喂给 parser；pending 表示同一 recv 里剩余的流水线字节。
-        http::Parser parser;
-        std::string pending;
+        // step1: 缓冲跨请求复用；pending 是已收到但尚未解析的流水线字节。
+        constexpr std::size_t kMaxRequestsPerConnection = 100;
+        constexpr auto kMaxRecvSlice = std::chrono::milliseconds(30000);
         std::array<char, 8192> buffer{};
-        http::Request request;
-        http::ParseResult parsed;
-        do {
-            if (!pending.empty()) {
-                parsed = parser.feed(pending, request);
-                pending.clear();
-            } else {
-                const auto count = connection->recv(
-                    buffer.data(), buffer.size(), 0, std::chrono::milliseconds(30000));
-                if (!count.ok() || count.transferred <= 0) {
+        std::string pending;
+
+        for (std::size_t served = 0; served < kMaxRequestsPerConnection; ++served) {
+            const auto deadline =
+                std::chrono::steady_clock::now() + config.request_timeout;
+            http::Parser parser;
+            http::Request request;
+            http::ParseResult parsed;
+            // 首个请求允许等 socket 新数据；后续请求只有已缓冲字节时才继续读，
+            // 防止空闲 keep-alive 连接把 worker 占在 recv 上。
+            bool allow_recv = served == 0 || !pending.empty();
+            do {
+                if (!pending.empty()) {
+                    parsed = parser.feed(pending, request);
+                    pending.clear();
+                    allow_recv = true;
+                } else {
+                    if (!allow_recv) {
+                        return;
+                    }
+                    // step1: 每次 recv 只看总 deadline 的剩余时间，慢连接无法靠
+                    // 「每次多等 30s」续期；到点直接放弃该连接。
+                    const auto now = std::chrono::steady_clock::now();
+                    if (now >= deadline) {
+                        request_timeouts.fetch_add(1, std::memory_order_relaxed);
+                        return;
+                    }
+                    const auto remaining =
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            deadline - now);
+                    const auto slice = std::min(remaining, kMaxRecvSlice);
+                    const auto count = connection->recv(
+                        buffer.data(), buffer.size(), 0,
+                        slice.count() > 0 ? slice : std::chrono::milliseconds(1));
+                    if (!count.ok() || count.transferred <= 0) {
+                        if (std::chrono::steady_clock::now() >= deadline) {
+                            request_timeouts.fetch_add(1,
+                                                       std::memory_order_relaxed);
+                        }
+                        return;
+                    }
+                    parsed = parser.feed(
+                        std::string_view(buffer.data(),
+                                         static_cast<std::size_t>(count.transferred)),
+                        request);
+                }
+                if (parsed.state == http::ParseState::Error) {
                     return;
                 }
-                parsed = parser.feed(
-                    std::string_view(buffer.data(),
-                                     static_cast<std::size_t>(count.transferred)),
-                    request);
+            } while (parsed.state == http::ParseState::NeedMore);
+
+            // step3: 同一 recv 里可能已带着下一条请求，留给下一轮而不是丢弃。
+            pending = parser.take_remaining();
+
+            // step4: Dispatch 兜底：自定义 handler/中间件 throw 不能穿出 worker 线程。
+            Response response;
+            try {
+                response = Dispatch(request);
+            } catch (const std::exception& error) {
+                internal_errors.fetch_add(1, std::memory_order_relaxed);
+                GO2CPP_LOG_ERROR(GO2CPP_LOG_NAME("app"))
+                    << "gateway handler threw: " << error.what();
+                response = ErrorResponse(500, "internal server error");
+                response.close = true;
+            } catch (...) {
+                internal_errors.fetch_add(1, std::memory_order_relaxed);
+                GO2CPP_LOG_ERROR(GO2CPP_LOG_NAME("app"))
+                    << "gateway handler threw unknown exception";
+                response = ErrorResponse(500, "internal server error");
+                response.close = true;
             }
-            if (parsed.state == http::ParseState::Error) {
+
+            // step5: 只有缓冲里确实还有下一条请求才保持连接，否则关闭；
+            // 这样既服务了流水线，又不为「等下一次请求」白占 worker。
+            const bool close_after = request.close || response.close ||
+                                     pending.empty() ||
+                                     served + 1 >= kMaxRequestsPerConnection;
+            response.close = close_after;
+            const std::string wire = SerializeResponse(request.method, response);
+
+            // step6: 写失败说明对端已断；正常写完且需关闭则结束，否则继续流水线。
+            if (!WriteAll(connection, wire)) {
                 return;
             }
-        } while (parsed.state == http::ParseState::NeedMore);
-
-        // step3/step4: 分发完成后按方法序列化，HEAD 需要去掉响应体。
-        const Response response = Dispatch(request);
-        const std::string wire = SerializeResponse(request.method, response);
-        WriteAll(connection, wire);
+            if (close_after) {
+                return;
+            }
+        }
     }
 
     void Stop() {
@@ -1249,6 +1341,8 @@ struct Gateway::Impl {
     std::atomic<std::uint64_t> upstream_errors{0};
     std::atomic<std::uint64_t> timeouts{0};
     std::atomic<std::uint64_t> health_checks{0};
+    std::atomic<std::uint64_t> request_timeouts{0};
+    std::atomic<std::uint64_t> internal_errors{0};
 };
 
 // ---- 中间件实现 -----------------------------------------------------------
@@ -1327,6 +1421,9 @@ Result<std::unique_ptr<Gateway>> Gateway::Create(Config config) {
     }
     if (config.accept_timeout.count() <= 0) {
         config.accept_timeout = std::chrono::milliseconds(100);
+    }
+    if (config.request_timeout.count() <= 0) {
+        config.request_timeout = std::chrono::milliseconds(10000);
     }
     const std::string host =
         config.listen_host.empty() ? std::string("0.0.0.0") : config.listen_host;
@@ -1551,6 +1648,9 @@ Stats Gateway::stats() const {
     snapshot.upstream_errors = m_impl->upstream_errors.load(std::memory_order_relaxed);
     snapshot.timeouts = m_impl->timeouts.load(std::memory_order_relaxed);
     snapshot.health_checks = m_impl->health_checks.load(std::memory_order_relaxed);
+    snapshot.request_timeouts =
+        m_impl->request_timeouts.load(std::memory_order_relaxed);
+    snapshot.internal_errors = m_impl->internal_errors.load(std::memory_order_relaxed);
     return snapshot;
 }
 

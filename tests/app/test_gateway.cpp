@@ -16,6 +16,12 @@
 #include "go2cpp/network/http.hpp"
 #include "go2cpp/network/socket.hpp"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -27,6 +33,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -91,6 +98,52 @@ bool SendAll(const go2cpp::net::Socket::Ptr& socket, std::string_view data) {
         sent += static_cast<std::size_t>(result.transferred);
     }
     return true;
+}
+
+/// @brief 建一条裸 TCP 连接（带 5s recv 超时），用于半开连接与流水线测试。
+int OpenRaw(std::uint16_t port) {
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return -1;
+    }
+    timeval timeout{5, 0};
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(port);
+    ::inet_pton(AF_INET, "127.0.0.1", &address.sin_addr);
+    if (::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
+        ::close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+bool SendRaw(int fd, std::string_view data) {
+    std::size_t sent = 0;
+    while (sent < data.size()) {
+        const ssize_t written =
+            ::send(fd, data.data() + sent, data.size() - sent, MSG_NOSIGNAL);
+        if (written <= 0) {
+            return false;
+        }
+        sent += static_cast<std::size_t>(written);
+    }
+    return true;
+}
+
+/// @brief 读到对端关闭或 5s 超时为止，返回全部响应字节。
+std::string ReadUntilEof(int fd) {
+    std::string output;
+    std::array<char, 4096> chunk{};
+    for (;;) {
+        const ssize_t got = ::recv(fd, chunk.data(), chunk.size(), 0);
+        if (got <= 0) {
+            break;
+        }
+        output.append(chunk.data(), static_cast<std::size_t>(got));
+    }
+    return output;
 }
 
 /// @brief 最小 HTTP echo 上游：随机端口、/health、/slow 与回显请求行/头/body。
@@ -307,6 +360,14 @@ public:
         }
         (*params)["tenant"] = "a";
         return true;
+    }
+};
+
+/// @brief 命中 /boom 的匹配器：用于验证 handler 抛异常时网关回 500 而不是崩溃。
+class ThrowMatcher final : public Matcher {
+public:
+    bool Match(const Request& request, PathParams*) const override {
+        return request.path() == "/boom";
     }
 };
 
@@ -622,6 +683,76 @@ int main() {
           "B 标记 ok=false");
     Check(HasBody(health_down, "\"ok\":false,\"services\""), "整体 ok=false");
 
+    // ---- 9. TOP1：handler 抛异常 → 500，进程不崩 -------------------------
+    std::printf("\n[9] handler 抛异常 → 500（进程不崩）\n");
+    auto throw_matcher = std::make_shared<ThrowMatcher>();
+    auto throw_handler = std::make_shared<Handler>([](Request&, Response&) -> Result<void> {
+        throw std::runtime_error("boom from test handler");
+    });
+    Check(gateway.AddRoute(throw_matcher, throw_handler).ok(), "注册抛异常路由");
+    const http::Result boom = Call(port, "/boom");
+    Check(StatusOf(boom) == 500, "throw handler 返回 500（修复前 SIGABRT）");
+    Check(HasBody(boom, "\"code\":500"), "500 错误体格式");
+    Check(gateway.stats().internal_errors >= 1, "internal_errors 计数 +1");
+    Check(StatusOf(Call(port, "/health")) == 200, "异常请求后进程仍可服务");
+
+    // ---- 10. TOP2：worker 被半开连接占满时，新请求受总时限约束 -----------
+    std::printf("\n[10] worker=2 + 2 条半开连接 → 新请求在总时限内响应\n");
+    GatewayHarness slow_harness;
+    slow_harness.config.listen_host = "127.0.0.1";
+    slow_harness.config.port = 0;
+    slow_harness.config.worker_threads = 2;
+    slow_harness.config.request_timeout = std::chrono::milliseconds(800);
+    if (slow_harness.Start()) {
+        const std::uint16_t slow_port = slow_harness.gateway->port();
+        const int slow1 = OpenRaw(slow_port);
+        const int slow2 = OpenRaw(slow_port);
+        const std::string half = "GET /health HTTP/1.1\r\nHost: slow\r\n";
+        Check(slow1 >= 0 && slow2 >= 0 && SendRaw(slow1, half) && SendRaw(slow2, half),
+              "2 条半开连接已占住 worker");
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        const auto probe_begin = std::chrono::steady_clock::now();
+        const http::Result probe = Call(slow_port, "/health");
+        const auto probe_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  std::chrono::steady_clock::now() - probe_begin)
+                                  .count();
+        std::printf("  [slowloris] probe=%lldms status=%d\n",
+                    static_cast<long long>(probe_ms), StatusOf(probe));
+        Check(StatusOf(probe) == 200, "半开连接占满 worker 后新请求仍成功");
+        Check(probe_ms <= 5000, "新请求在总时限内响应（修复前约 30s）");
+        Check(slow_harness.gateway->stats().request_timeouts >= 1,
+              "request_timeouts 记录了慢连接淘汰");
+        if (slow1 >= 0) {
+            ::close(slow1);
+        }
+        if (slow2 >= 0) {
+            ::close(slow2);
+        }
+        slow_harness.Stop();
+    }
+
+    // ---- 11. TOP3：同一次 send 3 个 pipeline 请求 → 3 个响应 -------------
+    std::printf("\n[11] 同包流水线 3 请求 → 3 响应\n");
+    const int pipeline_fd = OpenRaw(port);
+    if (pipeline_fd >= 0) {
+        const std::string triple =
+            "GET /health HTTP/1.1\r\nHost: p\r\n\r\n"
+            "GET /health HTTP/1.1\r\nHost: p\r\n\r\n"
+            "GET /health HTTP/1.1\r\nHost: p\r\n\r\n";
+        Check(SendRaw(pipeline_fd, triple), "一次 send 写入 3 个请求");
+        const std::string responses = ReadUntilEof(pipeline_fd);
+        ::close(pipeline_fd);
+        std::size_t response_count = 0;
+        for (std::size_t pos = 0;
+             (pos = responses.find("HTTP/1.1 200", pos)) != std::string::npos;
+             pos += 12) {
+            ++response_count;
+        }
+        std::printf("  [pipeline] responses=%zu bytes=%zu\n", response_count,
+                    responses.size());
+        Check(response_count == 3, "3 个 pipeline 请求都得到响应（修复前只回 1 个）");
+    }
+
     // ---- 汇总 ------------------------------------------------------------
     const Stats stats = gateway.stats();
     std::printf(
@@ -640,6 +771,7 @@ int main() {
     Check(stats.rate_limited >= 1, "stats.rate_limited >= 1");
     Check(stats.not_found >= 1, "stats.not_found >= 1");
     Check(stats.health_checks >= 2, "stats.health_checks >= 2");
+    Check(stats.internal_errors >= 1, "stats.internal_errors >= 1");
 
     harness.Stop();
     std::printf("\n[gateway] checks=%d failures=%d\n", g_checks, g_failures);

@@ -30,7 +30,10 @@
  * - **不复用** `app/douyin/include/douyin_http.hpp`：那是抖音 demo 的最小
  *   解析器（只按 Content-Length 读 body、无参数路由、无超时），不适合通用组件；
  * - 因此连接循环与响应序列化在本组件内实现（约 60 行），换来任意状态码透传
- *   与零 bento 依赖。当前**每条连接只处理一个请求**，响应带 `Connection: close`。
+ *   与零 bento 依赖。连接循环支持**同包流水线**：一次 `recv` 里的多个请求
+ *   按序全部处理（不再只回第一个），缓冲耗尽后关闭连接；**不做跨包空闲
+ *   keep-alive 等待**——空闲连接若继续占住 worker，会被 slowloris 放大成
+ *   全站 DoS。每个请求另有 `Config::request_timeout` 的读取总时限。
  *
  * ## 路由匹配
  * - `path_pattern` 三种形态：
@@ -343,6 +346,10 @@ struct Config {
     std::size_t max_queued_connections{256};
     /// accept 轮询超时（决定 Stop 的响应速度）。
     std::chrono::milliseconds accept_timeout{100};
+    /// 单个请求的读取总时限（毫秒，从本次请求第一次 recv 前起算，覆盖头部+body）。
+    /// 到期直接关闭连接，替代「每次 recv 30s」——后者可被 slowloris 无限续期。
+    /// 0 按 10000ms 处理。
+    std::chrono::milliseconds request_timeout{10000};
     /// 鉴权回调；非空时自动安装 `AuthMiddleware`。
     AuthFn auth;
     /// 限流回调；非空时自动安装 `RateLimitMiddleware`。
@@ -367,6 +374,8 @@ struct Stats {
     std::uint64_t upstream_errors{0}; ///< 502（连接失败/解析失败）数。
     std::uint64_t timeouts{0};        ///< 504（上游超时）数。
     std::uint64_t health_checks{0};   ///< 执行的聚合健康检查次数。
+    std::uint64_t request_timeouts{0}; ///< 请求读取总时限到期而关闭的连接数。
+    std::uint64_t internal_errors{0};  ///< handler/中间件抛异常被兜底成 500 的次数。
 };
 
 /**

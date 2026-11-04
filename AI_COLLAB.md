@@ -1093,3 +1093,29 @@ errno noinline），不是寄存器保存。
 
 **坑**：改 `CoordinatorOptions` 布局后，只重建新 target 会让**旧测试二进制**与新 `.so` ABI 不匹配
 （表现为 stack smashing / watchdog 超时）。改公共头后必须重建全部相关测试目标再跑 ctest。
+
+## 2026-11-04 · Gateway 高危修复：Dispatch 异常兜底 + 请求总时限 + 同包流水线
+
+**背景**：HTTP 链路审计（`src/app/gateway.cpp` @ `19562e9`）确认 2 个高危 + 1 个中级：
+handler 异常导致 SIGABRT；slowloris 靠单次 recv 30s 无限占住 worker；`take_remaining()`
+未调用导致一次 send 多个请求只回第一个。
+
+**改动**：
+- `src/app/gateway.cpp` / `include/go2cpp/app/gateway.hpp`：
+  `Dispatch` 与 `WorkerLoop` 调用点双层 try/catch → 500 + close + `Stats::internal_errors`；
+  新增 `Config::request_timeout`（默认 10000ms，0 归一化）与 `Stats::request_timeouts`，
+  `ServeConnection` 每请求从首次 recv 前建立总 deadline，每次 recv 只等剩余时间；
+  `pending = parser.take_remaining()` 驱动同包流水线排空（最多 100 请求/连接），
+  `SerializeResponse` 的 Connection 头跟随 `Response::close`。
+- `tests/app/test_gateway.cpp`：新增 [9] throw→500、[10] worker=2 半开连接、[11] 3 请求流水线。
+
+**验证**：`tests/app/build_and_run_gateway.sh` → `checks=62 failures=0`，`-Werror` 零告警。
+前后对比：throw 由 `Aborted (core dumped)` → 500 且进程存活；2 条半开连接下新请求
+29773ms → 9712ms（默认 10s）/ 601ms（配置 800ms）；同包 3 请求 1 响应 → 3 响应。
+
+**未动/未提交**：其他文件未改，未 commit；handler 执行时间不在总时限内、跨包 keep-alive
+未启用、`test_gateway` 仍未注册 CTest，均记入 `docs/reports/http-link-audit.md` TODO。
+
+**坑**：`http::Parser` 完成后 `m_finished=true`，必须 `take_remaining()` 后再用**新 Parser**
+解析下一条，否则 feed 直接返回 Complete；`Response::close` 必须与实际连接去留同步，
+否则客户端会按 keep-alive 等待已关闭的连接。
