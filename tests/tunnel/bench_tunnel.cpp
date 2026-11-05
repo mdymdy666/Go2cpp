@@ -11,8 +11,10 @@
  * ```
  *
  * 测量项：
- * - 吞吐：单连接一次 POST 8 MiB，重复 3 轮，取中位 MiB/s；
- * - 吞吐：4 并发连接各 8 MiB，重复 3 轮，按 wall 时间算聚合 MiB/s；
+ * - 吞吐：单连接每轮 8 MiB × 64 次 = 512 MiB，重复 5 轮，取中位 MiB/s；
+ * - 吞吐：4 并发连接每轮 8 MiB × 16 次 = 512 MiB，重复 5 轮，按 wall 算聚合
+ *   MiB/s；
+ * - 稳定性：每个阶段输出 median / mean / std / CV（验收口径：5 轮 CV < 5%）；
  * - 延迟：单连接 96 次 64 KiB POST 的 p50/p99（含每次建连）；
  * - 隧道开销倍率 = 直连中位吞吐 / 隧道中位吞吐（及其倒数）。
  *
@@ -35,6 +37,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -257,23 +260,33 @@ struct Latencies {
     }
 };
 
-/// 单连接吞吐：一次 POST 整个 body。
+/// 单连接吞吐：POST 同一 body `repeats` 次，按总字节 / 总 wall 算吞吐。
+///
+/// 单次 8 MiB 在直连约 3.6 ms、隧道约 7 ms，窗口远小于 100 ms，调度抖动
+/// 无法摊薄（实测 CV 16%）。repeats=32 → 256 MiB/轮，窗口约 0.11–0.23 s。
 bool RunSingle(std::uint16_t port, const std::string& host,
-               const std::string& path, const std::string& body, double* mibps,
-               double* ms) {
-    if (!PostOnce(port, host, path, body, ms)) {
-        return false;
+               const std::string& path, const std::string& body,
+               std::size_t repeats, double* mibps, double* ms) {
+    const auto begin = Clock::now();
+    for (std::size_t index = 0; index < repeats; ++index) {
+        double one_ms = 0.0;
+        if (!PostOnce(port, host, path, body, &one_ms)) {
+            return false;
+        }
     }
+    *ms = MsBetween(begin, Clock::now());
     const double seconds = *ms / 1000.0;
-    *mibps = (static_cast<double>(body.size()) / (1024.0 * 1024.0)) / seconds;
+    *mibps = (static_cast<double>(body.size()) * static_cast<double>(repeats) /
+              (1024.0 * 1024.0)) /
+             seconds;
     return true;
 }
 
-/// 并发吞吐：`threads` 条连接各 POST 一次，按 wall 时间算聚合吞吐。
+/// 并发吞吐：`threads` 条连接各 POST `repeats` 次，按 wall 算聚合吞吐。
 bool RunConcurrent(std::uint16_t port, const std::string& host,
                    const std::string& path, std::size_t threads,
-                   const std::string& body, double* mibps, Latencies* latencies,
-                   double* wall_ms) {
+                   std::size_t repeats, const std::string& body, double* mibps,
+                   Latencies* latencies, double* wall_ms) {
     std::atomic<int> failures{0};
     std::vector<double> per_thread_ms(threads, 0.0);
     const auto begin = Clock::now();
@@ -281,8 +294,13 @@ bool RunConcurrent(std::uint16_t port, const std::string& host,
     workers.reserve(threads);
     for (std::size_t index = 0; index < threads; ++index) {
         workers.emplace_back([&, index] {
-            if (!PostOnce(port, host, path, body, &per_thread_ms[index])) {
-                failures.fetch_add(1);
+            for (std::size_t round = 0; round < repeats; ++round) {
+                double one_ms = 0.0;
+                if (!PostOnce(port, host, path, body, &one_ms)) {
+                    failures.fetch_add(1);
+                    return;
+                }
+                per_thread_ms[index] += one_ms;
             }
         });
     }
@@ -290,8 +308,9 @@ bool RunConcurrent(std::uint16_t port, const std::string& host,
         worker.join();
     }
     *wall_ms = MsBetween(begin, Clock::now());
-    const double total_bytes =
-        static_cast<double>(body.size()) * static_cast<double>(threads);
+    const double total_bytes = static_cast<double>(body.size()) *
+                               static_cast<double>(threads) *
+                               static_cast<double>(repeats);
     *mibps = (total_bytes / (1024.0 * 1024.0)) / (*wall_ms / 1000.0);
     for (double value : per_thread_ms) {
         if (value > 0.0) {
@@ -301,20 +320,49 @@ bool RunConcurrent(std::uint16_t port, const std::string& host,
     return failures.load() == 0;
 }
 
-double Median(std::vector<double> values) {
+/// 一轮吞吐样本的汇总统计（验收口径：5 轮 CV = std/mean）。
+struct Stats {
+    double median{0.0};
+    double mean{0.0};
+    double stddev{0.0};
+    double cv{0.0};  ///< stddev / mean；0 表示样本为空或均值为 0
+};
+
+Stats ComputeStats(std::vector<double> values) {
+    Stats stats;
     if (values.empty()) {
-        return 0.0;
+        return stats;
     }
+    double sum = 0.0;
+    for (double value : values) {
+        sum += value;
+    }
+    stats.mean = sum / static_cast<double>(values.size());
+    double variance = 0.0;
+    for (double value : values) {
+        const double delta = value - stats.mean;
+        variance += delta * delta;
+    }
+    variance /= static_cast<double>(values.size());
+    stats.stddev = std::sqrt(variance);
+    stats.cv = stats.mean > 0.0 ? stats.stddev / stats.mean : 0.0;
     std::sort(values.begin(), values.end());
-    return values[values.size() / 2];
+    stats.median = values[values.size() / 2];
+    return stats;
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
-    const int rounds = argc > 1 ? std::atoi(argv[1]) : 3;
+    const int rounds = argc > 1 ? std::atoi(argv[1]) : 5;
     const int concurrency = argc > 2 ? std::atoi(argv[2]) : 4;
     const std::string body(8U * 1024U * 1024U, 'x');
+    // 单样本窗口必须落在 100 ms – 1 s（全局基准规范）。8 MiB 单请求直连约
+    // 3.6 ms、隧道约 7 ms，实测 256 MiB 时直连只有 77 ms，故单连接每轮
+    // 8 MiB × 64 = 512 MiB（直连 ≈0.15 s、隧道 ≈0.40 s）。
+    constexpr std::size_t kSingleRepeats = 64;
+    // 并发 4 路：每轮 4 × 16 × 8 MiB = 512 MiB（direct ≈ 0.23 s、tunnel ≈ 0.66 s）。
+    constexpr std::size_t kConcRepeats = 16;
     const std::size_t latency_requests = 96;
     const std::string small_body(64U * 1024U, 'y');
 
@@ -366,8 +414,11 @@ int main(int argc, char** argv) {
     std::vector<double> direct_mibps;
     std::vector<double> tunnel_mibps;
 
-    std::printf("[bench] rounds=%d concurrency=%d payload=8MiB\n", rounds,
-                concurrency);
+    std::printf(
+        "[bench] rounds=%d concurrency=%d payload=8MiB single=%zuMiB "
+        "conc=%zuMiB\n",
+        rounds, concurrency, kSingleRepeats * 8U,
+        kConcRepeats * static_cast<std::size_t>(concurrency) * 8U);
 
     // 阶段 1：单连接吞吐（8 MiB 单请求）。直连与隧道**交替**执行，
     // 避免 CPU 升频/后台负载把先后顺序变成系统性偏差。
@@ -379,9 +430,9 @@ int main(int argc, char** argv) {
             double mibps = 0.0;
             const bool ok =
                 direct ? RunSingle(direct_port, direct_host, "/upload", body,
-                                   &mibps, &ms)
+                                   kSingleRepeats, &mibps, &ms)
                        : RunSingle(tunnel_port, tunnel_host, "/bench/upload",
-                                   body, &mibps, &ms);
+                                   body, kSingleRepeats, &mibps, &ms);
             if (!ok) {
                 ++failures;
                 std::fprintf(stderr, "[bench] %s single failed round=%d\n",
@@ -393,8 +444,10 @@ int main(int argc, char** argv) {
             } else {
                 tunnel_mibps.push_back(mibps);
             }
-            std::printf("[bench] %s_tput round=%d %.2f MiB/s (%.2f ms)\n",
-                        direct ? "direct" : "tunnel", round + 1, mibps, ms);
+            std::printf(
+                "[bench] %s_tput round=%d %.2f MiB/s (%.2f ms, %zu MiB)\n",
+                direct ? "direct" : "tunnel", round + 1, mibps, ms,
+                kSingleRepeats * 8U);
         }
     }
 
@@ -440,11 +493,13 @@ int main(int argc, char** argv) {
             double wall_ms = 0.0;
             const bool ok = direct
                 ? RunConcurrent(direct_port, direct_host, "/upload",
-                                static_cast<std::size_t>(concurrency), body,
-                                &mibps, &direct_conc_latency, &wall_ms)
+                                static_cast<std::size_t>(concurrency),
+                                kConcRepeats, body, &mibps, &direct_conc_latency,
+                                &wall_ms)
                 : RunConcurrent(tunnel_port, tunnel_host, "/bench/upload",
-                                static_cast<std::size_t>(concurrency), body,
-                                &mibps, &tunnel_conc_latency, &wall_ms);
+                                static_cast<std::size_t>(concurrency),
+                                kConcRepeats, body, &mibps, &tunnel_conc_latency,
+                                &wall_ms);
             if (!ok) {
                 ++failures;
                 std::fprintf(stderr,
@@ -458,25 +513,38 @@ int main(int argc, char** argv) {
                 tunnel_conc_mibps.push_back(mibps);
             }
             std::printf(
-                "[bench] %s_conc round=%d x%d %.2f MiB/s (wall %.2f ms)\n",
+                "[bench] %s_conc round=%d x%d %.2f MiB/s (wall %.2f ms, "
+                "%zu MiB)\n",
                 direct ? "direct" : "tunnel", round + 1, concurrency, mibps,
-                wall_ms);
+                wall_ms,
+                kConcRepeats * static_cast<std::size_t>(concurrency) * 8U);
         }
     }
 
-    const double direct_median = Median(direct_mibps);
-    const double tunnel_median = Median(tunnel_mibps);
-    const double direct_conc_median = Median(direct_conc_mibps);
-    const double tunnel_conc_median = Median(tunnel_conc_mibps);
+    const Stats direct_stats = ComputeStats(direct_mibps);
+    const Stats tunnel_stats = ComputeStats(tunnel_mibps);
+    const Stats direct_conc_stats = ComputeStats(direct_conc_mibps);
+    const Stats tunnel_conc_stats = ComputeStats(tunnel_conc_mibps);
     std::printf(
-        "[bench] summary single direct=%.2f tunnel=%.2f overhead=%.2fx\n",
-        direct_median, tunnel_median,
-        tunnel_median > 0.0 ? direct_median / tunnel_median : 0.0);
+        "[bench] summary single direct median=%.2f mean=%.2f std=%.2f "
+        "cv=%.2f%% tunnel median=%.2f mean=%.2f std=%.2f cv=%.2f%% "
+        "overhead=%.2fx\n",
+        direct_stats.median, direct_stats.mean, direct_stats.stddev,
+        direct_stats.cv * 100.0, tunnel_stats.median, tunnel_stats.mean,
+        tunnel_stats.stddev, tunnel_stats.cv * 100.0,
+        tunnel_stats.median > 0.0 ? direct_stats.median / tunnel_stats.median
+                                  : 0.0);
     std::printf(
-        "[bench] summary conc%d direct=%.2f tunnel=%.2f overhead=%.2fx\n",
-        concurrency, direct_conc_median, tunnel_conc_median,
-        tunnel_conc_median > 0.0 ? direct_conc_median / tunnel_conc_median
-                                 : 0.0);
+        "[bench] summary conc%d direct median=%.2f mean=%.2f std=%.2f "
+        "cv=%.2f%% tunnel median=%.2f mean=%.2f std=%.2f cv=%.2f%% "
+        "overhead=%.2fx\n",
+        concurrency, direct_conc_stats.median, direct_conc_stats.mean,
+        direct_conc_stats.stddev, direct_conc_stats.cv * 100.0,
+        tunnel_conc_stats.median, tunnel_conc_stats.mean,
+        tunnel_conc_stats.stddev, tunnel_conc_stats.cv * 100.0,
+        tunnel_conc_stats.median > 0.0
+            ? direct_conc_stats.median / tunnel_conc_stats.median
+            : 0.0);
     std::printf(
         "[bench] conc_latency direct p50=%.3f p99=%.3f tunnel p50=%.3f "
         "p99=%.3f ms\n",

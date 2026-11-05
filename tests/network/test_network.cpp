@@ -416,53 +416,85 @@ void run_network_tests() {
         for (std::size_t offset = 0; offset < kChunkedBody; ++offset)
             close_wire += sample_byte(offset);
 
+        // 全局基准规范：单样本窗口必须落在 100 ms – 1 s。原口径只解析
+        // 6 MiB（约 13 ms），计时器分辨率与调度抖动无法摊薄。这里把同一条
+        // 6 MiB wire 重复解析 kRepeat=150 次（=900 MiB，窗口约 0.11 s）；
+        // wire 只构造一次，Parser::reset() 复用缓冲，避免把构造算进窗口。
+        constexpr std::size_t kRepeat = 150U;
+        constexpr std::size_t kTotalBody = kChunkedBody * kRepeat;
+        constexpr long long kRepeatCount = static_cast<long long>(kRepeat);
+
         go2cpp::http::Parser close_parser;
         go2cpp::http::Response close_response;
+        go2cpp::http::ParseState close_state = go2cpp::http::ParseState::NeedMore;
         const auto close_begin = std::chrono::steady_clock::now();
-        GO2CPP_CHECK(close_parser.feed(
-                         std::string_view(close_wire.data(), close_head_size), close_response)
-                         .state == go2cpp::http::ParseState::NeedMore);
-        for (std::size_t offset = 0; offset < kChunkedBody; offset += kFeedSize) {
-            const std::size_t size = std::min(kFeedSize, kChunkedBody - offset);
-            close_parser.feed(std::string_view(close_wire.data() + close_head_size + offset, size),
-                              close_response);
+        for (std::size_t repeat = 0; repeat < kRepeat; ++repeat) {
+            close_parser.reset();
+            close_response.body.clear();
+            const auto close_head = close_parser.feed(
+                std::string_view(close_wire.data(), close_head_size), close_response);
+            GO2CPP_CHECK(close_head.state == go2cpp::http::ParseState::NeedMore);
+            for (std::size_t offset = 0; offset < kChunkedBody; offset += kFeedSize) {
+                const std::size_t size = std::min(kFeedSize, kChunkedBody - offset);
+                close_parser.feed(
+                    std::string_view(close_wire.data() + close_head_size + offset, size),
+                    close_response);
+            }
+            close_state = close_parser.finish(close_response).state;
         }
-        const auto close_finished = close_parser.finish(close_response);
         const auto close_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - close_begin);
-        GO2CPP_CHECK(close_finished.state == go2cpp::http::ParseState::Complete);
+        GO2CPP_CHECK(close_state == go2cpp::http::ParseState::Complete);
         GO2CPP_CHECK(close_response.body.size() == kChunkedBody);
 
         go2cpp::http::Parser chunked_parser;
         go2cpp::http::Response chunked_response;
-        const auto chunked_begin = std::chrono::steady_clock::now();
-        auto chunked_result = chunked_parser.feed(
-            std::string_view(chunked_wire.data(), chunked_head_size), chunked_response);
-        GO2CPP_CHECK(chunked_result.state == go2cpp::http::ParseState::NeedMore);
+        go2cpp::http::ParseState chunked_state = go2cpp::http::ParseState::NeedMore;
         const std::size_t chunked_body_wire = chunked_wire.size() - chunked_head_size;
-        for (std::size_t offset = 0; offset < chunked_body_wire; offset += kFeedSize) {
-            const std::size_t size = std::min(kFeedSize, chunked_body_wire - offset);
-            chunked_result = chunked_parser.feed(
-                std::string_view(chunked_wire.data() + chunked_head_size + offset, size),
-                chunked_response);
-            if (chunked_result.state != go2cpp::http::ParseState::NeedMore) break;
+        const auto chunked_begin = std::chrono::steady_clock::now();
+        for (std::size_t repeat = 0; repeat < kRepeat; ++repeat) {
+            chunked_parser.reset();
+            chunked_response.body.clear();
+            const auto chunked_head = chunked_parser.feed(
+                std::string_view(chunked_wire.data(), chunked_head_size), chunked_response);
+            GO2CPP_CHECK(chunked_head.state == go2cpp::http::ParseState::NeedMore);
+            for (std::size_t offset = 0; offset < chunked_body_wire; offset += kFeedSize) {
+                const std::size_t size = std::min(kFeedSize, chunked_body_wire - offset);
+                chunked_state = chunked_parser.feed(
+                                    std::string_view(
+                                        chunked_wire.data() + chunked_head_size + offset, size),
+                                    chunked_response)
+                                    .state;
+                if (chunked_state != go2cpp::http::ParseState::NeedMore) break;
+            }
         }
         const auto chunked_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - chunked_begin);
-        GO2CPP_CHECK(chunked_result.state == go2cpp::http::ParseState::Complete);
+        GO2CPP_CHECK(chunked_state == go2cpp::http::ParseState::Complete);
         GO2CPP_CHECK(chunked_response.status == go2cpp::http::Status::OK);
         GO2CPP_CHECK(chunked_response.body.size() == kChunkedBody);
         bool chunked_body_ok = chunked_response.body.size() == kChunkedBody;
         for (std::size_t offset = 0; chunked_body_ok && offset < kChunkedBody; ++offset)
             chunked_body_ok = chunked_response.body[offset] == sample_byte(offset);
         GO2CPP_CHECK(chunked_body_ok);
-        // 修复前的 e2e 复现数据是 4017 ms；修复后应在个位数毫秒。
-        // 同时用 close-delimited 基线兜底，避免 CI 慢机把绝对阈值变脆。
-        GO2CPP_CHECK(chunked_elapsed.count() < 100);
-        GO2CPP_CHECK(chunked_elapsed.count() <= close_elapsed.count() * 4 + 50);
-        go2cpp_tests::announce("chunked 6MiB/1KiB feed: " +
-                               std::to_string(chunked_elapsed.count()) + " ms vs close-delimited " +
-                               std::to_string(close_elapsed.count()) + " ms");
+        // 修复前的 e2e 复现数据是 4017 ms；修复后应在个位数毫秒。阈值按
+        // kRepeat 线性放大，保持与原口径相同的 7.7 倍余量；同时用
+        // close-delimited 基线兜底，避免 CI 慢机把绝对阈值变脆。
+        GO2CPP_CHECK(chunked_elapsed.count() < 100 * kRepeatCount);
+        GO2CPP_CHECK(chunked_elapsed.count() <=
+                     close_elapsed.count() * 4 + 50 * kRepeatCount);
+        const double chunked_seconds =
+            static_cast<double>(chunked_elapsed.count()) / 1000.0;
+        const double chunked_mibps =
+            chunked_seconds > 0.0
+                ? static_cast<double>(kTotalBody) / (1024.0 * 1024.0) / chunked_seconds
+                : 0.0;
+        go2cpp_tests::announce(
+            "chunked " + std::to_string(kRepeat) + "x6MiB/1KiB feed: " +
+            std::to_string(chunked_elapsed.count()) + " ms (" +
+            std::to_string(static_cast<long long>(chunked_mibps + 0.5)) + " MiB/s, " +
+            std::to_string(kTotalBody / (1024U * 1024U)) + " MiB) vs close-delimited " +
+            std::to_string(close_elapsed.count()) + " ms");
     }
     // chunked 前缀擦除（NeedMore 时把已解析完的 wire 移出 m_buffer）后，
     // consumed 必须仍是「整条报文占用的字节数」，body 也必须完整——这是

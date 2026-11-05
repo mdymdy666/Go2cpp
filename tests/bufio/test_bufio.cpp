@@ -1648,9 +1648,17 @@ void ScenarioScannerLargeFile() {
 }
 
 /// 场景 5：分块传输 —— 1 MiB 随机分块，Read 循环到 EOF。
+///
+/// 基准规模：单轮 1 MiB × 2048 = 2 GiB。全局基准规范要求单样本窗口落在
+/// 100 ms – 1 s；原口径单轮只搬 1 MiB（约 0.10 ms），计时器分辨率与调度
+/// 抖动无法摊薄（实测 CV 15–25%）。实测 1 GiB/轮 只有 58 ms，故取 2 GiB/轮
+/// （约 116 ms）。同时保留 1 MiB 单次样本作「冷/热」对照——小样本只观察
+/// 缓存与缺页影响，不参与验收。
 void ScenarioChunkedTransfer() {
-    Announce("场景5：分块传输（1 MiB 随机分块 -> Read 循环到 EOF）");
+    Announce("场景5：分块传输（1 MiB 分块 x2048 = 2 GiB/轮，Read 循环到 EOF）");
     constexpr std::size_t kTotal = 1024 * 1024;
+    constexpr std::size_t kInner = 2048;  ///< 每轮重复次数（单轮 ≥100 MiB）
+    constexpr std::size_t kRoundBytes = kTotal * kInner;
     std::string payload(kTotal, '\0');
     for (std::size_t index = 0; index < kTotal; ++index) {
         payload[index] = static_cast<char>((index * 31U + 7U) & 0xFFU);
@@ -1664,43 +1672,53 @@ void ScenarioChunkedTransfer() {
         bool eof{false};
     };
 
-    const auto measure_once = [&payload]() {
+    // MemorySource 的构造会拷贝 payload（1 MiB）；把它挪到计时窗口外，循环内
+    // 只把游标/计数归零后复用，避免把 payload 拷贝算进吞吐。
+    const auto measure_once = [&payload](std::size_t inner) {
         MemorySource source(payload);
         // 8 项（2 的幂）→ 走掩码分支，热路径不再有 64 位 divq；仍然是不规则分块
         source.plan = {1, 3, 7, 13, 64, 1024, 4096, 2};
-        Reader<MemorySource> reader(source, 4096);
         Sample sample;
         sample.received.reserve(kTotal);
         char buffer[512];
         const auto start = std::chrono::steady_clock::now();
-        while (true) {
-            const std::size_t got = reader.Read(AsBytes(buffer, sizeof(buffer)));
-            if (got == 0) {
-                break;
+        for (std::size_t iter = 0; iter < inner; ++iter) {
+            source.position = 0;
+            source.calls = 0;
+            source.plan_position = 0;
+            Reader<MemorySource> reader(source, 4096);
+            sample.received.clear();
+            while (true) {
+                const std::size_t got = reader.Read(AsBytes(buffer, sizeof(buffer)));
+                if (got == 0) {
+                    break;
+                }
+                sample.received.append(buffer, got);
             }
-            sample.received.append(buffer, got);
+            sample.source_calls = source.calls;
+            sample.eof = IsEof(reader.Err());
         }
         const auto finish = std::chrono::steady_clock::now();
         sample.seconds = std::chrono::duration<double>(finish - start).count();
-        sample.source_calls = source.calls;
-        sample.eof = IsEof(reader.Err());
         return sample;
     };
 
-    // 1 MiB 目标缓冲首次写入走 mmap，256 个页各触发一次缺页，合计约 0.5 ms，而 1 MiB
-    // 的真实搬运只要约 0.06 ms——单轮会把缺页算进吞吐（实测 1.7 vs 12-19 GiB/s）。
-    // 因此先跑 1 轮丢弃（glibc 借此提升 mmap 阈值并复用已映射页），再取 5 轮 median，
-    // 与 Go 侧 21 轮取 median 的口径对齐。
+    // 目标缓冲首次写入走 mmap，页缺页会算进吞吐（实测 1.7 vs 12-19 GiB/s）；
+    // 因此先跑 1 轮丢弃（glibc 借此提升 mmap 阈值并复用已映射页），再取 5 轮
+    // median，与 Go 侧 21 轮取 median 的口径对齐。
     constexpr int kRounds = 6;
-    std::vector<double> rates;
-    rates.reserve(kRounds - 1);
+    std::vector<double> all_rates;
+    all_rates.reserve(kRounds);
     Sample last;
     for (int round = 0; round < kRounds; ++round) {
-        last = measure_once();
-        if (round > 0) {
-            rates.push_back(static_cast<double>(kTotal) / (1024.0 * 1024.0) / last.seconds);
-        }
+        last = measure_once(kInner);
+        const double rate =
+            static_cast<double>(kRoundBytes) / (1024.0 * 1024.0) / last.seconds;
+        all_rates.push_back(rate);
+        std::printf("[bufio]   round=%d %zu MiB, %.1f MiB/s, 窗口=%.1f ms\n", round + 1,
+                    kRoundBytes / (1024U * 1024U), rate, last.seconds * 1000.0);
     }
+    std::vector<double> rates(all_rates.begin() + 1, all_rates.end());
     std::sort(rates.begin(), rates.end());
     const double median = rates[rates.size() / 2];
 
@@ -1708,12 +1726,21 @@ void ScenarioChunkedTransfer() {
     CHECK(last.received == payload);
     CHECK(last.eof);
     CHECK(last.source_calls < kTotal / 10);
-    ReportRate("分块传输 1MiB（median）", kTotal,
-               static_cast<double>(kTotal) / (1024.0 * 1024.0) / median);
-    std::printf("[bufio]   median=%.1f MiB/s, best=%.1f MiB/s, 轮数=%d（首轮丢弃）\n",
-                median, rates.back(), kRounds - 1);
-    std::printf("[bufio]   Read 调用=%zu, 底层 Read=%llu, 每次请求=512B\n",
-                kTotal / 512, static_cast<unsigned long long>(last.source_calls));
+    std::printf("[bufio]   median=%.1f MiB/s, best=%.1f MiB/s, 轮数=%d, 每轮=%zu MiB\n",
+                median, rates.back(), kRounds - 1, kRoundBytes / (1024U * 1024U));
+
+    // 对照：原 1 MiB 单次口径（3 轮取中位）。窗口约 0.1 ms，只用于说明
+    // 「小样本为什么不合格」，不参与上面的验收。
+    std::vector<double> small_rates;
+    for (int round = 0; round < 3; ++round) {
+        const Sample small = measure_once(1);
+        small_rates.push_back(static_cast<double>(kTotal) / (1024.0 * 1024.0) /
+                              small.seconds);
+    }
+    std::sort(small_rates.begin(), small_rates.end());
+    std::printf("[bufio]   对照 1MiB 单次: median=%.1f MiB/s, 窗口中位≈%.3f ms\n",
+                small_rates[1], static_cast<double>(kTotal) / (1024.0 * 1024.0) /
+                                   small_rates[1] * 1000.0);
 }
 
 /// 场景 6：慢速对端（每次最多 512 字节）写 256 KiB。
