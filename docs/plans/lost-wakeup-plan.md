@@ -56,7 +56,7 @@
 | `- [x]` `src/relay/{relay_pipe,splice_pipe,lease}.cpp` | 数据面（**已审 2026-11-05：无丢唤醒**，见执行记录） |
 | `- [x]` `src/rpc/server.cpp` | 新增的请求队列（**已审 2026-11-05：发现并修复 P0**，见执行记录） |
 | `- [x]` `src/app/{gateway,realtime_room,transport}.cpp` + `connection/bento_link_transport` | 应用层（**已审 2026-11-05：无丢唤醒**，见执行记录） |
-| `src/distributed/transport.cpp` | 连接池 |
+| `- [x]` `src/distributed/transport.cpp` | 连接池 + worker 计数（**已审 2026-11-05：无丢唤醒**，见执行记录） |
 
 ### P2（工具/调试/存储，其余 16 个）
 
@@ -174,3 +174,4 @@ cv_.wait(lock, [&] { return closed_; });   // 谓词版 wait，内部 while
 | 2026-11-05 16:30 | `relay/{relay_pipe,splice_pipe,lease}`（P1 第 3 项） | ✅ **无丢唤醒**。① `relay_pipe` 缓冲区 `Pop`（`:333-350`）`wait(lock, pred)` 谓词版、出队后 `m_not_full.notify_all()` **持 `m_mutex`**；`Push` 的 `m_not_full.wait_until(lock, deadline)`（`:318`）无谓词但**带 deadline**（只等超时，notify 仅提前唤醒）、入队后 `m_not_empty.notify_one()` 持锁；② `done_cv`：`OnDirectionDone`（`:190-195`）`lock_guard(done_mutex)` 内递增 + notify，等待方（`:931-935`）`unique_lock` + 谓词版 wait；`cancel_requested` 路径（`:900-905`）锁内置位、锁外 notify——Dekker；③ `lease.cpp` 两处 `wait_until(lock, deadline, pred)` 都带超时 + 谓词。无需修改。 |
 | 2026-11-05 16:45 | `rpc/server.cpp`（P1 第 4 项） | 🔴 **发现 P0 并已修**：`ServerConnection::Close()` 原先 **锁外** `m_closed.exchange(true)` 再 `m_queue_cv.notify_all()`，而 `WorkerLoop`（`:544-550`）是 `unique_lock(m_queue_mutex)` + 谓词版 `wait`——「谓词已判 false、尚未挂 futex」窗口内 notify 必丢 → worker 永久睡死、`Join()` 卡死。修法：`exchange` 移进 `m_queue_mutex` 临界区，锁外 notify（Dekker）。入队路径 `HandleRequest`（`:483`）本来就是「锁内入队 + 锁外 notify」，正确。 |
 | 2026-11-05 17:00 | `app/{gateway,realtime_room,transport,connection,bento_link_transport}`（P1 第 5 项） | ✅ **无丢唤醒**。① `gateway` 连接队列：`Stop`（`:1422-1429`）锁内置 `queue_closed`、锁外 `notify_all`（Dekker），`HandleAccept`（`:1730-1738`）在 `lock_guard(queue_mutex)` 作用域内入队 **并在锁内 notify_one**，等待方（`:1228`）谓词版 `wait`；② `realtime_room`：`Push` 入队与 notify 同锁、`Stop`（`:96-101`）锁内置 `m_stopping` + 锁外 notify，等待方（`:126`）谓词版；③ `transport` 全部 `wait_for`（`:74` 无谓词但 100ms 超时兜底、`:100` 带谓词）；④ `bento_link_transport` `wait_for` 带超时；⑤ `connection.cpp` 两处 notify 均为锁内状态变更后发出。无需修改。 |
+| 2026-11-05 17:15 | `distributed/transport.cpp`（P1 第 6 项，P1 收尾） | ✅ **无丢唤醒**。worker 退出路径（`:503-508`）在 `lock_guard(workers_mutex)` 内 `--workers`、锁外 `notify_all`（Dekker）；`Stop()` 等待方（`:783`）`unique_lock(workers_mutex)` + 谓词版 `wait(lock, [workers == 0])`——计数在锁内减、谓词在锁内检查，无窗口。注释也写明了「必须等归零，否则 Impl 析构后仍有 detached 线程访问 → UAF」。**P1 六项全部审完**。 |
