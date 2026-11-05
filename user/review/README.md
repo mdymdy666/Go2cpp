@@ -21,14 +21,19 @@ user/review/<模块>-review.md
 - **状态**：待评估 / 已确认 / 已修（commit）/ 已否决（理由）
 ```
 
+## 现有审查文档（本目录）
+
+| 文档 | 说明 |
+|---|---|
+| `user/review/审查顺序-并发与网络.md` | 从底到顶的文件级审查顺序（16+14 步） |
+| `user/review/审查顺序-类级.md` | 类级审查顺序（18+18 步，每类带 file:line） |
+| `user/review/专题-定时器perP改进.md` | TimerService 改 Go per-P 模式（⏸ 暂缓，设计保留） |
+| `user/review/WaitNode统一-整改.md` | 三套 WaitNode 同构整改（待开工，丢唤醒专项防复发的第一优先级） |
+
 ## 接上的历史文档
 
 | 文档 | 说明 |
 |---|---|
-|  | 从底到顶的文件级审查顺序（16+14 步） |
-|  | 类级审查顺序（18+18 步，含 file:line） |
-|  | TimerService 改 Go per-P 模式（⏸ 暂缓，设计保留） |
-|  | 三套 WaitNode 同构整改（待开工） |
 | `docs/reports/baseline-review-2026-11-04.md` | 11-04 基座大改审查（6 路，P0×1/P1×8/P2×8/P3×5） |
 | `docs/reports/2026-11-01-asm-concurrency-review.md` | 11-01 并发汇编审查 |
 | `docs/reports/2026-11-01-asm-network-review.md` | 11-01 网络汇编审查 |
@@ -38,7 +43,7 @@ user/review/<模块>-review.md
 | `docs/reports/three-piece-audit.md` | 三件套覆盖盘点（44 模块） |
 | `docs/reports/http-link-audit.md` | HTTP 链路 34 bug 全清单 |
 | `docs/reports/rdnet-v3-review.md` | rd_net v3 审查 |
-| `docs/plans/lost-wakeup-plan.md` | 丢唤醒专项（11-05 待执行） |
+| `docs/plans/lost-wakeup-plan.md` | 丢唤醒专项（含 7.0 三套 WaitNode 同构整改） |
 
 ## 协作方式
 
