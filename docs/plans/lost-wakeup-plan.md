@@ -143,26 +143,21 @@ cv_.wait(lock, [&] { return closed_; });   // 谓词版 wait，内部 while
 
 ## 七、防复发（机制）
 
-### 7.0 根因整改：三套 WaitNode 同构（2026-11-05 用户指出）
+### 7.0 三套 WaitNode：只做正确性检查（2026-11-05 用户决定）
 
-今天 3 例丢唤醒之所以「修 N 遍」，根因是**等待节点有三套各自独立的实现**：
+今天 3 例丢唤醒「修 N 遍」的根因是三套独立的等待节点实现：
 
 | 位置 | 名字 |
 |---|---|
-|  | （公共基类，但只有 channel 用） |
-|  | （独立一套） |
-|  | （独立一套） |
+| `channel.hpp:933` | `WaitNodeBase` |
+| `parking_condition.hpp:242` | `ParkingCondition::WaitNode` |
+| `sync.cpp:340` | `sync::WaitNode` |
 
-链表操作、generation 校验、唤醒协议、TLS 池各重复 2–3 份。整改方案（分 4 步）见
-：抽 ，三处继承，只留特化
-（channel 的 select / sync 的 granted / parking 的 timeout）。
+**用户决定（2026-11-05）：不做解耦、不抽公共基类——「重复就重复吧」；只对三套各自做正确性检查。**
 
-**这是「防复发」的第一优先级**——统一节点基类后，丢唤醒类 bug 只需要修一处。
+检查清单见 `user/review/WaitNode统一-整改.md`（每套的 CAS 唯一赢家、futex 顺序、generation 校验、池生命周期等）。
 
-
-1. **代码规范**：`docs/engineering-standards.md` 加「条件变量三规则」；
-2. **CI 检查**：新增静态检查脚本（扫 `notify` 是否在锁外，可用 clang-tidy 自定义 check 或简单 grep）；
-3. **测试模板**：所有 condvar 使用点必须有一个「注入延迟」的回归测试（今天 `MuxStream` 的教训）。
+> 原「抽 `core/wait_node_base.hpp` 统一节点」的整改**取消**。
 
 ## 执行记录
 
