@@ -2,9 +2,12 @@
 
 > 读法：先读第一部分建立全局图，再按需下钻第二部分。行号以 2026-11-03 写入时的 WSL 工作树为准
 > （当时 HEAD 为 `be73a4e`；树在动，读到时先 `sed -n` 复核）。
-> **数字纪律**：本文不引用任何历史文档的延迟/吞吐当结论。凡涉及性能一律写「未实测」并说明原因；
+> **数字纪律**：性能数字必须带「报告名 + 日期」，禁止裸数字；没有报告的写「未实测」。
+> 本文当期可引的唯一报告是 `docs/reports/tunnel-raw-default-2026-11-04.md`（2026-11-04，
+> WSL2 环回，raw 按需选路）：8 MiB body **2385.3 MiB/s、开销 1.27×**（同机 mux 对照
+> 770.5 MiB/s / 3.59×）；1 KiB 小请求走 mux p50 1.282 / p99 1.846 ms。
 > 历史文档（`docs/modules/tunnel.md`、`user/docs/14-tunnel.md`）的 1.96× / 488 MiB/s 只在
-> 「历史文档称…」的位置出现。配套考试：`docs/exam/14-tunnel.md`（20 题）。
+> 「历史文档称…」的位置出现，**不得当结论**。配套考试：`docs/exam/14-tunnel.md`（20 题）。
 
 ## 代码地图
 
@@ -665,15 +668,27 @@ SIGTERM → g_stop=true → server.Stop()
 ② 「153 项检查」出自历史文档（`docs/modules/tunnel.md:245`），**未实测**：`build/` 下没有
 `go2cpp_tunnel_test` 产物。
 
-**性能全部未实测**，原因：① 工作树没有已构建产物（`build/` 为空），要测须整项目构建；
-② 即使测了也只是 WSL2 本机回环口径，不能外推到公网；③ 历史文档的 1.96× / 2.99× /
-488 MiB/s 出自 `docs/modules/tunnel.md` §6，按 README 铁律不能当本文结论。
-若要做一次可信测量（**未执行**）：
+**已有实测（2026-11-04，raw 按需选路）**——数字出处 `docs/reports/tunnel-raw-default-2026-11-04.md`；口径：WSL2 环回、单连接、端口自动分配——**不能外推到公网**。
+
+| 场景 | 隧道 MiB/s | 直连 MiB/s | 开销 | 隧道 p50 / p99 |
+|---|---:|---:|---:|---|
+| 8 MiB body，raw（`Content-Length` > 1 MiB，默认） | **2385.3** | 3039.2 | **1.27×** | 3.331 / 4.410 ms |
+| 8 MiB body，强制 mux（阈值 `-1`） | 770.5 | 2766.3 | 3.59× | 10.328 / 13.409 ms |
+| 1 KiB 小请求（默认→mux） | 0.7 | 3.2 | 4.22× | 1.282 / 1.846 ms |
+
+- 选路规则：`Content-Length > GO2CPP_TUNNEL_RAW_THRESHOLD`（默认 1048576）→ raw，其余 → mux；
+  `0` = 全 raw，`-1` = 全 mux（`src/tunnel/protocol.cpp`）。
+- soak：4 组共 **63,048 请求、0 错误**；`ctest -R '^tunnel$'` **170 checks** 通过。
+- **历史数字**（`docs/modules/tunnel.md` §6 的 1.96× / 2.99× / 488 MiB/s，以及更早的
+  「mux 830 MiB/s / 3.56×」旧默认）：**未复跑**，且口径是旧默认 mux，只作演进对照，
+  不得当结论。旧默认 → 现默认的吞吐提升为 **+187%**、开销 −64%（同一报告）。
+
+要复跑请用仓库现有目标（**本文未执行**）：
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target tunnel_server tunnel_client go2cpp_tunnel_test -j
-./build/go2cpp_tunnel_test    # 只报通过/失败与 checks 计数，不报延迟
+./build/go2cpp_tunnel_test    # 只报通过/失败与 checks；吞吐需自建 soak 驱动
 ```
 
 ---
@@ -689,4 +704,5 @@ cmake --build build --target tunnel_server tunnel_client go2cpp_tunnel_test -j
 - [ ] 能说出一个 RelayPipe 为何 5 条线程、一条请求为何跨两端 10 条
       （`relay_pipe.cpp:393-397`、`:787-789`）。
 - [ ] 能指出回调里 `Stop()` 的真实后果（detach，不是永久死锁）。
-- [ ] 知道本文所有性能数字都是「未实测」，以及为什么。
+- [ ] 能说清本文的性能数字来自哪份报告、什么口径（WSL2 环回 / 单连接 / 8 MiB body），
+      以及为什么不能外推到公网。

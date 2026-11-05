@@ -116,7 +116,7 @@ bash user/modules/app/p2p_demo/run_demo.sh
 ```
 
 实测（WSL，2026-11-02）：`cache_demo` 三张命中率表正常；`stream_demo` 输出
-`STREAM_OK`、SHA-256 一致（1 MiB / 8 块 / 58.8 MiB/s）；`web_server_simple`
+`STREAM_OK`、SHA-256 一致（1 MiB / 8 块 / 58.8 MiB/s；**示例单次输出，随机器波动，不是基准**，与 `stream_demo` README 里的 55.6 MiB/s 是同因差异）；`web_server_simple`
 的 200/400/404/405 与 SIGTERM 优雅关闭全部符合预期。
 
 ## 三个新示例一览

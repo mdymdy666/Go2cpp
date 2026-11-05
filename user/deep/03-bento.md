@@ -295,7 +295,12 @@
 
 **`ReplayWindow`**（`crypto.hpp:244-262`）：`kWindow=64`，`highest` 是收到过的最大 wire seq，bitmap bit i 表示 `highest-i` 已收到；`InitializeBefore(next_seq)`（`:253`）只用于 0-RTT（`crypto.cpp:1042`）。
 
-**自研 AEAD 的真实状态（重要，别抄旧结论）**：`asm-tls.md` 里「1MB 比 OpenSSL 慢 13.41×、全文件 0 条 SIMD 指令」的口径**已经过时**——`crypto.cpp:367` 起有 AVX2（8 路，`:573`）与 AVX-512（16 路，`:650`）后端，`ChaCha20Xor`（`:806`）会按 CPU 能力分派（`:820-823`）；标量路径也有 4 路并行（`:137-141`，注释记录 1MiB 吞吐 709→830 MB/s）。**现状是否追上 OpenSSL：未实测**，本文不给结论。
+**自研 AEAD 的真实状态（重要，别抄旧结论）**：`asm-tls.md` 里「1MB 比 OpenSSL 慢 13.41×、全文件 0 条 SIMD 指令」的口径**已经过时**——`crypto.cpp:367` 起有 AVX2（8 路，`:573`）与 AVX-512（16 路，`:650`）后端，`ChaCha20Xor`（`:806`）会按 CPU 能力分派（`:820-823`）；标量路径也有 4 路并行（`:137-141`，注释记录 1MiB 吞吐 709→830 MB/s）。**2026-11-04 已复测：追上了**——AEAD vs OpenSSL EVP 从 1.14–1.21× 降到 **1.02–1.04×**
+（64 KiB 1.02–1.03×、1 MiB 1.03–1.04×），Poly1305 9.9–10.1 → **14.8–15.9 GB/s**，
+AEAD 总吞吐 1 MiB 4.69–4.84 GB/s。口径：`taskset -c 6`、每尺寸 0.5 s × 2 轮、
+**同轮 A/B 相除**（EVP 基线自身在 4.6–5.1 GB/s 间漂移）。见 `docs/reports/asm-tls.md`
+§「冲 1.1×（2026-11-04）」；走的是 16 路 AVX-512 IFMA（`Poly1305BlocksIfma16`，
+每批 16 块共享一次跨 lane 归并），**不是**「lo/hi 打包归并」那条低风险路径。
 
 **典型误用**：以为 PSK 有前向保密（Q15 错答）；以为「加个 AVX 就能补上 13.41×」（先看 `:367` 已经加了，再看是否还差）。
 
@@ -694,7 +699,9 @@ GO2CPP_IO_SINGLE_POLLER=1 BIN=/home/ubunturoot/wsbench-bin \
 - **FEC 划算区间拐点**：只有 5% 丢包一个点，没有 on/off 曲线。
 - **0-RTT 重放攻击面**：只有代码防线，没有攻防实测。
 - **BBR 竞争公平性 / 深队列 RTT 膨胀**：仓库无实测，只能定性。
-- **自研 ChaCha20-Poly1305 vs OpenSSL**：`asm-tls.md` 的 13.41× 是**加 SIMD 之前**的口径；`crypto.cpp:367` 起已有 AVX2/AVX-512 后端，**现状未实测**。
+- **自研 ChaCha20-Poly1305 vs OpenSSL**：`asm-tls.md` 的 13.41× 是**加 SIMD 之前**的口径。
+  **2026-11-04 已复测：1 MiB 为 1.03–1.04×（64 KiB 1.02–1.03×）**，靠 16 路 AVX-512 IFMA；
+  见 `docs/reports/asm-tls.md` §「冲 1.1×（2026-11-04）」。
 - **PMTUD**：默认关闭（`link.hpp:149`），仓里有 `tests/bento/test_pmtud.cpp`，本文未跑。
 
 要复跑时最省事的入口：`GO2CPP_WITH_BENTO=ON` 后跑 `ctest -R bento`，弱网单场景用 `bash tests/bento/test_netem.sh <netem_probe>`，矩阵用 `bench_weaknet --weak-frames=10000`。
