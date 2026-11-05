@@ -40,7 +40,7 @@
 
 | 文件 | 重点 |
 |---|---|
-| `src/concurrency/parking_condition.cpp` | 所有 fiber 的 park/unpark 都走它 |
+| `- [x]` `src/concurrency/parking_condition.cpp` | 所有 fiber 的 park/unpark 都走它（**已审 2026-11-05：无丢唤醒**，见执行记录） |
 | `src/concurrency/sync.cpp` | Mutex/CondVar/WaitGroup |
 | `src/concurrency/scheduler.cpp` | worker 唤醒、sysmon |
 | `src/concurrency/timer.cpp` | 定时器队列唤醒 |
@@ -146,3 +146,9 @@ cv_.wait(lock, [&] { return closed_; });   // 谓词版 wait，内部 while
 1. **代码规范**：`docs/engineering-standards.md` 加「条件变量三规则」；
 2. **CI 检查**：新增静态检查脚本（扫 `notify` 是否在锁外，可用 clang-tidy 自定义 check 或简单 grep）；
 3. **测试模板**：所有 condvar 使用点必须有一个「注入延迟」的回归测试（今天 `MuxStream` 的教训）。
+
+## 执行记录
+
+| 时间 | 审查项 | 结论 |
+|---|---|---|
+| 2026-11-05 14:30 | `parking_condition.cpp`（P0 第 1 项） | ✅ **无丢唤醒**。两条路径分别核对：① **Linux futex 路径**（`:355-363`）`fetch_add(release)` + `FutexWake`，等待方 `FUTEX_WAIT(seq, expected)` 由内核保证「seq 已变则不阻塞」，无窗口；② **native 路径**（`:363-390` / `:512-521`）`Finish` 用 CAS(acq_rel) 改 `result`、`notify_one` 持 `m_wake_mutex`、等待方用 `unique_lock` + **谓词版** `wait(lock, pred)`——经典正确模式，谓词检查与挂起由 lock 串行化。无需修改。 |
