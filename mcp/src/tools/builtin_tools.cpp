@@ -5,6 +5,8 @@
 
 #include "mcp/tools/builtin_tools.hpp"
 
+#include "go2cpp_debug_tools.hpp"
+
 namespace go2cpp::mcp::tools {
 
 void RegisterBuiltinTools(Registry& registry) {
@@ -14,6 +16,8 @@ void RegisterBuiltinTools(Registry& registry) {
     RegisterWeatherTool(registry);
     RegisterNotificationTools(registry);
     RegisterRobotControlTools(registry);
+    // Go2Cpp 运行时探针（DebugServer HTTP，默认 127.0.0.1:39101）。
+    RegisterGo2CppDebugTools(registry);
 
     RegisterBuiltinPrompts(registry);
     RegisterBuiltinResources(registry);

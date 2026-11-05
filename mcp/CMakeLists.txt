@@ -37,6 +37,8 @@ set(MCP_CORE_SOURCES
     src/tools/prompts.cpp
     src/tools/retrieval_tools.cpp
     src/tools/monitor_tools.cpp
+    # Go2Cpp 运行时探针：6 个 go2cpp_debug_* 工具（DebugServer HTTP）。
+    src/tools/go2cpp_debug_tools.cpp
     # Socket 可观测：本进程 socket 注册表/事件/审计 + 四个 socket_* 工具。
     src/tools/socket_registry.cpp
     src/tools/socket_tools.cpp

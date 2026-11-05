@@ -4,6 +4,7 @@
  */
 
 #include "go2cpp/debug/debug_server.hpp"
+#include "go2cpp/debug/debug_fiber.hpp"
 
 #include "go2cpp/json.hpp"
 #include "go2cpp/network/socket.hpp"
@@ -13,13 +14,19 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <thread>
 
+#include <dirent.h>
 #include <fcntl.h>
+#include <netinet/in.h>
 #include <poll.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -477,12 +484,15 @@ bool DebugServer::Start(const std::string& path) {
         m_last_error = "thread-start-failed";
         return false;
     }
+    // HTTP 探针是附加能力：绑定失败只记录 http_last_error，不影响 socket。
+    (void)StartHttp();
     return true;
 #endif
 }
 
 void DebugServer::Stop() {
-    if (!running() && m_listen_fd < 0) {
+    if (!running() && m_listen_fd < 0 && !http_running()) {
+        StopHttp();
         return;
     }
     m_stop.store(true, std::memory_order_release);
@@ -502,6 +512,7 @@ void DebugServer::Stop() {
     if (!path.empty()) {
         (void)::unlink(path.c_str());
     }
+    StopHttp();
 }
 
 std::string DebugServer::path() const {
@@ -1311,5 +1322,592 @@ bool RegisterEventRing(const std::string& name) {
         name, "scheduler park/wake/runqueue event ring",
         []() { return DumpEvents(0); });
 }
+
+
+// ===========================================================================
+// HTTP 探针端点（GO2CPP-DEBUG-HTTP/1）
+// ===========================================================================
+//
+// 设计取舍（见 docs/reports/debug-mcp-integration.md）：
+// - 复用 DebugServer 已有的组件注册表与 Dump()，不新增观测代码；
+// - 单线程 accept + 每连接独立处理：调试查询低频，避免线程池与背压问题；
+// - 每个连接有 1s 读写 deadline，客户端断连不会拖住 accept 循环；
+// - 全部端点只读：不触发调度器/锁/IO 状态变化。
+
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+
+namespace {
+
+/// 默认端口落在 39xxx 段，避开 MCP 监控 Manager 的 9101。
+constexpr std::uint16_t kDefaultDebugHttpPort = 39101;
+constexpr std::size_t kMaxHttpRequestBytes = 8192;
+constexpr std::size_t kMaxHttpResponseBytes = 8ULL * 1024ULL * 1024ULL;
+constexpr int kHttpIoTimeoutMs = 1000;
+
+std::string HttpQueryValue(const std::string& query, const std::string& key) {
+    std::size_t begin = 0;
+    while (begin <= query.size()) {
+        const std::size_t end = query.find('&', begin);
+        const std::string pair = query.substr(
+            begin, end == std::string::npos ? std::string::npos : end - begin);
+        const std::size_t equal = pair.find('=');
+        if (equal != std::string::npos && pair.substr(0, equal) == key) {
+            return pair.substr(equal + 1);
+        }
+        if (end == std::string::npos) {
+            break;
+        }
+        begin = end + 1;
+    }
+    return {};
+}
+
+std::size_t HttpQuerySize(const std::string& query, const std::string& key,
+                          std::size_t fallback, std::size_t maximum) {
+    const std::string text = HttpQueryValue(query, key);
+    if (text.empty()) {
+        return fallback;
+    }
+    try {
+        std::size_t consumed = 0;
+        const unsigned long long value = std::stoull(text, &consumed);
+        if (consumed != text.size()) {
+            return fallback;
+        }
+        return static_cast<std::size_t>(std::min<unsigned long long>(
+            value == 0 ? 1ULL : value, static_cast<unsigned long long>(maximum)));
+    } catch (...) {
+        return fallback;
+    }
+}
+
+Json ParseJsonOrNull(const std::string& text) {
+    const JsonParseResult parsed = ParseJson(text);
+    if (!parsed.ok()) {
+        return Json();
+    }
+    return parsed.value;
+}
+
+std::string ComponentSchema(const Json& value) {
+    if (!value.is_object() || !value.contains("schema") ||
+        !value["schema"].is_string()) {
+        return {};
+    }
+    return value["schema"].get<std::string>();
+}
+
+bool SchemaMentions(const Json& value, const char* needle) {
+    return ComponentSchema(value).find(needle) != std::string::npos;
+}
+
+/// 资源注册表按 kind 的存活计数（只读；不保存对象指针）。
+Json ResourceKindCounts() {
+    Json counts = Json::object();
+    const std::vector<ResourceInfo> resources = SnapshotResources();
+    for (const ResourceInfo& info : resources) {
+        if (!info.alive) {
+            continue;
+        }
+        const char* name = ResourceKindName(info.kind);
+        const std::string key = name == nullptr ? "kUnknown" : name;
+        counts[key] = counts.value(key, 0U) + 1U;
+    }
+    return counts;
+}
+
+/// 读 /proc/self 的 RSS/VSZ/线程/fd；失败字段留空（不编造）。
+Json ProcessStats() {
+    Json out = Json::object();
+    std::ifstream status("/proc/self/status");
+    std::string line;
+    const auto take_kb = [&out](const std::string& text, const char* prefix,
+                                const char* field) {
+        if (text.rfind(prefix, 0) != 0) {
+            return;
+        }
+        const std::string rest = text.substr(std::strlen(prefix));
+        try {
+            out[field] = std::stoull(rest);
+        } catch (...) {
+        }
+    };
+    while (std::getline(status, line)) {
+        take_kb(line, "VmRSS:", "vm_rss_kb");
+        take_kb(line, "VmSize:", "vm_size_kb");
+        take_kb(line, "VmHWM:", "vm_hwm_kb");
+        take_kb(line, "Threads:", "threads");
+    }
+    std::size_t fd_count = 0;
+    if (DIR* dir = ::opendir("/proc/self/fd")) {
+        while (::readdir(dir) != nullptr) {
+            ++fd_count;
+        }
+        ::closedir(dir);
+        // 去掉 "." 与 ".." 两个目录项。
+        fd_count = fd_count >= 2 ? fd_count - 2 : 0;
+    }
+    out["fd_count"] = fd_count;
+    rlimit limit{};
+    if (::getrlimit(RLIMIT_NOFILE, &limit) == 0) {
+        out["fd_limit"] = static_cast<std::uint64_t>(limit.rlim_cur);
+    }
+    return out;
+}
+
+/// 读满一个 HTTP 请求头（最多 kMaxHttpRequestBytes / 1s）。
+std::string ReadHttpRequest(int fd) {
+    std::string data;
+    const std::uint64_t deadline =
+        NowNs() + static_cast<std::uint64_t>(kHttpIoTimeoutMs) * 1000000ULL;
+    while (data.size() < kMaxHttpRequestBytes) {
+        if (data.find("\r\n\r\n") != std::string::npos) {
+            break;
+        }
+        if (NowNs() >= deadline) {
+            break;
+        }
+        pollfd descriptor{};
+        descriptor.fd = fd;
+        descriptor.events = POLLIN;
+        if (::poll(&descriptor, 1, 100) <= 0) {
+            continue;
+        }
+        char buffer[2048];
+        const ssize_t received = ::recv(fd, buffer, sizeof(buffer), 0);
+        if (received <= 0) {
+            break;
+        }
+        data.append(buffer, static_cast<std::size_t>(received));
+    }
+    return data;
+}
+
+/// 发送一个最小 HTTP/1.1 响应；head_only 时只发头。
+bool SendHttpResponse(int fd, int status, const char* reason,
+                      const std::string& body, bool head_only) {
+    std::string response = "HTTP/1.1 " + std::to_string(status) + " " + reason +
+                           "\r\nContent-Type: application/json; charset=utf-8\r\n"
+                           "Cache-Control: no-store\r\n"
+                           "Content-Length: " + std::to_string(body.size()) +
+                           "\r\nConnection: close\r\n\r\n";
+    if (!head_only) {
+        response += body;
+    }
+    std::size_t sent = 0;
+    while (sent < response.size()) {
+        const ssize_t written =
+            ::send(fd, response.data() + sent, response.size() - sent,
+                   MSG_NOSIGNAL);
+        if (written <= 0) {
+            return false;
+        }
+        sent += static_cast<std::size_t>(written);
+    }
+    return true;
+}
+
+bool KnownHttpEndpoint(const std::string& path) {
+    static const char* const kEndpoints[] = {
+        "/debug/fibers", "/debug/scheduler", "/debug/sync",
+        "/debug/resources", "/debug/events", "/debug/dump",
+    };
+    for (const char* endpoint : kEndpoints) {
+        if (path == endpoint) {
+            return true;
+        }
+    }
+    return false;
+}
+
+}  // namespace
+
+std::uint16_t DebugServer::DefaultHttpPort() {
+    const char* env = std::getenv("GO2CPP_DEBUG_HTTP_PORT");
+    if (env == nullptr || *env == '\0') {
+        return kDefaultDebugHttpPort;
+    }
+    try {
+        std::size_t consumed = 0;
+        const long value = std::stol(env, &consumed);
+        if (consumed != std::strlen(env)) {
+            return kDefaultDebugHttpPort;
+        }
+        if (value == 0) {
+            return 0;  // 显式禁用 HTTP 探针
+        }
+        if (value > 0 && value <= 65535) {
+            return static_cast<std::uint16_t>(value);
+        }
+    } catch (...) {
+    }
+    return kDefaultDebugHttpPort;
+}
+
+std::string DebugServer::http_last_error() const {
+    std::lock_guard<std::mutex> lock(m_http_error_mutex);
+    return m_http_last_error;
+}
+
+bool DebugServer::StartHttp() {
+    if (http_running()) {
+        return true;
+    }
+    const std::uint16_t port = DefaultHttpPort();
+    if (port == 0) {
+        std::lock_guard<std::mutex> lock(m_http_error_mutex);
+        m_http_last_error = "http-disabled";
+        return false;
+    }
+    const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) {
+        std::lock_guard<std::mutex> lock(m_http_error_mutex);
+        m_http_last_error = std::string("http-socket: ") + std::strerror(errno);
+        return false;
+    }
+    int reuse = 1;
+    (void)::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(port);
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (::bind(fd, reinterpret_cast<const sockaddr*>(&address),
+               sizeof(address)) != 0) {
+        const int saved = errno;
+        ::close(fd);
+        std::lock_guard<std::mutex> lock(m_http_error_mutex);
+        m_http_last_error = std::string("http-bind: ") + std::strerror(saved);
+        return false;
+    }
+    if (::listen(fd, 8) != 0) {
+        const int saved = errno;
+        ::close(fd);
+        std::lock_guard<std::mutex> lock(m_http_error_mutex);
+        m_http_last_error = std::string("http-listen: ") + std::strerror(saved);
+        return false;
+    }
+    m_http_listen_fd = fd;
+    m_http_port.store(port, std::memory_order_release);
+    m_http_stop.store(false, std::memory_order_release);
+    m_http_running.store(true, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(m_http_error_mutex);
+        m_http_last_error.clear();
+    }
+    try {
+        m_http_thread = std::thread([this] { HttpRun(); });
+    } catch (...) {
+        m_http_running.store(false, std::memory_order_release);
+        m_http_port.store(0, std::memory_order_release);
+        ::close(fd);
+        m_http_listen_fd = -1;
+        std::lock_guard<std::mutex> lock(m_http_error_mutex);
+        m_http_last_error = "http-thread-start-failed";
+        return false;
+    }
+    return true;
+}
+
+void DebugServer::StopHttp() {
+    m_http_stop.store(true, std::memory_order_release);
+    if (m_http_thread.joinable()) {
+        m_http_thread.join();
+    }
+    m_http_running.store(false, std::memory_order_release);
+    m_http_port.store(0, std::memory_order_release);
+    if (m_http_listen_fd >= 0) {
+        ::close(m_http_listen_fd);
+        m_http_listen_fd = -1;
+    }
+}
+
+void DebugServer::HttpRun() noexcept {
+    while (!m_http_stop.load(std::memory_order_acquire)) {
+        pollfd descriptor{};
+        descriptor.fd = m_http_listen_fd;
+        descriptor.events = POLLIN;
+        if (::poll(&descriptor, 1, 100) <= 0) {
+            continue;
+        }
+        const int client = ::accept(m_http_listen_fd, nullptr, nullptr);
+        if (client < 0) {
+            continue;
+        }
+        timeval timeout{};
+        timeout.tv_sec = 1;
+        (void)::setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                           sizeof(timeout));
+        (void)::setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout,
+                           sizeof(timeout));
+        HttpHandleClient(client);
+        ::close(client);
+    }
+}
+
+void DebugServer::HttpHandleClient(int client_fd) noexcept {
+    const std::string request = ReadHttpRequest(client_fd);
+    const std::size_t line_end = request.find("\r\n");
+    const std::string first_line =
+        line_end == std::string::npos ? request : request.substr(0, line_end);
+    const std::size_t first_space = first_line.find(' ');
+    const std::size_t second_space = first_space == std::string::npos
+                                         ? std::string::npos
+                                         : first_line.find(' ', first_space + 1);
+    if (first_space == std::string::npos || second_space == std::string::npos) {
+        (void)SendHttpResponse(client_fd, 400, "Bad Request",
+                               R"({"ok":false,"error":"bad-request"})", false);
+        return;
+    }
+    const std::string method = first_line.substr(0, first_space);
+    const std::string target =
+        first_line.substr(first_space + 1, second_space - first_space - 1);
+    const bool head_only = method == "HEAD";
+    if (method != "GET" && method != "HEAD") {
+        (void)SendHttpResponse(client_fd, 405, "Method Not Allowed",
+                               R"({"ok":false,"error":"method-not-allowed"})",
+                               false);
+        return;
+    }
+    if (target.empty() || target[0] != '/') {
+        (void)SendHttpResponse(client_fd, 400, "Bad Request",
+                               R"({"ok":false,"error":"bad-target"})", false);
+        return;
+    }
+    const std::size_t path_end = target.find('?');
+    const std::string path = target.substr(0, path_end);
+    if (!KnownHttpEndpoint(path)) {
+        const std::string not_found =
+            std::string(R"({"ok":false,"error":"unknown-endpoint","endpoints":[)")
+            + R"("/debug/fibers","/debug/scheduler","/debug/sync",)"
+            + R"("/debug/resources","/debug/events","/debug/dump"]})";
+        (void)SendHttpResponse(client_fd, 404, "Not Found", not_found,
+                               head_only);
+        return;
+    }
+    const std::string body = HandleHttpRequest(target);
+    (void)SendHttpResponse(client_fd, 200, "OK", body, head_only);
+}
+
+std::string DebugServer::HandleHttpRequest(const std::string& target) const {
+    const std::size_t question = target.find('?');
+    const std::string path = target.substr(0, question);
+    const std::string query =
+        question == std::string::npos ? std::string() : target.substr(question + 1);
+    const std::uint64_t now = NowNs();
+
+    Json out = Json::object();
+    out["version"] = 1;
+    out["pid"] = static_cast<std::int64_t>(::getpid());
+    out["steady_ns"] = now;
+    out["uptime_ns"] = m_started_ns == 0U ? 0U : now - m_started_ns;
+    out["endpoint"] = path;
+
+    if (path == "/debug/fibers") {
+        out["schema"] = "go2cpp.debug.fibers/1";
+        const auto entries = DebugRegistry::Instance().Snapshot();
+        Json fibers = Json::array();
+        for (const auto& entry : entries) {
+            Json item = Json::object();
+            item["id"] = entry.first;
+            item["name"] = entry.second.name;
+            item["description"] = entry.second.description;
+            item["file"] = entry.second.file;
+            item["line"] = entry.second.line;
+            item["present"] = entry.second.present;
+            fibers.push_back(std::move(item));
+        }
+        std::size_t fiber_count = entries.size();
+        Json components = Json::object();
+        Json scheduler_summary = Json::object();
+        for (const std::string& name : Components()) {
+            const DumpPayload payload = Dump(name);
+            if (!payload.available) {
+                continue;
+            }
+            const Json value = ParseJsonOrNull(payload.json);
+            if (value.is_null()) {
+                continue;
+            }
+            if (!SchemaMentions(value, "scheduler") &&
+                !SchemaMentions(value, "fiber")) {
+                continue;
+            }
+            components[name] = value;
+            if (value.contains("tasks") && value["tasks"].is_array()) {
+                fiber_count = std::max(fiber_count, value["tasks"].size());
+            }
+            if (SchemaMentions(value, "scheduler")) {
+                scheduler_summary = value;
+            }
+        }
+        out["ok"] = true;
+        out["fiber_count"] = fiber_count;
+        out["registry_count"] = entries.size();
+        out["fibers"] = std::move(fibers);
+        out["scheduler_summary"] = std::move(scheduler_summary);
+        out["components"] = std::move(components);
+        if (fiber_count == 0) {
+            out["hint"] =
+                "没有可观测 fiber：业务需创建 Fiber/DebugFiber 并注册 "
+                "DebugRegistry，或用 RegisterScheduler 注册 scheduler 组件";
+        }
+        return out.dump(2);
+    }
+
+    if (path == "/debug/scheduler") {
+        out["schema"] = "go2cpp.debug.scheduler/1";
+        Json components = Json::object();
+        Json primary = Json::object();
+        for (const std::string& name : Components()) {
+            const DumpPayload payload = Dump(name);
+            if (!payload.available) {
+                continue;
+            }
+            const Json value = ParseJsonOrNull(payload.json);
+            if (value.is_null() || !SchemaMentions(value, "scheduler")) {
+                continue;
+            }
+            components[name] = value;
+            if (primary.empty()) {
+                primary = value;
+            }
+        }
+        const bool has_components = !components.empty();
+        out["ok"] = true;
+        out["scheduler"] = std::move(primary);
+        out["components"] = std::move(components);
+        out["available"] = has_components;
+        if (!has_components) {
+            out["hint"] =
+                "未注册 scheduler 组件：进程内调用 "
+                "debug::RegisterScheduler(\"scheduler\", scheduler)";
+        }
+        return out.dump(2);
+    }
+
+    if (path == "/debug/sync") {
+        out["schema"] = "go2cpp.debug.sync/1";
+        Json components = Json::object();
+        std::size_t primitives = 0;
+        std::uint64_t total_waiters = 0;
+        for (const std::string& name : Components()) {
+            const DumpPayload payload = Dump(name);
+            if (!payload.available) {
+                continue;
+            }
+            const Json value = ParseJsonOrNull(payload.json);
+            if (value.is_null()) {
+                continue;
+            }
+            if (!SchemaMentions(value, "mutex") &&
+                !SchemaMentions(value, "condition") &&
+                !SchemaMentions(value, "parking") &&
+                !SchemaMentions(value, "waitgroup")) {
+                continue;
+            }
+            ++primitives;
+            if (value.contains("waiters") && value["waiters"].is_number_unsigned()) {
+                total_waiters += value["waiters"].get<std::uint64_t>();
+            }
+            components[name] = value;
+        }
+        out["ok"] = true;
+        out["primitives"] = primitives;
+        out["total_waiters"] = total_waiters;
+        out["components"] = std::move(components);
+        out["resources"] = ResourceKindCounts();
+        out["resource_alive"] = ResourceAliveCount();
+        if (primitives == 0) {
+            out["hint"] =
+                "未注册同步原语组件：用 debug::RegisterMutex / "
+                "RegisterConditionVariable / RegisterParkingCondition 注册";
+        }
+        // 慢查询保护：只读资源注册表，不等待任何锁；本端点不会阻塞同步原语。
+        return out.dump(2);
+    }
+
+    if (path == "/debug/resources") {
+        out["schema"] = "go2cpp.debug.resources/1";
+        out["process"] = ProcessStats();
+        Json registry = Json::object();
+        registry["alive_count"] = ResourceAliveCount();
+        registry["by_kind"] = ResourceKindCounts();
+        registry["stack_samples"] = StackSampleCount();
+        registry["fiber_chain_samples"] = FiberChainCount();
+        out["resources"] = std::move(registry);
+        Json ring = Json::object();
+        ring["enabled"] = EventRing::Enabled();
+        ring["threads"] = EventRing::ThreadCount();
+        ring["dropped_threads"] = static_cast<std::uint64_t>(EventRing::DroppedThreads());
+        ring["published_events"] = EventRing::PublishedEvents();
+        out["event_ring"] = std::move(ring);
+        out["ok"] = true;
+        return out.dump(2);
+    }
+
+    if (path == "/debug/events") {
+        out["schema"] = "go2cpp.debug.events/1";
+        const std::size_t limit = HttpQuerySize(query, "limit", 64, 1024);
+        const Json events = ParseJsonOrNull(EventRing::DumpJson(limit));
+        out["ok"] = true;
+        out["limit"] = limit;
+        out["enabled"] = EventRing::Enabled();
+        out["published_events"] = EventRing::PublishedEvents();
+        out["events"] = events.is_null() ? Json::object() : events;
+        return out.dump(2);
+    }
+
+    if (path == "/debug/dump") {
+        out["schema"] = "go2cpp.debug.dump/1";
+        const DumpPayload payload = Dump("all");
+        const Json data = ParseJsonOrNull(payload.json);
+        out["ok"] = !data.is_null();
+        if (data.is_null()) {
+            out["error"] = "dump-json-invalid";
+            out["text"] = payload.text;
+        } else {
+            out["dump"] = data;
+        }
+        if (HttpQueryValue(query, "format") == "text") {
+            out["text"] = payload.text;
+        }
+        return out.dump(2);
+    }
+
+    out["ok"] = false;
+    out["error"] = "unknown-endpoint";
+    return out.dump(2);
+}
+
+#else  // GO2CPP_DEBUG_DUMP=OFF
+
+std::uint16_t DebugServer::DefaultHttpPort() {
+    const char* env = std::getenv("GO2CPP_DEBUG_HTTP_PORT");
+    if (env == nullptr || *env == '\0') {
+        return 39101;
+    }
+    try {
+        const long value = std::stol(env);
+        if (value >= 0 && value <= 65535) {
+            return static_cast<std::uint16_t>(value);
+        }
+    } catch (...) {
+    }
+    return 39101;
+}
+
+std::string DebugServer::http_last_error() const { return "http-disabled"; }
+
+bool DebugServer::StartHttp() { return false; }
+void DebugServer::StopHttp() {}
+void DebugServer::HttpRun() noexcept {}
+void DebugServer::HttpHandleClient(int) noexcept {}
+
+std::string DebugServer::HandleHttpRequest(const std::string&) const {
+    return R"({"ok":false,"error":"debug-dump-disabled"})";
+}
+
+#endif  // GO2CPP_DEBUG_DUMP
+
 
 }  // namespace go2cpp::debug

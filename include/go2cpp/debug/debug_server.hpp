@@ -154,9 +154,47 @@ public:
     /// 默认 socket 路径 `/tmp/go2cpp-<pid>.sock`。
     static std::string DefaultPath();
 
+    // -----------------------------------------------------------------
+    // HTTP 探针端点（供 MCP / 远程只读查询；与 socket 协议并存）
+    // -----------------------------------------------------------------
+    //
+    // `Start()` 成功后自动在 `127.0.0.1:<DefaultHttpPort()>` 上监听；绑定
+    // 失败只记录 `http_last_error()`，不影响 Unix socket 与进程内 Dump。
+    // 端点：GET /debug/fibers | scheduler | sync | resources | events | dump。
+    // 只读，每连接独立处理，响应 JSON（统一带 schema/pid/steady_ns 头）。
+
+    /// 默认 HTTP 端口：`GO2CPP_DEBUG_HTTP_PORT` 优先（`0`=禁用），否则 39101。
+    /// @note 默认端口避开 MCP 监控 Manager 的 9101，落在 39xxx 段。
+    static std::uint16_t DefaultHttpPort();
+    /// HTTP 监听是否已启动。
+    bool http_running() const noexcept {
+        return m_http_running.load(std::memory_order_acquire);
+    }
+    /// 实际监听端口；0 表示未监听。
+    std::uint16_t http_port() const noexcept {
+        return m_http_port.load(std::memory_order_acquire);
+    }
+    /// 最近一次 HTTP 启动/运行错误（空表示无错误）。
+    std::string http_last_error() const;
+    /**
+     * @brief 处理一条 HTTP 请求目标（`/debug/...?limit=N`），返回 JSON 文本。
+     * @param target [in] origin-form 目标，必须以 `/` 开头；未知路径返回
+     *        `{"ok":false,"error":"unknown-endpoint",...}`。
+     * @return JSON body；线程安全、只读、不抛异常。测试与嵌入方可直接调用
+     *         （不需要真实 socket）。
+     * @note 返回的 JSON 始终是单对象；调用方负责按路径决定 HTTP 状态码。
+     */
+    std::string HandleHttpRequest(const std::string& target) const;
+
 private:
     DebugServer();
     void Run() noexcept;
+    /// 启动 HTTP 监听；失败返回 false 并写 `m_http_last_error`。
+    bool StartHttp();
+    /// 停止 HTTP 监听（幂等；join 后关闭 fd）。
+    void StopHttp();
+    void HttpRun() noexcept;
+    void HttpHandleClient(int client_fd) noexcept;
     void HandleClient(int client_fd) noexcept;
     /// 在独立线程里为一条 SUBSCRIBE 连接推送增量；fd 由本函数负责关闭。
     void ServeSubscription(int fd, const std::string& argument) noexcept;
@@ -178,6 +216,15 @@ private:
     std::atomic<std::uint64_t> m_requests{0};
     /// 最近一条 accept 连接的 TCP_NODELAY 状态：-1 不适用/未接受，0 关闭，1 开启。
     std::atomic<int> m_last_accept_nodelay{-1};
+
+    // HTTP 探针：独立监听 fd + 单线程 accept 循环（调试查询低频，不做线程池）。
+    std::atomic<bool> m_http_running{false};
+    std::atomic<bool> m_http_stop{false};
+    std::atomic<std::uint16_t> m_http_port{0};
+    std::thread m_http_thread;
+    int m_http_listen_fd{-1};
+    mutable std::mutex m_http_error_mutex;
+    std::string m_http_last_error;
 };
 
 // ---------------------------------------------------------------------------
