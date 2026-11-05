@@ -29,11 +29,21 @@
 | 16 | `docs/02-network.md` §6.3 | AEAD 13.41×（历史快照） | `docs/reports/asm-tls.md`（2026-11-02） | 2026-11-02 | 历史（已加「已被推翻」标注） |
 | 17 | `docs/14-tunnel.md` §性能 | 1.96× / 488 MiB/s（历史快照） | `docs/modules/tunnel.md` §6 | 2026-11-03 前 | 历史（已加「已被 raw 取代」标注） |
 
+| 18 | `docs/metrics-ledger.md` M17（原 `deep/14-tunnel.md` §2.10） | tunnel raw 2385.3 MiB/s / 1.27×；mux 770.5 / 3.59× | `docs/reports/tunnel-raw-default-2026-11-04.md:4,27` | 2026-11-04 | 已入账 |
+| 19 | 台账 M18（原 `deep/03-bento.md`、`deep/02-network.md`） | TLS AEAD 64 KiB 1.02–1.03× / 1 MiB 1.03–1.04×；Poly 14.83–15.95 GB/s | `docs/reports/asm-tls.md:823-824,864-865` | 2026-11-04 | 已入账 |
+| 20 | 台账 M19（原 `deep/17-bufio.md`） | bufio 17695 MiB/s（0.895× Go，改前 12387） | `docs/reports/asm-bufio.md:211-216` | 2026-11-04 | 已入账（M08 旧值 1853.9 保留为历史，口径不同） |
+| 21 | 台账 M20（原 `deep/02-network.md` §5.1） | Parser 66.3→1.95 ms；chunked 4017→17 ms | `docs/reports/http-link-audit.md:22-23` | 2026-11-04 | 已入账 |
+| 22 | 台账 M21（原 `deep/04-storage.md` §5.2/§5.3） | kv 读 1.109×/1.252×；写 703,517 ops/s = 1.09× | `docs/reports/storage-opt.md:61,74,260,266` | 2026-11-04 | 已入账 |
+| 23 | 台账 M22（原 `deep/03-bento.md` §3.2/§3.3） | WS 20k RSS 227.7 MB=0.96×；p99 1.691 ms=0.93× | `docs/reports/three-piece-status-2026-11-04.md:37,47` | 2026-11-04 | 已入账 |
+| 24 | `docs/modules/tunnel.md` §6（旧值源头） | 1.96× / 488 MiB/s → 2385.3 MiB/s / 1.27× | 台账 M17 + 上述报告 | 2026-11-05 | 已改（旧值标历史、行内划改） |
+| 25 | `user/docs/` 10 份交接摘要（03/04/07/10/11/12/13/15/16/17） | 全文性能数字（历史） | 台账 M01–M23 | 2026-11-05 | 已加文件级历史横幅 |
+
+| 26 | 台账 M23（`user/deep/08-rpc.md` 原本无性能数字） | rpc p50 114.4 µs / 串行 7,350/s / 并发 212,701/s | `docs/reports/rpc-bench-2026-11-05.md` | 2026-11-05 | 已入账（本轮实测） |
 ## 二、无出处 / 禁止引用
 
 | 数字 | 出处情况 | 处置 |
 |---|---|---|
-| rpc p50 **149 µs**、**177k/s** | `docs/reports/` 全目录 grep `149µs` / `177k` **0 命中**；`tests/bench/results/` 无 rpc 产物 | **禁止写进文档**。等报告落盘（建议 `docs/reports/rpc-bench-*.md`）后再引用 |
+| ~~rpc p50 149 µs / 177k/s~~ | **已实测（2026-11-05）**：`docs/reports/rpc-bench-2026-11-05.md` → p50 **114.4 µs**、串行 **7,350/s**、并发（8×32）**212,701/s**。149 µs 比实测高 30%，177k 与串行差 24.1×、也不等于本次并发 → **原数字继续禁止引用**，引用改指台账 **M23** | 已处置 |
 | 「153 项检查」tunnel | 历史文档 `docs/modules/tunnel.md:245`，`build/` 无产物 | 已在 `deep/14-tunnel.md` 标「未实测」 |
 | HTTP pipeline 「411k rps」 | ledger 头部已记为「全库查无此数」 | 禁止引用 |
 
@@ -52,17 +62,21 @@ grep -rn '<report-name>.md' user/ --include=*.md
 
 ## 四、已知缺口（本清单未覆盖，下一批要补）
 
-1. **`docs/metrics-ledger.md` 落后于本轮报告**：台账只到 M16，M08 bufio 仍记 1853.9 MiB/s（旧值），
-   **未收录** tunnel raw 2385 / TLS 1.02–1.04 / bufio 17695 / Parser 1.95 ms / WS 0.93× / kv 1.09×。
-   台账规则第 1 条要求「文档数字必须指到台账一条记录」——当前这 6 组只能指到报告，**台账待补**。
-2. **`user/docs/` 另有 8 份交接摘要含历史性能数字**（11-tools、12-app、13-relay-jinshan、15-os、
-   16-go-api、04-storage、10-observability、07-p2p、03-bento、17-bufio）。本轮只给与今日报告**直接冲突**
-   的两处（02-network 的 AEAD、14-tunnel 的吞吐）加了「历史快照」标注，其余仍是裸历史值。
-3. **`docs/modules/*.md`** 同样含旧数字（`user/docs/` 引用的 1.96×/488 MiB/s 就出自
-   `docs/modules/tunnel.md` §6），未在本轮范围（任务限定 user/）。
+1. ~~台账落后于报告~~ → **已补（2026-11-05）**：`docs/metrics-ledger.md` 新增「第二批」M17–M22
+   （6 组 2026-11-04 报告原始实测，逐条含「模块/指标/实测/对照基线/来源报告/日期/复跑状态」），
+   M08 bufio 更新为 **17695 MiB/s**（1853.9 保留为「历史」并注明口径不同）；M23 为 rpc **2026-11-05 实测**
+   （见 `docs/reports/rpc-bench-2026-11-05.md`）。台账规则第 1 条现已满足。
+2. ~~8 份交接摘要裸数字~~ → **已补（2026-11-05）**：`user/docs/` 10 份（03-bento、04-storage、07-p2p、
+   10-observability、11-tools、12-app、13-relay-jinshan、15-os、16-go-api、17-bufio）在 H1 后统一加
+   「**历史快照（2026-11-04 前，未复跑）**」横幅并指向台账 M17–M22；02-network / 14-tunnel 上一批已单独标注。
+   保留逐条数字原值（不删历史），但文件级已禁止当现状引用。
+3. ~~docs/modules 旧值~~ → **已改（2026-11-05）**：`docs/modules/tunnel.md` §6 标题标「历史快照」，
+   表前加「已被 raw 取代」警示（**2385.3 MiB/s / 1.27×**，台账 M17），488 MiB/s 行内划改并注明现 2385.3。
 
 ## 五、变更记录
 
 | 日期 | 动作 |
 |---|---|
 | 2026-11-05 | 首版：13 处 user/ 文档数字同步到 2026-11-04/05 报告；新增 `user/README.md`「性能数字约定」、`deep/README.md` 铁律第 6 条；本清单建立 |
+| 2026-11-05 | 补齐三处遗留：台账补 M17–M23 + M08 更新；10 份交接摘要加历史横幅；`docs/modules/tunnel.md` §6 旧值标历史并改最新值；映射表补 18–25 行 |
+| 2026-11-05 | rpc 实测落盘 `docs/reports/rpc-bench-2026-11-05.md`：p50 114.4 µs / 串行 7,350/s / 并发 212,701/s；「149 µs / 177k/s」确认不可复现，禁止引用，改指台账 M23 |
