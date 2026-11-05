@@ -54,7 +54,7 @@
 | `- [x]` `src/network/io.cpp` | IOManager 事件队列（**已审 2026-11-05：无严重丢唤醒**，见执行记录） |
 | `- [x]` `src/tunnel/{mux,server,client}` | 已修 2 处（`b176c7f`/`8ebeb53`/`850e813`），**复查剩余：无丢唤醒**（见执行记录） |
 | `- [x]` `src/relay/{relay_pipe,splice_pipe,lease}.cpp` | 数据面（**已审 2026-11-05：无丢唤醒**，见执行记录） |
-| `src/rpc/server.cpp` | 新增的请求队列 |
+| `- [x]` `src/rpc/server.cpp` | 新增的请求队列（**已审 2026-11-05：发现并修复 P0**，见执行记录） |
 | `src/app/{gateway,realtime_room,transport}.cpp` | 应用层 |
 | `src/distributed/transport.cpp` | 连接池 |
 
@@ -177,3 +177,4 @@ cv_.wait(lock, [&] { return closed_; });   // 谓词版 wait，内部 while
 | 2026-11-05 16:00 | `io.cpp`（P1 第 1 项） | ✅ **无严重丢唤醒**。两处 condvar：① `callback_cv`（`:455-470`）`end_callback` 在 `lock_guard(callback_mutex)` 内清 `callback_active`、锁外 `notify_all`，`stop_callbacks` 用 `unique_lock` + **谓词版** wait——Dekker（置位与谓词同锁），无窗口；② `m_queue_cv`（`:2013-2021`）`wait_for(lock, effective, pred)` **带超时 + 谓词**，即使 notify 落在窗口内丢失，超时后也会重检 `m_queue_depth`/`m_stop_poller`，不会永久睡死。生产端 `notify_one/all` 在锁外属正常写法（等待方是谓词版）。不用改。 |
 | 2026-11-05 16:15 | `tunnel/{mux,server,client}`（P1 第 2 项） | ✅ **无丢唤醒**（含此前 3 处修复的复查）。① `MuxStream::m_cv`（`mux.cpp:267`）`wait(lock, pred)` 谓词版；`Close/MarkPeerClosed`（`:325-334`）**已修**为持 `m_mutex` 的 `lock_guard` 内 CAS + notify_all（注释写明窗口与 TSan 症状），网络动作移到锁外；② `m_ack_cv`（`:430/662/751`）、`m_closed_cv`（`:663/935`）、client 的 `m_state_cv`（`:171/474/484/491/539/563`）与 `workers->cv`（`:152`）全部 `wait_for(lock, timeout, pred)`——**带超时兜底**，即使 notify 丢失也会超时重检。无需修改。 |
 | 2026-11-05 16:30 | `relay/{relay_pipe,splice_pipe,lease}`（P1 第 3 项） | ✅ **无丢唤醒**。① `relay_pipe` 缓冲区 `Pop`（`:333-350`）`wait(lock, pred)` 谓词版、出队后 `m_not_full.notify_all()` **持 `m_mutex`**；`Push` 的 `m_not_full.wait_until(lock, deadline)`（`:318`）无谓词但**带 deadline**（只等超时，notify 仅提前唤醒）、入队后 `m_not_empty.notify_one()` 持锁；② `done_cv`：`OnDirectionDone`（`:190-195`）`lock_guard(done_mutex)` 内递增 + notify，等待方（`:931-935`）`unique_lock` + 谓词版 wait；`cancel_requested` 路径（`:900-905`）锁内置位、锁外 notify——Dekker；③ `lease.cpp` 两处 `wait_until(lock, deadline, pred)` 都带超时 + 谓词。无需修改。 |
+| 2026-11-05 16:45 | `rpc/server.cpp`（P1 第 4 项） | 🔴 **发现 P0 并已修**：`ServerConnection::Close()` 原先 **锁外** `m_closed.exchange(true)` 再 `m_queue_cv.notify_all()`，而 `WorkerLoop`（`:544-550`）是 `unique_lock(m_queue_mutex)` + 谓词版 `wait`——「谓词已判 false、尚未挂 futex」窗口内 notify 必丢 → worker 永久睡死、`Join()` 卡死。修法：`exchange` 移进 `m_queue_mutex` 临界区，锁外 notify（Dekker）。入队路径 `HandleRequest`（`:483`）本来就是「锁内入队 + 锁外 notify」，正确。 |

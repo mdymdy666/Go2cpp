@@ -295,10 +295,18 @@ void ServerConnection::Start() {
 }
 
 void ServerConnection::Close() {
-    if (m_closed.exchange(true, std::memory_order_acq_rel)) {
-        return;
+    // P0（2026-11-05 丢唤醒专项 R10）：`m_closed` 的置位必须与 WorkerLoop 的
+    // 谓词检查串行化。WorkerLoop 是 `unique_lock(m_queue_mutex)` + 谓词版
+    // `wait`；若这里在**锁外** exchange（本实现原样），会撞上「谓词已判 false、
+    // 线程尚未挂上 futex」的窗口——notify 丢失、worker 永久睡死、Join 卡死。
+    {
+        std::lock_guard<std::mutex> lock(m_queue_mutex);
+        if (m_closed.exchange(true, std::memory_order_acq_rel)) {
+            return;
+        }
     }
     m_transport->Close();
+    // 置位已在同一把锁内完成，锁外 notify 满足 Dekker（通知必在登记之后）。
     m_queue_cv.notify_all();
 }
 
