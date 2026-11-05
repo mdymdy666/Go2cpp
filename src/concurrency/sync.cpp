@@ -554,7 +554,16 @@ private:
 #if defined(__linux__)
                 WakeNativeLocked();
 #else
-                m_native_condition.notify_one();
+                // P0（2026-11-05 丢唤醒专项 R2）：notify 必须与等待方的谓词检查
+                // 用同一把锁串行化。等待方是 unique_lock(m_native_mutex) +
+                // wait(lock, pred)；若这里锁外 notify，会撞上「谓词已判 false、
+                // 尚未挂 futex」的窗口——唤醒丢失、普通线程永久睡死。
+                // Linux 路径靠 futex 的 (seq, expected) 语义天然免疫，Windows/
+                // macOS 没有这层保护，必须显式持锁。
+                {
+                    std::lock_guard<std::mutex> native_lock(m_native_mutex);
+                    m_native_condition.notify_one();
+                }
 #endif
             }
         } catch (...) {
