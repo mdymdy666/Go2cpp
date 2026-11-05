@@ -337,3 +337,5 @@ grep -nE '114\.4|7,350|212,701' docs/reports/rpc-bench-2026-11-05.md # 6,58,61,6
 - ⏳ 固化 Go 基准到 `tools/`（当前在 /tmp，重启即失）。
 - ⏳ A6：把 docs 里 411k、160ns 等改为指向本文件或标 STALE。
 - ⏳ A7 架构级：M01b-a 通用 Channel 无锁化（覆盖 Send/Recv/Select/Close，需完整验证窗口，单独立项）。
+
+| 2026-11-05 18:30 | bufio 热态 | median **10784.5 MiB/s**（best 18387.8） | 基线 17695（0.895× Go） | 本轮抽查，偏差 **−39%**（median）；⚠️ median 与 best 差 70%，判环境噪声，待下一轮复测 | 2026-11-05 | 单次 |
