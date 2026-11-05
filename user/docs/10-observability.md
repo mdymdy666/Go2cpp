@@ -1,5 +1,11 @@
 # 可观测（交接文档）
 
+> ⚠️ **本文性能数字均为历史快照（2026-11-04 前，未按现行口径复跑）**：
+> 文中的吞吐（MiB/s、GB/s）、倍率（×）、延迟（ns/µs/ms）与分位（p50/p99）数字，来自当时的交接记录，
+> **不代表当前实现**。引用前先查 `docs/metrics-ledger.md` 对应 M 编号（M17–M22 为 2026-11-04 报告补录：
+> tunnel 2385.3 MiB/s、TLS AEAD 1.02–1.04×、bufio 17695 MiB/s、Parser 1.95 ms、kv 1.09×、WS 0.96×/0.93×）；
+> 台账无对应条目的一律按「历史数据，未复跑」处理，**禁止当作现状结论**。
+
 > **定位**：零外部依赖的可观测层 —— 指标（数字）、日志（文本）、配置（开关）、事件环/诊断（时序事实）。
 > **源码**：`include/go2cpp/{metrics,logging,config,debug}/`；实现 `src/{metrics,logging,config,debug}/`
 > **构建接入**：库目标 `go2cpp_metrics`、`go2cpp_log`、`go2cpp_config`、`go2cpp_debug_event`、`go2cpp_debug`；选项 `GO2CPP_DEBUG_DUMP`、`GO2CPP_DIAGNOSTIC`、`GO2CPP_REPLAY`（默认全 OFF）、`GO2CPP_WITH_OPS_LOG_CONFIG`

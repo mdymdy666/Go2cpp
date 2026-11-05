@@ -15,6 +15,7 @@
  * 运行：./build-quality/go2cpp_debug_module_demo
  */
 
+#include "go2cpp/go.hpp"
 #include "go2cpp/debug.hpp"
 #include "go2cpp/scheduler.hpp"
 #include "go2cpp/sync.hpp"
@@ -68,10 +69,11 @@ int main() {
     config.processor_count = 2;
     config.max_workers = 2;
     config.min_workers = 2;
-    Scheduler scheduler(config);
+    // 默认契约是进程级唯一调度器：default_scheduler() 首次调用即启动，
+    // 因此要在使用前挂好观察者（否则会漏掉 start 事件）。
+    Scheduler& scheduler = default_scheduler(config);
     auto collector = std::make_shared<DebugEventCollector>(4096);
     scheduler.set_observer(collector);
-    scheduler.start();
     std::printf("  调度器已启动，观察者已挂载\n");
 
     // ---------- 2. 跑一批任务 ----------
@@ -346,7 +348,7 @@ int main() {
     }
 
     // ---------- 收尾 ----------
-    scheduler.shutdown();
+    shutdown_default_scheduler();
     Section("结果");
     if (g_failures == 0) {
         std::printf("  所有演示步骤通过\n");

@@ -1,3 +1,4 @@
+#include "go2cpp/go.hpp"
 #include "go2cpp/runtime.hpp"
 
 #include <chrono>
@@ -131,11 +132,10 @@ bool scenario_condition_variable(go2cpp::Scheduler& scheduler) {
     return consumed == kItems;
 }
 
-bool scenario_wait_group() {
+bool scenario_wait_group(go2cpp::Scheduler& scheduler) {
     using namespace go2cpp;
     std::clog << "[full][场景5] WaitGroup：汇合一波 Fiber\n";
-    Scheduler scheduler(3);
-    scheduler.start();
+    // 与其它场景共用 main 的默认实例，避免第二个 Scheduler 并存。
     sync::WaitGroup group;
     constexpr int kTasks = 6;
     std::atomic<int> finished{0};
@@ -148,7 +148,6 @@ bool scenario_wait_group() {
     }
     const bool waited = group.WaitFor(Ms(2000));
     const std::size_t remain = group.Count();
-    scheduler.shutdown();
     std::cout << "  WaitFor 成功 = " << waited << " 完成 " << finished.load()
               << " 剩余计数 = " << remain << "（预期 1 " << kTasks << " 0）\n";
     return waited && finished.load() == kTasks && remain == 0;
@@ -189,18 +188,18 @@ bool scenario_cancel_unblocks_wait(go2cpp::Scheduler& scheduler) {
 int main() {
     using namespace go2cpp;
 
-    Scheduler scheduler(4);
-    scheduler.start();
+    // 默认契约是进程级唯一调度器：全示例共用一个默认实例（P=4）。
+    Scheduler& scheduler = default_scheduler(4);
 
     bool ok = true;
     ok = scenario_mutex_mutual_exclusion(scheduler) && ok;
     ok = scenario_cross_execution_unlock(scheduler) && ok;
     ok = scenario_lock_for_timeout(scheduler) && ok;
     ok = scenario_condition_variable(scheduler) && ok;
-    ok = scenario_wait_group() && ok;
+    ok = scenario_wait_group(scheduler) && ok;
     ok = scenario_cancel_unblocks_wait(scheduler) && ok;
 
-    scheduler.shutdown();
+    shutdown_default_scheduler();
     std::clog << (ok ? "[full] 6 个场景全部通过\n" : "[full] 存在失败场景\n");
     return ok ? 0 : 1;
 }

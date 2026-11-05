@@ -1,3 +1,4 @@
+#include "go2cpp/go.hpp"
 #include "go2cpp/runtime.hpp"
 
 #include <atomic>
@@ -117,6 +118,8 @@ bool scenario_config_drives_runtime() {
     const auto value = ini.Get("scheduler", "processors", "1");
     const auto processors = static_cast<std::size_t>(std::stoul(value));
 
+    // 故意使用独立实例：本场景要验证「配置里的 P=3 真的生效」，
+    // 默认实例已被上一个场景关闭，这里不会与它并存。
     Scheduler scheduler(processors);
     scheduler.Start();
     const auto actual = scheduler.processor_count();
@@ -202,19 +205,21 @@ bool scenario_fiber_local_isolation(go2cpp::Scheduler& scheduler) {
 int main() {
     using namespace go2cpp;
 
-    Scheduler scheduler(4);
-    scheduler.start();
+    // 默认契约是进程级唯一调度器：全示例共用一个默认实例（P=4）。
+    Scheduler& scheduler = default_scheduler(4);
 
     bool ok = true;
     ok = scenario_multiple_subsystems(scheduler) && ok;
     ok = scenario_cancel_driven_shutdown(scheduler) && ok;
     ok = scenario_submit_and_join(scheduler) && ok;
-    ok = scenario_config_drives_runtime() && ok;
     ok = scenario_future_cancelled(scheduler) && ok;
     ok = scenario_defer_in_fiber(scheduler) && ok;
     ok = scenario_fiber_local_isolation(scheduler) && ok;
 
-    scheduler.shutdown();
+    // 场景4 需要一个独立的 P=3 实例演示「INI 配置决定 P 数」。先关闭默认
+    // 实例再跑它，保证两个 Scheduler 不并存（并存会触发唯一性告警）。
+    shutdown_default_scheduler();
+    ok = scenario_config_drives_runtime() && ok;
     std::clog << (ok ? "[full] 7 个场景全部通过\n" : "[full] 存在失败场景\n");
     return ok ? 0 : 1;
 }

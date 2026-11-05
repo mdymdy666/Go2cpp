@@ -21,6 +21,7 @@
  *
  * 预期输出里应能看到 `:status = 200` 与 `hello from python h2c server`。
  */
+#include "go2cpp/go.hpp"
 #include "go2cpp/network/http2/connection.hpp"
 #include "go2cpp/network/http2/fiber_transport.hpp"
 #include "go2cpp/network/socket.hpp"
@@ -143,8 +144,8 @@ int main(int argc, char** argv) {
     config.min_workers = 1;
     config.max_workers = 1;
     config.collect_metrics = false;
-    Scheduler scheduler(config);
-    scheduler.start();
+    // 默认契约是进程级唯一调度器：复用默认实例，不再自建 Scheduler。
+    Scheduler& scheduler = go2cpp::default_scheduler(config);
 
     std::printf("[client] 连接到 127.0.0.1:%d，请求 %s\n", port, path.c_str());
     int result = 1;
@@ -152,7 +153,7 @@ int main(int argc, char** argv) {
     // 这是本项目 IO 模型的正常用法。
     auto task = scheduler.spawn([&] { result = RunClient(port, path); });
     const bool finished = task->wait_for(30s);
-    (void)scheduler.shutdown_for(5s);
+    go2cpp::shutdown_default_scheduler();   // 等价于 shutdown_for：排空后关闭
     if (!finished) {
         std::fprintf(stderr, "[client] 客户端 Fiber 超时\n");
         return 1;

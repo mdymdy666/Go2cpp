@@ -1,3 +1,4 @@
+#include "go2cpp/go.hpp"
 #include "go2cpp/runtime.hpp"
 
 #include <chrono>
@@ -18,11 +19,16 @@ int main() {
 
     bool ok = true;
 
-    // ① 创建 3 个 P 并启动
+    // ① 取得 3 个 P 的默认调度器（首次调用时自动启动）
     std::clog << "[scheduler][场景1] 启动调度器\n";
-    Scheduler scheduler(3);
-    std::cout << "  is_running（启动前）=" << scheduler.is_running() << '\n';
-    scheduler.start();
+    // 默认契约是进程级唯一调度器：用 handle 持有默认实例，shutdown 之后
+    // 仍可查询 is_running()（default_scheduler() 的裸引用在关闭后即失效）。
+    SchedulerConfig config;
+    config.processor_count = 3;
+    auto scheduler_handle = default_scheduler_handle(config);
+    Scheduler& scheduler = *scheduler_handle;
+    std::cout << "  is_running（启动前，默认实例已自动启动）="
+              << scheduler.is_running() << '\n';
     // **等 worker 全部启动**：`start()` 里的工作线程是**异步创建**的，
     // 紧接着查 `worker_count()` 可能少 1~2 个（实测偶发 2 而配置是 3）。
     // 这是测试的时序假设问题，不是调度器缺陷 —— 多等几毫秒即可。
@@ -58,9 +64,10 @@ int main() {
               << "（应 >= processor_count=3）\n";
     ok = ok && workers >= scheduler.processor_count();
 
-    scheduler.shutdown();
-    std::cout << "  is_running（关闭后）=" << scheduler.is_running() << "（预期 0）\n";
-    ok = ok && !scheduler.is_running();
+    shutdown_default_scheduler();
+    std::cout << "  is_running（关闭后）=" << scheduler_handle->is_running()
+              << "（预期 0）\n";
+    ok = ok && !scheduler_handle->is_running();
 
     std::clog << (ok ? "[scheduler] 全部通过\n" : "[scheduler] 有失败\n");
     return ok ? 0 : 1;

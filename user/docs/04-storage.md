@@ -1,5 +1,11 @@
 # 存储（交接文档）
 
+> ⚠️ **本文性能数字均为历史快照（2026-11-04 前，未按现行口径复跑）**：
+> 文中的吞吐（MiB/s、GB/s）、倍率（×）、延迟（ns/µs/ms）与分位（p50/p99）数字，来自当时的交接记录，
+> **不代表当前实现**。引用前先查 `docs/metrics-ledger.md` 对应 M 编号（M17–M22 为 2026-11-04 报告补录：
+> tunnel 2385.3 MiB/s、TLS AEAD 1.02–1.04×、bufio 17695 MiB/s、Parser 1.95 ms、kv 1.09×、WS 0.96×/0.93×）；
+> 台账无对应条目的一律按「历史数据，未复跑」处理，**禁止当作现状结论**。
+
 > **定位**：两层存储——SQLite 封装（`storage::DB` + ORM）与自研 LSM KV 引擎（`storage::KV` + Queue/Watch/MemCache 功能层）。
 > **源码**：`include/go2cpp/storage/**`、`src/storage/**`（约 7700 行实现）　**构建**：`cmake/Go2CppStorage.cmake`（`go2cpp_storage`）、`cmake/Go2CppKv.cmake`（`go2cpp_kv`）、`cmake/Go2CppLevelDb.cmake`（`go2cpp_leveldb`，适配层）
 > **测试**：`tests/storage/`（14 个文件：`test_db` / `orm_test` / `kv_test` / `queue_test` / `watch_test` / `memcache_test` + 4 个 bench）

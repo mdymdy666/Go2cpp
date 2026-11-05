@@ -1,5 +1,11 @@
 # 带缓冲 IO（交接文档）
 
+> ⚠️ **本文性能数字均为历史快照（2026-11-04 前，未按现行口径复跑）**：
+> 文中的吞吐（MiB/s、GB/s）、倍率（×）、延迟（ns/µs/ms）与分位（p50/p99）数字，来自当时的交接记录，
+> **不代表当前实现**。引用前先查 `docs/metrics-ledger.md` 对应 M 编号（M17–M22 为 2026-11-04 报告补录：
+> tunnel 2385.3 MiB/s、TLS AEAD 1.02–1.04×、bufio 17695 MiB/s、Parser 1.95 ms、kv 1.09×、WS 0.96×/0.93×）；
+> 台账无对应条目的一律按「历史数据，未复跑」处理，**禁止当作现状结论**。
+
 > **定位**：Go `bufio` 的 C++ 复刻 —— `Reader`/`Writer`/`Scanner` 三个模板装饰器把 N 次小 `Read`/`Write` 合并成 1 次大调用；`Writer` 额外提供 Go 没有的**可配置批量 flush**（4 种策略 + iovec 段），`Peek`/`Scanner::Bytes` 交付零拷贝 `ByteSpan`。
 > **源码**：`include/go2cpp/bufio/`（9 个头文件，约 105 KB；核心 `reader.hpp` 693 行、`writer.hpp` 668 行、`scanner.hpp` 419 行）；实现 `src/bufio/bufio.cpp`（211 行）；Socket 适配层 `include/go2cpp/network/bufio_socket.hpp`（498 行，不在本目录）
 > **构建接入**：库目标 `go2cpp_bufio`（单源文件，`PUBLIC go2cpp_error`，别名 `go2cpp::bufio`，属于 `GO2CPP_MODULE_TARGETS`）

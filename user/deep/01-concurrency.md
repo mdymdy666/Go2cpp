@@ -60,7 +60,7 @@
 | 不做 | 原因 | 替代方案 |
 |---|---|---|
 | 异步抢占（信号强制切 G） | C++ 栈上对象没有 GC 安全点，强切会撕裂 RAII | 只在 park/yield 点协作让出；CPU 密集任务自己 `yield_current()` |
-| 手动 Fiber 上的 `Select`/`Channel` park | 手动 Fiber 没有「回到调度器」的路径 | 返回 `kInvalid`，或改用受管 `spawn` |
+| 手动 Fiber 上的 `Select`/`Channel` park | 手动 Fiber 没有「回到调度器」的路径 | 返回 `kNoScheduler`（2026-11-05 修正，旧值 `kInvalid`），或改用受管 `spawn` |
 | `Channel` 的 `range` 语法糖 | C++ 没有语言级 range-over-channel | 循环 `Recv()` 直到 `kClosed` |
 | nil channel 的永久阻塞 | 与「所有等待可取消」冲突 | 返回 `kNil`，让调用方显式处理 |
 | G 的栈收缩 | 收缩要搬栈 + 修指针，C++ 没有精确栈图 | 只增长不收缩，靠 FiberBin 复用 |
@@ -900,7 +900,7 @@ TSan 抓锁序（admission/条带/P 的反向嵌套）。
 
 1. **关掉不需要的观测**：`collect_metrics=false`（默认就是 false，
    确认没被环境变量打开）；压测时尤其要关。
-2. **栈参数**：`fiber_stack_size` 默认 2 KiB 提交、8 MiB 预留；
+2. **栈参数**：`fiber_stack_size` 默认 128 KiB 提交、8 MiB 预留（2026-11-05 修正，旧值 2 KiB）；
    短任务多时把预留调小（例如 1 MiB）可显著降 VA 压力，
    但要接受「栈增长到上限就崩」。
 3. **队列边界**：`local_queue_limit=256` 是实测最优点

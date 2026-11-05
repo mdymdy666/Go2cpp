@@ -1,3 +1,4 @@
+#include "go2cpp/go.hpp"
 #include "go2cpp/core/parking_condition.hpp"
 #include "go2cpp/runtime.hpp"
 
@@ -27,8 +28,8 @@ bool scenario_managed_fiber_does_not_block_m() {
     using namespace go2cpp;
     std::clog << "[full][场景1] 受管 G 等待不阻塞 M（P=1 反证）\n";
     // 只给一个 P：若等待阻塞了 M，通知者就永远没机会运行。
-    Scheduler scheduler(1);
-    scheduler.start();
+    // 复用进程级默认调度器（首次创建时 P=1），不再自建实例。
+    Scheduler& scheduler = default_scheduler(1);
 
     core::ParkingCondition cv;
     std::mutex mutex;
@@ -56,7 +57,7 @@ bool scenario_managed_fiber_does_not_block_m() {
     waiter->wait();
     const bool finished = waiter_done.load();
     notifier->wait();
-    scheduler.shutdown();
+    shutdown_default_scheduler();
     std::cout << "  等待者已完成=" << finished
               << "（预期 1；若为 0 说明等待阻塞了唯一的 M）\n";
     return finished;
@@ -65,8 +66,8 @@ bool scenario_managed_fiber_does_not_block_m() {
 bool scenario_predicate_loop() {
     using namespace go2cpp;
     std::clog << "[full][场景2] 谓词式等待：条件不成立就继续等\n";
-    Scheduler scheduler(2);
-    scheduler.start();
+    // 复用进程级默认调度器（首次创建时 P=2），不再自建实例。
+    Scheduler& scheduler = default_scheduler(2);
     core::ParkingCondition cv;
     std::mutex mutex;
     int counter = 0;
@@ -87,7 +88,7 @@ bool scenario_predicate_loop() {
     const bool reached = cv.wait(lock, [&] { return counter >= 3; });
     lock.unlock();
     producer->wait();
-    scheduler.shutdown();
+    shutdown_default_scheduler();
     std::cout << "  谓词最终成立=" << reached << " counter=" << counter << "（预期 1 3）\n";
     return reached && counter == 3;
 }
@@ -95,8 +96,8 @@ bool scenario_predicate_loop() {
 bool scenario_notify_all() {
     using namespace go2cpp;
     std::clog << "[full][场景3] notify_all 唤醒全部等待者\n";
-    Scheduler scheduler(5);
-    scheduler.start();
+    // 复用进程级默认调度器（首次创建时 P=5），不再自建实例。
+    Scheduler& scheduler = default_scheduler(5);
     core::ParkingCondition cv;
     std::mutex mutex;
     bool open = false;
@@ -124,7 +125,7 @@ bool scenario_notify_all() {
         w->wait();
     }
     opener->wait();
-    scheduler.shutdown();
+    shutdown_default_scheduler();
     std::cout << "  被唤醒=" << woken.load() << "（预期 " << kWatchers << "）\n";
     return woken.load() == kWatchers;
 }
@@ -175,14 +176,14 @@ bool scenario_static_queries() {
     const bool unsupported = core::ParkingCondition::FiberWaitUnsupported();
     const bool cancelled = core::ParkingCondition::CancellationRequested();
     // 在受管 Fiber 里，FiberWaitUnsupported 仍应为 false（有 Scheduler 后端）
-    Scheduler scheduler(1);
-    scheduler.start();
+    // 复用进程级默认调度器（首次创建时 P=1），不再自建实例。
+    Scheduler& scheduler = default_scheduler(1);
     std::atomic<bool> in_fiber_unsupported{true};
     auto task = go(scheduler, [&in_fiber_unsupported] {
         in_fiber_unsupported.store(core::ParkingCondition::FiberWaitUnsupported());
     });
     task->wait();
-    scheduler.shutdown();
+    shutdown_default_scheduler();
 
     std::cout << "  普通线程 FiberWaitUnsupported=" << unsupported
               << " 受管 Fiber 内=" << in_fiber_unsupported.load()

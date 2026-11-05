@@ -1,3 +1,4 @@
+#include "go2cpp/go.hpp"
 #include "go2cpp/fiber_local.hpp"
 #include "go2cpp/scheduler.hpp"
 #include "go2cpp/sync.hpp"
@@ -78,7 +79,8 @@ int main() {
     config.idle_worker_timeout = 40ms;
     config.allow_worker_oversubscription = true;
 
-    go2cpp::Scheduler scheduler(config);
+    // 默认契约是进程级唯一调度器：复用默认实例，不再自建 Scheduler。
+    go2cpp::Scheduler& scheduler = go2cpp::default_scheduler(config);
     go2cpp::sync::Mutex mutex;
     go2cpp::sync::ConditionVariable condition;
     go2cpp::sync::Mutex condition_mutex;
@@ -150,7 +152,7 @@ int main() {
     if (!wait_flag(native_locked, 2s)) {
         stop.store(true, std::memory_order_release);
         join_with_watchdog(native_owner, 3s, "native owner");
-        scheduler.Shutdown();
+        go2cpp::shutdown_default_scheduler();
         return 1;
     }
 
@@ -242,7 +244,7 @@ int main() {
         release_blocking.store(true, std::memory_order_release);
         join_with_watchdog(native_owner, 3s, "native owner");
         join_with_watchdog(native_notifier, 3s, "native notifier");
-        scheduler.Shutdown();
+        go2cpp::shutdown_default_scheduler();
         return 1;
     }
 
@@ -267,7 +269,7 @@ int main() {
         std::max(peak_workers.load(std::memory_order_relaxed),
                  scheduler.WorkerCount()),
         std::memory_order_relaxed);
-    scheduler.Shutdown();
+    go2cpp::shutdown_default_scheduler();
 
     // 错误场景说明：如果 LockFor/ConditionVariable 返回 false，说明 Context
     // 已取消、超时或 Scheduler 不可用；示例把它计入 ok=false 并停止，不会

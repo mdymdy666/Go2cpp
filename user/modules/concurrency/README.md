@@ -87,12 +87,14 @@ int main() {
     using namespace go2cpp;
     using namespace std::chrono_literals;
 
-    Scheduler scheduler(2);          // 2 个 P
+    // 直接构造是高级用法（默认单例用 default_scheduler()）；第二个运行实例会 WARN
+    Scheduler scheduler(2);          // 2 个 P（2026-11-05 修正说明）
     scheduler.start();
 
     auto ch = MakeChannel<int>(0);   // 无缓冲：发送方等接收方取走
 
     auto sender = go(scheduler, [ch] { (void)ch->Send(2026); });
+    if (!sender) return 1;           // 2026-11-05 修正：空句柄 = 未提交，必须判空
 
     SelectLoop loop;
     loop.bind(RecvCase(ch), [](const SelectResult& r) {
@@ -223,8 +225,10 @@ g++ -std=c++17 -Wall -Wextra -Wpedantic -I"$ROOT/include" \
 
 - **必须 `start()` 之后提交任务，结束前 `shutdown()`**；用默认调度器则结尾调
   `shutdown_default_scheduler()`，否则进程退出时仍有 Fiber 在跑。
-- **Fiber 栈固定、不增长**：深递归、超大局部数组会直接踩爆栈（没有 SIGSEGV handler
-  兜底）。先读 `fiber_stack_limit_demo.cpp` 再写递归代码；`FiberOptions` 可以调大栈。
+- **Fiber 栈默认按需增长**（2026-11-05 修正）：`fiber_stack_growable` 默认 true，初始
+  128 KiB、预留 8 MiB；ASan/TSan、非 Linux/x86_64、`GO2CPP_GROWABLE_STACK=0` 或
+  `stack_growable=false` 时退化为固定栈（无 SIGSEGV handler 兜底）。先读
+  `fiber_stack_limit_demo.cpp` 再写递归代码；`TaskOptions::stack_size` 可以调大栈。
 - **不要在 Fiber 里做未被 Hook 覆盖的阻塞调用**（文件 IO、第三方库内部阻塞等），
   它会连同 M 一起卡住；用 `BlockingRegion` 显式声明，或把工作扔到普通线程。
 - **Channel 的值语义**：`Select` 内建的 `SendCase`/`RecvCase` 要求 `T` 可复制，

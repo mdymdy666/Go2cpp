@@ -24,6 +24,7 @@
  * 连接内的 HTTP/2 逻辑全部是**同步写法**，IO 由 `FiberTransport` 在
  * `Socket::recv/send` 上挂起 —— 与 Go 中每个连接一个 goroutine 的写法一致。
  */
+#include "go2cpp/go.hpp"
 #include "go2cpp/network/http2/connection.hpp"
 #include "go2cpp/network/http2/fiber_transport.hpp"
 #include "go2cpp/network/socket.hpp"
@@ -125,8 +126,9 @@ int main(int argc, char** argv) {
     config.min_workers = 2;
     config.max_workers = 4;
     config.collect_metrics = false;
-    Scheduler scheduler(config);
-    scheduler.start();
+    // 默认契约是进程级唯一调度器：复用默认实例，不再自建 Scheduler。
+    // 本示例是 accept 死循环，进程退出即结束，无需显式 shutdown。
+    Scheduler& scheduler = go2cpp::default_scheduler(config);
 
     auto address = IPv4Address::Create("127.0.0.1", static_cast<std::uint16_t>(port));
     if (!address) {

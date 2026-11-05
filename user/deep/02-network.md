@@ -255,9 +255,10 @@ Content-Length        → 等到 body_start + length
 chunked               → 逐 chunk 扫描，O(n) 增量（m_chunk_scan_pos）
 ```
 
-**pipeline 的关键**：`consumed` 是「本次喂入字节数」，不是「已消费偏移」。
+**pipeline 的关键**（2026-11-05 修正）：`consumed` 是「本条消息在内部缓冲中占用的
+字节数」（跨 feed 累积），不是「本次喂入字节数」，也不是「已消费偏移」。
 要把同一 `recv` 里的第二条请求拿出来，必须 `take_remaining()`
-（`http.cpp` 的 `Parser::take_remaining`）而不是 `erase(0, consumed)`。
+（`http.cpp` 的 `Parser::take_remaining`，保留 `m_response_to_head`）而不是 `erase(0, consumed)`。
 
 ## 2.6 HTTP/2 的分层
 
@@ -736,8 +737,9 @@ close 可能已经把它关掉并复用。正确做法是 `begin_operation`。
 **定位**：在 `serve_connection` 打印 `parser.feed` 的 `consumed` 与
 `m_buffer.size()`，发现用了 `erase(0, consumed)`。
 
-**根因**：`consumed` 是本次喂入字节数，不是已消费偏移。
-正确做法是 `take_remaining()`（swap + reset），再喂给下一轮。
+**根因**（2026-11-05 修正）：`consumed` 是本条消息在内部缓冲中占用的字节数
+（跨 feed 累积），不是本次喂入字节数。正确做法是 `take_remaining()`（swap + reset，
+保留 `m_response_to_head`），再喂给下一轮。
 
 **教训**：解析器的「消费了多少」和「缓冲区里剩多少」是两个概念，
 API 没写清就会用错。

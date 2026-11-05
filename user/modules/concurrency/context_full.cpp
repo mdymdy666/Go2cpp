@@ -1,3 +1,4 @@
+#include "go2cpp/go.hpp"
 #include "go2cpp/runtime.hpp"
 
 #include <chrono>
@@ -124,15 +125,15 @@ bool scenario_wait_done_signal() {
 
     // 从另一个执行流里稍后取消，主执行流阻塞在 Done() 上。
     const bool done = [&] {
-        Scheduler scheduler(1);
-        scheduler.start();
+        // 复用进程级默认调度器（首次创建时 P=1），不再自建实例。
+        Scheduler& scheduler = default_scheduler(1);
         auto canceller = go(scheduler, [cancel = pair.second] {
             std::this_thread::sleep_for(Ms(20));
             cancel();
         });
         const bool signalled = pair.first->Done().WaitFor(Ms(500));
         canceller->wait();
-        scheduler.shutdown();
+        shutdown_default_scheduler();
         return signalled;
     }();
 

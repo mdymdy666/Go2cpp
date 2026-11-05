@@ -1,3 +1,4 @@
+#include "go2cpp/go.hpp"
 #include "go2cpp/channel.hpp"
 #include "go2cpp/context.hpp"
 #include "go2cpp/scheduler.hpp"
@@ -21,8 +22,9 @@ int main() {
     config.processor_count = 2;
     config.max_workers = 2;
     config.local_queue_limit = 8;
-    Scheduler scheduler(config);
-    scheduler.start();
+    // 默认契约是进程级唯一调度器：复用 default_scheduler()/go()，不再自建实例
+    // （自建第二个实例会触发唯一性告警）。配置只在首次创建时生效。
+    Scheduler& scheduler = default_scheduler(config);
 
     auto context_pair = WithTimeout(Background(), 2s);
     ContextKey<int> demo_key("demo-number");
@@ -103,7 +105,7 @@ int main() {
               << '\n';
 
     context_pair.second();
-    scheduler.shutdown();
+    shutdown_default_scheduler();
     return tasks_joined && received.load(std::memory_order_acquire) == 42 &&
                    context_value == 7 && context_cancelled &&
                    timeout_ok && closed_ok &&

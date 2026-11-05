@@ -97,12 +97,16 @@ void shutdown_default_scheduler() noexcept;
 `fiber` 是可先构造、后 `bind()` 的句柄：`fiber f(fn); f.bind(scheduler); f.wait();`。
 **默认调度器是进程级的**，`shutdown_default_scheduler()` 是终态，之后再 `go()` 会新建实例。
 
+**`go()` 可能返回空句柄**（2026-11-05 修正）：调度器已 `shutdown()` 或与关闭并发时返回
+`nullptr`，表示任务**未提交**。把空句柄交给 `wait()`/`cancel()` 是空指针解引用；若任务
+负责完成 Promise，则表现为永不完成。所有调用点必须判空并降级（就地执行 / 上报 / 关闭连接）。
+
 ### 3.2 调度器
 
 ```cpp
 // include/go2cpp/concurrency/scheduler/scheduler.hpp
-explicit Scheduler(SchedulerConfig config = {});
-void start();
+explicit Scheduler(SchedulerConfig config = {});   // 高级用法；生产入口优先 default_scheduler()（2026-11-05 修正）
+void start();                                      // 已有运行实例时会 WARN（默认唯一性契约）
 bool run_main(Task::Function function);   // 当前线程当 m0 跑 main G，返回即停机
 void shutdown();
 bool shutdown_for(std::chrono::steady_clock::duration timeout);
@@ -120,8 +124,9 @@ static std::shared_ptr<Task> current_task() noexcept;
 ```
 
 `SchedulerConfig` 关键默认值：`processor_count=0`（→ 硬件并发）、`max_workers=0`（→ `2*P`）、
-`min_workers=0`（→ P）、`local_queue_limit=256`、`idle_wait=10ms`、`fiber_stack_size=2048`
-（页对齐后 1 页）、`fiber_stack_reserve_size=8 MiB`、`fiber_stack_growable=true`。
+`min_workers=0`（→ P）、`local_queue_limit=256`、`idle_wait=10ms`、`fiber_stack_size=128 KiB`
+（= `Fiber::DefaultStackSize()`；旧默认 2048 字节已废弃，2026-11-05 修正）、
+`fiber_stack_reserve_size=8 MiB`、`fiber_stack_growable=true`（默认按需增长）。
 
 ### 3.3 Fiber
 
@@ -148,7 +153,10 @@ ChannelSendResult SendFor(T value, Duration timeout, const ContextPtr& context =
 ChannelRecvResult<T> Recv(const ContextPtr& context = {});
 ChannelRecvResult<T> RecvFor(Duration timeout, const ContextPtr& context = {});
 ChannelSendResult TrySend(T value);   ChannelRecvResult<T> TryRecv();
-ChannelSendResult Close() noexcept;
+ChannelCloseResult Close() noexcept;   // 2026-11-05 修正：Close 返回 ChannelCloseResult
+// Send/Recv/SendFor/TrySend/TryRecv 的 Result 均为 [[nodiscard]]；关闭后 Send
+// 返回 kClosed（忽略返回值会 -Wunused-result）。需要「关闭即异常」用：
+void SendOrThrow(T value, const ContextPtr& context = {});  // 抛 logic_error
 
 SelectResult Select(const std::vector<SelectCase>& cases,
                     const ContextPtr& context = {},
@@ -203,25 +211,27 @@ int main() {
     using namespace go2cpp;
     using namespace std::chrono_literals;
 
-    Scheduler scheduler(2);            // P = 2
-    scheduler.start();
+    // 2026-11-05 修正：默认调度器是进程级单例，最小用法优先用它；
+    // 需要自定义 P 数时用 default_scheduler(2) 或 SchedulerConfig。
+    auto& scheduler = default_scheduler();
     auto jobs = MakeChannel<int>(4);   // 有缓冲：前 4 次 Send 不阻塞
     auto done = MakeChannel<int>(1);
     sync::WaitGroup wg;
     wg.Add(1);
 
-    go(scheduler, [&] {                // 在 Fiber 上执行，可 park
+    auto worker = go(scheduler, [&] {  // 在 Fiber 上执行，可 park
         for (int i = 1; i <= 3; ++i) { (void)jobs->Send(i * 10); }
         (void)jobs->Close();           // 消费者按 range 语义退出
         (void)done->Send(1);
         wg.Done();
     });
+    if (!worker) return 1;             // 空句柄 = 未提交，必须判空（2026-11-05 修正）
 
     int sum = 0;
     while (auto got = jobs->Recv()) { sum += *got.value; }
     const auto sel = Select({RecvCase(done), DefaultCase()}, {}, 100ms);
-    wg.Wait();                         // 必须等 Fiber 结束再 shutdown
-    scheduler.shutdown();
+    wg.Wait();                         // 必须等 Fiber 结束再关闭调度器
+    shutdown_default_scheduler();
     std::cout << "sum=" << sum << " selected=" << sel.selected << '\n';
     return sum == 60 ? 0 : 1;
 }
@@ -294,8 +304,9 @@ AMD Ryzen 9 8945HX / WSL2 12 vCPU，`taskset -c 2,3` 绑同一物理核的两个
    `T` 可复制（move-only 走 `SelectValue` 自定义路径），`SelectResult::Value<T>()` 对 move-only
    返回 `nullopt`，必须用 `TakeValue<T>()`。
 5. **nil 通道语义不同**：`SendChecked/RecvChecked` 对空 `ChannelPtr` 返回 `kNil`，**不会**像
-   Go 的 nil channel 一样永久阻塞。**手动 Fiber 也不能 park**：未归属 Scheduler 的 `Fiber` 上
-   `Send/Recv` 返回 `kInvalid`、`Mutex::Lock` 返回 false——没有等待后端就不假装能等。
+   Go 的 nil channel 一样永久阻塞。**手动 Fiber 也不能 park**（2026-11-05 修正）：未归属 Scheduler 的 `Fiber` 上
+   `Send/Recv/Select` 返回 `kNoScheduler`（不再是笼统的 `kInvalid`）、`Mutex::Lock`
+   返回 false——没有等待后端就不假装能等。
 6. **跨 M 唤醒是微秒级**（4~5 µs）：`yield` 回来的 G 刻意不 notify，否则 64 Fiber 场景整档慢
    10 倍；`ConditionVariable` 热路径 287 ns、`NotifyAll` 即使 0 等待者也要一次队列 swap。
 7. **定时器单线程**：一个长期阻塞的回调会推迟该服务所有后续任务；`Timer` 句柄析构即取消

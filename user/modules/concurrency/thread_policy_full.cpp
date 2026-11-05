@@ -1,3 +1,4 @@
+#include "go2cpp/go.hpp"
 #include "go2cpp/thread_policy.hpp"
 #include "go2cpp/runtime.hpp"
 
@@ -44,7 +45,8 @@ bool scenario_default_state() {
 bool scenario_scoped_participation() {
     std::clog << "[full][场景2] ScopedThreadParticipation 提升与恢复\n";
     const auto before = CurrentThreadPolicy();
-    go2cpp::Scheduler scheduler(1);
+    // 复用进程级默认调度器（首次创建时 P=1），不再自建实例。
+    go2cpp::Scheduler& scheduler = go2cpp::default_scheduler(1);
     bool inside_ok = false;
     bool gmp_inside = false;
     {
@@ -62,6 +64,7 @@ bool scenario_scoped_participation() {
     std::cout << "  作用域内提升=" << inside_ok
               << " 参与 GMP=" << gmp_inside
               << " 退出后恢复=" << restored << "（预期 1 1 1）\n";
+    go2cpp::shutdown_default_scheduler();
     return inside_ok && gmp_inside && restored;
 }
 
@@ -161,8 +164,8 @@ bool scenario_hook_allowed_merge() {
 bool scenario_runtime_worker() {
     std::clog << "[full][场景7] Scheduler worker 内：runtime_worker 与参与者身份\n";
     using namespace go2cpp;
-    Scheduler scheduler(2);
-    scheduler.start();
+    // 复用进程级默认调度器（首次创建时 P=2），不再自建实例。
+    Scheduler& scheduler = default_scheduler(2);
 
     std::atomic<bool> worker_flag{false};
     std::atomic<bool> gmp_flag{false};
@@ -176,7 +179,7 @@ bool scenario_runtime_worker() {
         hook_disabled.store(CurrentThreadHookMode() == ThreadHookMode::kDisabled);
     });
     task->wait();
-    scheduler.shutdown();
+    shutdown_default_scheduler();
 
     // 主线程不受 worker 内守卫的影响（TLS 隔离）
     const auto main_snapshot = CurrentThreadPolicy();

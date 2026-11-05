@@ -1,5 +1,11 @@
 # Go API 兼容层（交接文档）
 
+> ⚠️ **本文性能数字均为历史快照（2026-11-04 前，未按现行口径复跑）**：
+> 文中的吞吐（MiB/s、GB/s）、倍率（×）、延迟（ns/µs/ms）与分位（p50/p99）数字，来自当时的交接记录，
+> **不代表当前实现**。引用前先查 `docs/metrics-ledger.md` 对应 M 编号（M17–M22 为 2026-11-04 报告补录：
+> tunnel 2385.3 MiB/s、TLS AEAD 1.02–1.04×、bufio 17695 MiB/s、Parser 1.95 ms、kv 1.09×、WS 0.96×/0.93×）；
+> 台账无对应条目的一律按「历史数据，未复跑」处理，**禁止当作现状结论**。
+
 > **定位**：把 Go 标准库的常用接口（net/sync/chan/context/error/time/io/os-signal/crc32/rand/flag）映射成 C++ 薄封装，让 Go 代码逐函数替换，不引入第二套运行时。
 > **源码**：`include/go2cpp/go/`（12 个头文件，4,871 行，全部 header-only）；测试 `tests/go_api/`
 > **构建接入**：`-DGO2CPP_WITH_GO_API=ON`（默认 OFF）；测试目标 `go_api_net`、`go_api_concurrency`、`go_api_stress`、`go_api_crc32`、`go_api_crypto_rand`、`go_api_flag`、`go_api_signal`（Unix only）

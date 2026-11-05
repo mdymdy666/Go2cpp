@@ -99,7 +99,9 @@ public:
     bool connect(const Address& address, Duration timeout = Duration::max());
     bool close() noexcept;
     SocketResult send(const void* data, std::size_t length, int flags = 0,
-                      Duration timeout = Duration::max());
+                      Duration timeout = Duration::max());   // 单次 write，可短写
+    SocketResult SendAll(const void* data, std::size_t length, int flags = 0,
+                         Duration timeout = Duration::max()); // 2026-11-05 补：循环到全量
     SocketResult recv(void* data, std::size_t length, int flags = 0,
                       Duration timeout = Duration::max());
     SocketResult sendv(const iovec* buffers, std::size_t count, int flags = 0, Duration timeout = Duration::max());
@@ -124,6 +126,12 @@ struct SocketResult { ssize_t transferred{-1}; int error{0}; bool ok() const noe
 
 `SocketResult::ok()` 要求 `transferred >= 0 && error == 0`。**部分成功不重试**：`send_batch` 的
 `transferred` 可能小于 count，调用方把 `[transferred, count)` 作为下一批继续（重试会重复发送）。
+
+`send()`/`recv()` 的 `timeout` 是**三态**（2026-11-05 修正，`socket.hpp` 的 H-02/H-03）：
+`Duration::max()`（默认）**不是无限**，而是回落到 `recv_timeout()`/`send_timeout()` 配置，
+只有配置也为 max 时才真正无限；有限正数 = 本次等待上限；`Duration(0)` = 合法的「不等待」，
+不可读/不可写时立即返回 `{-1, ETIMEDOUT}`（不是清除超时）；负数 = `EINVAL`。
+大包必须用 `SendAll()`：`send()` 部分成功仍 `ok()==true`，直接重试会重发前缀。
 
 ### 3.2 HTTP/1.1
 
@@ -192,12 +200,14 @@ const std::string& NegotiatedProtocol() const noexcept;   // ALPN，如 "h2"
 
 int main() {
     using namespace go2cpp;
-    Scheduler sched(2);
-    sched.start();
+    auto& sched = default_scheduler();   // 2026-11-05 修正：默认调度器是进程级单例
 
     auto listener = net::Socket::CreateTCP(AF_INET);
     if (!listener->bind(*net::IPv4Address::Create("127.0.0.1", 0)) || !listener->listen(8)) return 1;
-    const auto port = listener->local_address()->port();   // 0 → 内核分配
+    // 2026-11-05 修正：port() 在 IPAddress 子类，不在 Address 基类，需向下转型
+    const auto local = std::dynamic_pointer_cast<net::IPAddress>(listener->local_address());
+    if (!local) return 1;
+    const auto port = local->port();   // 0 → 内核分配
 
     auto server = go(sched, [listener] {                    // Fiber 上 accept 会 park
         auto conn = listener->accept(std::chrono::milliseconds(5000));
@@ -217,8 +227,9 @@ int main() {
     char reply[64]{};
     auto got = client->recv(reply, sizeof(reply));
     std::cout << "echo=" << std::string(reply, got.ok() ? got.transferred : 0) << '\n';
+    if (!server) return 1;              // 空句柄 = 未提交，必须判空（2026-11-05 修正）
     server->wait();
-    sched.shutdown();
+    shutdown_default_scheduler();
     return 0;
 }
 ```
@@ -298,8 +309,11 @@ Go**，领先 **1.07–2.90×**」；最差项是 WebSocket 16 连接 1.07×，�
    会同时关链校验和主机名校验；空 `server_name` 不设 SNI 也不做主机名匹配。
 4. **`http::Server` 不 accept**：构造注入 listener，调用方自己 `accept()` 再
    `serve_connection()`；后者**不设 recv/write 超时**（无限等待），连接级超时要上层负责。
-5. **`Parser::feed` 的 `consumed` 语义**：返回的是「本次喂入的字节数」，不是已消费偏移；
-   多读的剩余字节必须用 `take_remaining()` 取。`http.hpp` 里「consumed 之前已交付」是过期注释。
+5. **`Parser::feed` 的 `consumed` 语义**（2026-11-05 修正）：`consumed` 是**本条消息在
+   内部缓冲中占用的字节数**（跨 feed 累积；`ParseResult` 不变量要求 Complete 时 `consumed>0`），
+   不是「本次喂入的字节数」，也不是「已消费偏移」。多读的剩余字节必须用 `take_remaining()` 取；
+   后者保留 `set_response_to_head()` 的连接级标志（流水线下一条仍服务同一 HEAD 请求），
+   只有 `reset()` 清零。
    **`ResponseWriter::flush()` 不写字节**（只检查可写，历史命名）；**`http::Client` 不复用连接**。
 6. **QUIC/HTTP3 默认 OFF**：`GO2CPP_WITH_PICOQUIC=ON` 才编，**无 ctest**，只做过编译验证。
 7. **WebSocket 所有权**：`Accept/Connect` 拿 `Socket::Ptr`，析构只 `abort_transport()`

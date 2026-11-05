@@ -36,6 +36,7 @@
  * @return 全部断言通过返回 0，否则返回 1。
  */
 
+#include "go2cpp/go.hpp"
 #include "go2cpp/runtime.hpp"
 
 #include <atomic>
@@ -173,15 +174,15 @@ void ScenarioCheckDone() {
 /// @brief 演示 WithCancel 泄漏的默认行为与三种可选收尾策略。
 /// @return 全部断言通过返回 0，否则返回 1。
 int main() {
-  Scheduler scheduler(2);
-  scheduler.start();
+  // 复用进程级默认调度器（首次创建时 P=2），不再自建实例。
+  Scheduler& scheduler = default_scheduler(2);
 
   ScenarioForgotCancel(scheduler);
   ScenarioRaiiGuard(scheduler);
   ScenarioWithTimeout(scheduler);
   ScenarioCheckDone();
 
-  scheduler.shutdown();
+  shutdown_default_scheduler();
 
   if (g_failures == 0) {
     std::clog << "[03-context-cancel-leak] 全部通过\n";

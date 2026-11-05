@@ -113,7 +113,8 @@ task->wait_for(3s);
 ### 2. `Parser` 喂了半包就不再喂
 - **现象**：请求一直不完整，连接空转直到超时。
 - **原因**：`Parser` 是**有状态**的增量解析器，一次 `feed()` 只处理已到达的字节，必须持续喂到 `Complete`。
-- **处理**：`while (!parser.Complete()) { feed(...); }`；解析出错后 `reset()` 或重建，不要复用旧状态。
+- **处理**（2026-11-05 修正）：循环 `feed()` 直到返回的 `ParseResult.state == ParseState::Complete`
+  或 `parser.finished()` 为真（Parser **没有** `Complete()` 成员）；解析出错后 `reset()` 或重建。
 
 ### 3. 分帧没设 `max_frame`
 - **现象**：内存暴涨几个 GB 后 OOM。

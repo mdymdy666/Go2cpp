@@ -1,3 +1,4 @@
+#include "go2cpp/go.hpp"
 #include "go2cpp/scheduler.hpp"
 
 #include <atomic>
@@ -26,8 +27,8 @@ int main() {
     config.max_workers = 4;
     config.idle_worker_timeout = Ms(40);
 
-    Scheduler scheduler(config);
-    scheduler.Start();
+    // 默认契约是进程级唯一调度器：复用默认实例，不再自建 Scheduler。
+    Scheduler& scheduler = go2cpp::default_scheduler(config);
     const auto initial = scheduler.WorkerCount();
     std::cout << "  启动后 Worker 数=" << initial
               << "（应在 " << config.min_workers << ".." << config.max_workers
@@ -69,7 +70,7 @@ int main() {
               << "，即保底不回收到 0）\n";
     ok = ok && idle == config.min_workers;
 
-    scheduler.Shutdown();
+    go2cpp::shutdown_default_scheduler();
     std::clog << (ok ? "[gmp] 全部通过\n" : "[gmp] 有失败\n");
     return ok ? 0 : 1;
 }
