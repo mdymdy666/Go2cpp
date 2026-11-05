@@ -349,3 +349,5 @@ grep -nE '114\.4|7,350|212,701' docs/reports/rpc-bench-2026-11-05.md # 6,58,61,6
 | 2026-11-05 19:18 | Parser（chunked 6MiB/1KiB） | **23 ms**（对照 close-delimited 17 ms） | 基线 17 ms / 9 ms | ⚠️ +35%，但**对照组同步变慢**（9→17 ms，+89%）→ 判机器负载噪声，非 Parser 回归 | 2026-11-05 | 单次 |
 
 | 2026-11-05 19:35 | TLS AEAD（taskset -c 4，vs EVP） | 1MiB **1.06×**（4638.3 vs 4934.0 MB/s）；64KiB **1.01×**；chacha20-only 6880.7 MB/s | 基线 1.02–1.04× | ✅ 偏差 +2~4%，在 ±20% 内，**无回归** | 2026-11-05 | taskset 绑核 |
+
+| 2026-11-05 19:47 | tunnel（mux 模式，taskset -c 4） | tunnel **792.75 / 1139.44 / 1095.60 MiB/s**（3 轮）；direct 1460 / 1336 / 2229；开销约 **1.84–2.03×**；latency p50 tunnel 2.126 ms vs direct 0.224 ms | 基线 raw 2385 MiB/s / 1.27× | 口径不同：bench_tunnel 跑 mux 路径，未触发 raw（raw 需 GO2CPP_TUNNEL_RAW_THRESHOLD=0 + 大 body）；mux 与旧基线（770–1139）一致，无回归 | 2026-11-05 | 3 轮 |
