@@ -42,7 +42,7 @@
 |---|---|
 | `- [x]` `src/concurrency/parking_condition.cpp` | 所有 fiber 的 park/unpark 都走它（**已审 2026-11-05：无丢唤醒**，见执行记录） |
 | `- [x]` `src/concurrency/sync.cpp` | Mutex/CondVar/WaitGroup（**已审 2026-11-05：发现并修复 P0**，见执行记录） |
-| `src/concurrency/scheduler.cpp` | worker 唤醒、sysmon |
+| `- [x]` `src/concurrency/scheduler.cpp` | worker 唤醒、sysmon（**已审 2026-11-05：无丢唤醒**，见执行记录） |
 | `src/concurrency/timer.cpp` | 定时器队列唤醒 |
 | `src/concurrency/context.cpp` | cancel 传播 |
 | `include/go2cpp/concurrency/channel.hpp` + `channel.cpp` | `Channel::Send/Recv` 阻塞 |
@@ -153,3 +153,4 @@ cv_.wait(lock, [&] { return closed_; });   // 谓词版 wait，内部 while
 |---|---|---|
 | 2026-11-05 14:30 | `parking_condition.cpp`（P0 第 1 项） | ✅ **无丢唤醒**。两条路径分别核对：① **Linux futex 路径**（`:355-363`）`fetch_add(release)` + `FutexWake`，等待方 `FUTEX_WAIT(seq, expected)` 由内核保证「seq 已变则不阻塞」，无窗口；② **native 路径**（`:363-390` / `:512-521`）`Finish` 用 CAS(acq_rel) 改 `result`、`notify_one` 持 `m_wake_mutex`、等待方用 `unique_lock` + **谓词版** `wait(lock, pred)`——经典正确模式，谓词检查与挂起由 lock 串行化。无需修改。 |
 | 2026-11-05 14:45 | `sync.cpp`（P0 第 2 项） | 🔴 **发现 P0 并已修**：non-Linux 路径 `m_native_condition.notify_one()` **不持 `m_native_mutex`**，而等待方是 `unique_lock(m_native_mutex) + wait(lock, pred)` → 「谓词已判 false、尚未挂 futex」窗口内 notify 必丢 → 普通线程永久睡死（Windows/macOS 受影响；Linux 靠 futex 的 (seq,expected) 免疫）。修法：notify 前加 `lock_guard<std::mutex>(m_native_mutex)`。 |
+| 2026-11-05 15:00 | `scheduler.cpp`（P0 第 3 项） | ✅ **无丢唤醒**。三处 condvar 分别核对：① `Task` 终态等待（`:1096-1115`）`unique_lock` + 谓词 `wait`，`notify_terminal`（`:1154-1165`）用 Dekker（`terminal` release + `waiters` seq_cst）先判「有无等待者」，有则**先拿 `waiter->mutex` 做登记屏障再锁外 notify_all**——等待方在持锁状态下完成「登记+谓词复查」，锁保证通知必在登记之后，无窗口；② worker 睡眠（`:6629`）`condition.wait_for(lock, timeout, pred)` 标准谓词版，`notify_worker` 的锁外 `notify_one` 由 POSIX condvar「释放锁+挂起」的原子性保证不丢；③ sysmon（`:2616`）同样是谓词版 `wait_for`。无需修改。 |
