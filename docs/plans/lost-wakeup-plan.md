@@ -60,6 +60,10 @@
 
 ### P2（工具/调试/存储，其余 16 个）
 
+| 状态 | 文件 | 结论 |
+|---|---|---|
+| `- [x]` | `src/storage/watch.cpp` + `src/os/pool.cpp` | **已审 2026-11-05：无丢唤醒**（见执行记录 R13） |
+
 `src/storage/watch.cpp`、`src/os/pool.cpp`、`src/p2p/signaling.cpp`、`src/bento/net/memory_transport.cpp`、
 `src/debug/*`、`include/go2cpp/logging/rotate.hpp`、`include/go2cpp/distributed/{metadata_store,coordinator}.hpp`、
 `include/go2cpp/concurrency/core/futex_mutex.hpp` 等。
@@ -175,3 +179,4 @@ cv_.wait(lock, [&] { return closed_; });   // 谓词版 wait，内部 while
 | 2026-11-05 16:45 | `rpc/server.cpp`（P1 第 4 项） | 🔴 **发现 P0 并已修**：`ServerConnection::Close()` 原先 **锁外** `m_closed.exchange(true)` 再 `m_queue_cv.notify_all()`，而 `WorkerLoop`（`:544-550`）是 `unique_lock(m_queue_mutex)` + 谓词版 `wait`——「谓词已判 false、尚未挂 futex」窗口内 notify 必丢 → worker 永久睡死、`Join()` 卡死。修法：`exchange` 移进 `m_queue_mutex` 临界区，锁外 notify（Dekker）。入队路径 `HandleRequest`（`:483`）本来就是「锁内入队 + 锁外 notify」，正确。 |
 | 2026-11-05 17:00 | `app/{gateway,realtime_room,transport,connection,bento_link_transport}`（P1 第 5 项） | ✅ **无丢唤醒**。① `gateway` 连接队列：`Stop`（`:1422-1429`）锁内置 `queue_closed`、锁外 `notify_all`（Dekker），`HandleAccept`（`:1730-1738`）在 `lock_guard(queue_mutex)` 作用域内入队 **并在锁内 notify_one**，等待方（`:1228`）谓词版 `wait`；② `realtime_room`：`Push` 入队与 notify 同锁、`Stop`（`:96-101`）锁内置 `m_stopping` + 锁外 notify，等待方（`:126`）谓词版；③ `transport` 全部 `wait_for`（`:74` 无谓词但 100ms 超时兜底、`:100` 带谓词）；④ `bento_link_transport` `wait_for` 带超时；⑤ `connection.cpp` 两处 notify 均为锁内状态变更后发出。无需修改。 |
 | 2026-11-05 17:15 | `distributed/transport.cpp`（P1 第 6 项，P1 收尾） | ✅ **无丢唤醒**。worker 退出路径（`:503-508`）在 `lock_guard(workers_mutex)` 内 `--workers`、锁外 `notify_all`（Dekker）；`Stop()` 等待方（`:783`）`unique_lock(workers_mutex)` + 谓词版 `wait(lock, [workers == 0])`——计数在锁内减、谓词在锁内检查，无窗口。注释也写明了「必须等归零，否则 Impl 析构后仍有 detached 线程访问 → UAF」。**P1 六项全部审完**。 |
+| 2026-11-05 17:30 | `storage/watch.cpp` + `os/pool.cpp`（P2 第 1 批） | ✅ **无丢唤醒**。① `watch.cpp`：`Close`（`:108-120`）`lock_guard(q_mu_)` 内置 `stop_`、锁外 `q_cv_`/`q_space_cv_` notify_all（Dekker）；等待方（`:464/480`）都是谓词版。② `os/pool.cpp`：`Submit` 在锁内 `queue.push_back`（`:153`）、锁外 `work_cv.notify_all()`（`:161`）——经典正确；`space_cv`（`:134/137`）谓词版 + 可选超时。**一条值得记住的注释**（`:155-160`）：缩容后等待谓词含 `index < target_workers`，用 `notify_one` 可能选中已无资格的 worker → 任务滞留到超时（实测 ~10%），所以必须 `notify_all`——这是「谓词带资格条件时不能 notify_one」的真实教训。 |
