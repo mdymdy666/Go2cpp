@@ -66,7 +66,9 @@ int main() {
 
     SchedulerConfig config;
     config.processor_count = 2;
-    Scheduler scheduler(config);
+    // 默认契约：进程级唯一调度器；default_scheduler() 首次调用即启动，
+    // 因此先取实例、再挂观察者（避免漏掉 start 事件）。
+    Scheduler& scheduler = default_scheduler(config);
 
     // ① 挂事件采集器
     auto collector = std::make_shared<DebugEventCollector>(4096);
@@ -77,7 +79,6 @@ int main() {
     spec.name = "demo";
     const auto id = DebugBreakpoints::Instance().Add(spec);
 
-    scheduler.start();
     for (int i = 0; i < 20; ++i) {
         scheduler.spawn([] { ScopedCheckpoint ck("demo"); (void)ck.hit(); })->wait();
     }
@@ -87,7 +88,7 @@ int main() {
     const auto snap = proxy.Snapshot();          // processor_count / worker_count / runnable_total
     const std::string text = proxy.DumpText();
 
-    scheduler.shutdown();
+    shutdown_default_scheduler();
     return DebugBreakpoints::Instance().Hits(id) == 20 ? 0 : 1;
 }
 ```

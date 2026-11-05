@@ -6,14 +6,13 @@
 - 分布在 concurrency（最多）、network、debug、app 与 4 篇文档。
 
 ## 2. 关键事实（任务前提需修正）
-
 多实例告警是**编译期宏**，不是环境变量：`src/concurrency/scheduler.cpp:3367` 用
 `#ifndef GO2CPP_ALLOW_MULTI_SCHEDULER` 包裹，编译进库后无法在示例里用
 `setenv("GO2CPP_ALLOW_MULTI_SCHEDULER","1",1)` 关闭。且告警只在 `active_instances>1`
 时触发（`start()` 计数、`shutdown()` 归还），顺序创建/销毁的单实例示例本来就不告警。
 因此本次对"故意多实例"的示例只保留构造 + 注释说明，未写入无效的 setenv。
 
-## 3. 改造（21 处不再自建）
+## 3. 改造（22 处不再自建）
 
 19 处代码改为 `default_scheduler(...)` / `default_scheduler_handle(...)` + `shutdown_default_scheduler()`，
 并补 `#include "go2cpp/go.hpp"`：
@@ -30,10 +29,10 @@
 | network/http2_h2c_server、http2_h2c_client | 2 |
 | debug/debug_module_demo（先挂观察者再取默认实例） | 1 |
 
-另 2 处文档（`user/docs/01-concurrency.md`、`02-network.md`）由并发的文档任务在
-`dfc7319` 中同步为 `go()` 写法，本 agent 已核对，未重复编辑以避免写冲突。
+另 3 处文档：`user/docs/01-concurrency.md`、`02-network.md` 由并发的文档任务在
+`dfc7319` 中同步为 `go()` 写法（已核对）；`user/modules/debug/README.md` 本 agent 同步。
 
-## 4. 保留（21 处）
+## 4. 保留（20 处）
 
 - **16 处：教学/多实例/多配置，故意保留**
   - `scheduler_full.cpp` 6 处：Scheduler 生命周期与多实例用例（本示例的教学对象）。
@@ -42,7 +41,8 @@
   - `runtime_full.cpp:123` 1 处：INI 配置驱动 P=3 的独立实例，已挪到默认实例关闭之后。
 - **3 处：bento 依赖，构建被跳过，未验证 → 不动**
   - `app/web_server_simple/main.cpp`、`app/web_server_full/app_server.h`、`chat_server_full/app_server.h`。
-- **2 处：文档残留**（`concurrency/README.md:91`、`debug/README.md:69`），属并发文档任务范围。
+- **1 处：文档刻意保留**：`concurrency/README.md:91` 已被并发文档任务改写为「直接构造是高级用法」
+  的显式重载示例，并注明第二实例会 WARN；尊重该裁定，未推翻。
 
 ## 5. 验证
 
@@ -51,10 +51,10 @@
   手工链接仓库 `.so` 通过。
 - 运行：15 个可运行示例 **rc=0**；14 个**零多实例告警**；
   `dynamic_gmp_demo` 出现 1 条预期内告警（故意多实例）。
-- 复扫：`grep -rnE 'Scheduler +[A-Za-z_]+ *[({]' user/` → **23 行**，扣除 2 处 DebugScheduler
-  误报为 **21 处**，即上表保留项；`grep -c "Scheduler s("` 已为 0。
+- 复扫：`grep -rnE 'Scheduler +[A-Za-z_]+ *[({]' user/` → **22 行**，扣除 2 处 DebugScheduler
+  误报为 **20 处**，即上表保留项；`grep -c "Scheduler s("` 已为 0。
 
 ## 6. 备注
 
-- 未改 `src/`、未主动 commit；改动被并发文档提交 `dfc7319` 一并纳入，工作区当前 clean。
-- 时间盒超时（约 70 分钟）：bento 三个应用示例与两篇文档未纳入本轮验证。
+- 未改 `src/`、未主动 commit；代码改动被并发提交 `dfc7319`、报告被 `13aaafe` 纳入。
+  时间盒超时（约 75 分钟），bento 三个应用示例未纳入编译/运行验证。
