@@ -54,6 +54,32 @@ constexpr bool FastOk(FastStatus status) noexcept {
   return status == FastStatus::kOk;
 }
 
+/**
+ * @brief 把 `FastStatus` 翻译成具体含义与调用方处置建议。
+ *
+ * @param status [in] 任意 `FastStatus` 值。
+ * @return 静态字符串（进程生命周期有效，不需释放）；未知值返回
+ *         `"unknown FastStatus"`。
+ *
+ * @note `noexcept` 且无分配；诊断接口，不参与控制流。
+ */
+inline const char* FastStatusMessage(FastStatus status) noexcept {
+  switch (status) {
+    case FastStatus::kOk:
+      return "操作成功完成（值已入槽或已取出）；调用方继续正常流程";
+    case FastStatus::kWouldBlock:
+      return "非阻塞操作当前无法完成（通道满/空），本次没有传输；调用方"
+             "应稍后重试或改阻塞接口";
+    case FastStatus::kClosed:
+      return "通道已关闭，接收方在排空缓冲后看到该状态；调用方应结束"
+             "收发循环并收尾";
+    case FastStatus::kUnsupported:
+      return "当前上下文无法安全阻塞（手动 Fiber/无 Scheduler）或 park 被"
+             "打断；调用方应改用非阻塞接口或先绑定 Scheduler，不要忙等";
+  }
+  return "unknown FastStatus";
+}
+
 namespace detail {
 
 /** @brief 就地构造槽位（不要求 T 默认构造；Cap==0 时可定义空数组）。 */

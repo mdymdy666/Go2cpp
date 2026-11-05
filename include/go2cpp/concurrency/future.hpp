@@ -178,6 +178,44 @@ enum class FutureStatus : std::uint8_t {
 const char* FutureStatusName(FutureStatus status) noexcept;
 
 /**
+ * @brief 把 `FutureStatus` 翻译成具体含义与调用方处置建议。
+ *
+ * @param status [in] 任意 `FutureStatus` 值。
+ * @return 静态字符串（进程生命周期有效，不需释放）；说明结果是否已改变
+ *         Future 状态、调用方该消费还是重试。未知值返回
+ *         `"unknown FutureStatus"`。
+ *
+ * @note `noexcept` 且无分配；诊断接口，不参与控制流。与
+ *       `FutureStatusName()` 的分工：Name 返回枚举名（日志字段/测试断言），
+ *       Message 返回人读的语义与动作建议。
+ */
+inline const char* FutureStatusMessage(FutureStatus status) noexcept {
+    switch (status) {
+    case FutureStatus::kReady:
+        return "Future 已产生值并发布终态；调用方直接取值，不要再次等待";
+    case FutureStatus::kError:
+        return "Promise 以错误完成并发布终态；调用方取 error() 查看原因，"
+               "不要重试等待";
+    case FutureStatus::kException:
+        return "Promise 以异常完成并发布终态；GetOrThrow 会重新抛出该异常，"
+               "调用方按异常路径处理，不要当作超时";
+    case FutureStatus::kCancelled:
+        return "等待期间取消请求生效（Task/后端取消），Future 可能仍未完成；"
+               "调用方应向上传播取消，不要重试";
+    case FutureStatus::kTimedOut:
+        return "本次等待超过本地 deadline，Future 状态未被改变；调用方可在"
+               "业务允许时再次等待（与 kCancelled 的区别：没有取消发生）";
+    case FutureStatus::kDeadlineExceeded:
+        return "Context 的上游 deadline 已过（优先于本地 deadline），等待未"
+               "改变 Future 状态；调用方应按上下文到期处理，通常不再重试";
+    case FutureStatus::kInvalid:
+        return "Future 没有关联有效的共享状态（默认构造/已移动）；调用方应"
+               "检查对象生命周期，重试不会成功";
+    }
+    return "unknown FutureStatus";
+}
+
+/**
  * 显式 GetOrThrow 失败时抛出的异常。运行时内部不会使用这个异常做跳转。
  */
 /** @brief Future::GetOrThrow 抛出的状态异常。 */

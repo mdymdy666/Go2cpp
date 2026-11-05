@@ -496,6 +496,37 @@ namespace go2cpp
         ErrorPtr rollback_cause() const noexcept;
         /** @brief 返回状态名称；未知值返回 "unknown"。 */
         static const char *StatusName(Status status) noexcept;
+        /**
+         * @brief 把事务状态翻译成具体含义与调用方处置建议。
+         * @param status [in] 任意 `Status` 值。
+         * @return 静态字符串（进程生命周期有效，不需释放）；未知值返回
+         *         "unknown ContextRollback status"。
+         * @note `noexcept` 且无分配；诊断接口，不参与控制流。与 StatusName
+         *       的分工：Name 给稳定枚举名，Message 给「能不能继续记 undo、
+         *       能否等待 RollbackDone」的动作建议。
+         */
+        static const char *StatusMessage(Status status) noexcept
+        {
+            switch (status)
+            {
+            case Status::kActive:
+                return "事务进行中，可继续 RecordUndo/记录 savepoint；"
+                       "提交或回滚尚未发生";
+            case Status::kRollingBack:
+                return "回滚已开始、补偿动作正在按 LIFO 执行；调用方应等待 "
+                       "RollbackDone，不要再登记新的 undo（会被拒绝）";
+            case Status::kCommitted:
+                return "事务已提交，undo 队列被丢弃、child Context 未被取消；"
+                       "调用方把 context() 交给下游，不要再回滚";
+            case Status::kRolledBack:
+                return "事务已完整回滚，补偿动作执行完毕；调用方按失败路径"
+                       "收尾，重复回滚是幂等成功，不要重试业务操作";
+            case Status::kFailed:
+                return "回滚过程有补偿动作抛异常，异常已聚合在 failures()；"
+                       "调用方应记录全部异常并判定资源可能残留";
+            }
+            return "unknown ContextRollback status";
+        }
         const char *status_name() const noexcept { return StatusName(status()); }
         bool committed() const noexcept;
         bool rolled_back() const noexcept;

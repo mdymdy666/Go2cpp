@@ -111,6 +111,64 @@ class ParkingCondition final {
 public:
     using Clock = std::chrono::steady_clock;
 
+    /**
+     * @brief 单次 `WaitOnce`（即一次 `wait/wait_for/wait_until` 的内部迭代）
+     *        的结局。
+     *
+     * ## 为什么不是 bool
+     *
+     * 上层 `wait*` 只把「谓词最终是否为真」交回调用方，但“为什么结束”决定
+     * 日志、超时统计与取消传播。旧版只有三个值，`kCancelled` 同时承担了
+     * 「Task 取消」和「当前上下文无法 park」两种完全不同的处置方式；调用方
+     * 无法从状态本身区分「该向上传播取消」还是「该换非阻塞接口」。
+     *
+     * ## 值稳定性
+     *
+     * 前三个值（0/1/2）是历史值，**不得改动**；新增值只追加在末尾。外部
+     * `switch` 必须覆盖全部值（或带 `default`），否则新增值会触发
+     * `-Wswitch` —— 这正是我们想要的编译期提醒。
+     */
+    enum class WaitStatus {
+        /**
+         * 正常唤醒：等待期间谓词变为真，或通知先于入队到达、入队前重检
+         * 谓词即为真。调用方应按正常路径继续，**不要**重试本次等待。
+         */
+        kNotified = 0,
+        /**
+         * 超时：等待超过 deadline（或进入等待前 deadline 已过期），且谓词
+         * 仍未满足。调用方应检查业务条件后决定重试还是放弃，并把超时作为
+         * 结果返回上层；不要把它当成取消。
+         */
+        kTimedOut = 1,
+        /**
+         * 取消：所属 Task 的取消请求在等待前或等待期间生效（无限等待时这是
+         * 唯一会打断阻塞的负向结局）。调用方应立即放弃本次操作并向上传播
+         * 取消，**不要重试**。
+         */
+        kCancelled = 2,
+        /**
+         * 虚假唤醒：被与本次等待无关的唤醒/信号打断，且谓词仍未满足。
+         * 当前实现内部重新 park（`WaitManaged` 的 spurious 重试循环），不会
+         * 把它交给调用方；保留该值供未来需要显式暴露虚假唤醒的路径使用。
+         * 若调用方收到，应重新检查谓词并重试等待。
+         */
+        kSpurious = 3,
+        /**
+         * 未武装：等待没有真正进入阻塞就返回 —— 典型是手动 Fiber（有 Fiber
+         * 上下文但没有 Scheduler/Task 归属），既无法 park、也不允许阻塞
+         * carrier 线程。对应旧实现里被并入 `kCancelled` 的「无调度器」场景。
+         * 调用方应改用非阻塞接口，或先绑定 Scheduler；**不要原地重试**
+         * （否则会变成忙等），也不要当作业务取消向上传播。
+         */
+        kNotArmed = 4,
+        /**
+         * 非法/实现违约：等待返回时节点结果仍是 `kWaiting`（状态机不变量
+         * 被破坏），或参数组合非法。属于实现缺陷信号，调用方应停止重试、
+         * 记录诊断并尽快失败，而不是把结果当作正常超时/取消处理。
+         */
+        kInvalid = 5,
+    };
+
     ParkingCondition();
     ~ParkingCondition();
     ParkingCondition(const ParkingCondition&) = delete;
@@ -125,8 +183,11 @@ public:
     template <typename Predicate>
     bool wait(std::unique_lock<std::mutex>& lock, Predicate predicate) {
         while (!predicate()) {
-            if (WaitOnce(lock, std::nullopt, predicate) ==
-                WaitStatus::kCancelled) {
+            // 任何非 kNotified 结局都必须退出：kCancelled/kNotArmed/kInvalid
+            // 都表示本次等待没有拿到通知，继续循环只会忙等（尤其是无法 park
+            // 的手动 Fiber，每次都会立即返回 kNotArmed）。
+            if (WaitOnce(lock, std::nullopt, predicate) !=
+                WaitStatus::kNotified) {
                 return predicate();
             }
         }
@@ -178,7 +239,6 @@ public:
     ParkingConditionDebugSnapshot DebugSnapshot() const;
 
 private:
-    enum class WaitStatus { kNotified, kTimedOut, kCancelled };
     class WaitNode;
 
     WaitStatus WaitOnce(std::unique_lock<std::mutex>& lock,
@@ -211,4 +271,42 @@ private:
     alignas(64) BroadcastState m_broadcast;
 };
 
+
+/**
+ * @brief 把 `WaitStatus` 翻译成可写进日志/错误信息的具体含义。
+ *
+ * @param status [in] 任意 `WaitStatus` 值（含未来新增值）。
+ * @return 描述「发生了什么、调用方该怎么做」的静态字符串；未知值返回
+ *         `"unknown WaitStatus"`。返回值是静态存储，进程生命周期有效，
+ *         调用方**不要**释放，也不要假设它等于枚举名。
+ *
+ * @note `noexcept` 且无堆分配：可在取消路径、信号处理后的收尾路径与
+ *       每等待一次的日志里直接调用。它是诊断接口，不参与控制流——控制流
+ *       一律比较枚举本身。
+ */
+inline const char* WaitStatusMessage(ParkingCondition::WaitStatus status) noexcept {
+    switch (status) {
+    case ParkingCondition::WaitStatus::kNotified:
+        return "等待正常结束：谓词已满足（通知在入队前到达或等待期间被唤醒）；"
+               "调用方按正常路径继续，不要重试本次等待";
+    case ParkingCondition::WaitStatus::kTimedOut:
+        return "等待超过 deadline 且谓词仍未满足；调用方应检查业务条件，"
+               "决定重试或把超时返回上层，不要当作取消";
+    case ParkingCondition::WaitStatus::kCancelled:
+        return "所属 Task 的取消请求在等待前或等待期间生效；调用方应立即"
+               "放弃本次操作并向上传播取消，不要重试";
+    case ParkingCondition::WaitStatus::kSpurious:
+        return "被与本次等待无关的唤醒/信号打断且谓词仍未满足；当前实现会在"
+               "内部重新 park，正常情况下调用方看不到此值；"
+               "若收到应重检谓词并重试等待";
+    case ParkingCondition::WaitStatus::kNotArmed:
+        return "当前上下文无法 park（典型是未绑定 Scheduler 的手动 Fiber），"
+               "等待未进入阻塞就返回；调用方应改用非阻塞接口或先绑定"
+               "Scheduler，不要原地重试，也不要当作业务取消";
+    case ParkingCondition::WaitStatus::kInvalid:
+        return "等待返回时节点仍处于 kWaiting，说明状态机不变量被破坏"
+               "（实现缺陷或非法参数）；调用方应停止重试、记录诊断并尽快失败";
+    }
+    return "unknown WaitStatus";
+}
 }  // namespace go2cpp::core

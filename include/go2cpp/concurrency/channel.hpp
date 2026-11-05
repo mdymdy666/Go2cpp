@@ -169,6 +169,52 @@ inline const char* ChannelStatusName(ChannelStatus status) noexcept {
   return "kUnknown";
 }
 
+/**
+ * @brief 把 `ChannelStatus` 翻译成具体含义与调用方处置建议。
+ *
+ * @param status [in] 任意 `ChannelStatus` 值。
+ * @return 静态字符串（进程生命周期有效，不需释放）；描述「为什么得到这个
+ *         状态、接下来该怎么做」，而不是重复枚举名。未知值返回
+ *         `"unknown ChannelStatus"`。
+ *
+ * @note `noexcept` 且无分配，可在错误构造与日志热路径直接调用；
+ *       它是诊断接口，不参与控制流。
+ */
+inline const char* ChannelStatusMessage(ChannelStatus status) noexcept {
+  switch (status) {
+    case ChannelStatus::kReady:
+      return "操作成功且值已交付；调用方直接消费结果，不要重试";
+    case ChannelStatus::kWouldBlock:
+      return "非阻塞模式下通道当前为空/满，本次没有传输；调用方应在业务"
+             "允许时稍后重试，或改阻塞模式";
+    case ChannelStatus::kClosed:
+      return "通道已关闭且缓冲已排空；读取方应结束接收循环并收尾，"
+             "不要继续等待新值";
+    case ChannelStatus::kAlreadyClosed:
+      return "目标通道已经关闭，本次关闭/发送被拒绝；按幂等处理并忽略，"
+             "不要重试";
+    case ChannelStatus::kCancelled:
+      return "等待期间所属 Task 的取消请求生效，本次操作未完成；调用方应"
+             "向上传播取消，不要重试";
+    case ChannelStatus::kDeadlineExceeded:
+      return "等待超过调用方传入的绝对 deadline；调用方应决定重试或把"
+             "超时返回上层（与 kTimedOut 的区别：语义来自绝对时刻）";
+    case ChannelStatus::kTimedOut:
+      return "等待超过本次操作的超时时长；业务可重试，但不要把它当成取消";
+    case ChannelStatus::kNil:
+      return "通道句柄为空（nil channel），Go 语义下会永久阻塞，本实现"
+             "立即返回；调用方应检查初始化，不要重试";
+    case ChannelStatus::kInvalid:
+      return "参数非法（容量/操作组合不合法）；调用方应修正调用参数，"
+             "重试同样的调用不会成功";
+    case ChannelStatus::kNoScheduler:
+      return "操作需要 park 但当前没有 Scheduler（典型是未绑定的手动"
+             "Fiber）；调用方应改用非阻塞接口或先绑定 Scheduler，"
+             "不要原地重试";
+  }
+  return "unknown ChannelStatus";
+}
+
 /** @brief 判断状态是否代表一次可交付的结果。 */
 inline bool ChannelStatusIsReady(ChannelStatus status) noexcept {
   return status == ChannelStatus::kReady || status == ChannelStatus::kClosed;
