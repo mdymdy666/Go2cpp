@@ -359,3 +359,124 @@ grep -nE '114\.4|7,350|212,701' docs/reports/rpc-bench-2026-11-05.md # 6,58,61,6
 | 2026-11-05 21:50 | TLS AEAD 1MiB（core 6，低负载 5 轮） | 倍率 [1.02, 1.02, 1.06, 1.04, 1.04] 中位 **1.04×**、std 0.0167、**CV 1.6%** | 基线 1.02–1.04× | ✅ **CV 1.6% < 5%，首个稳定测量**；中位 1.04× 完全符合基线 | 2026-11-05 | 5 轮绑核 |
 
 | 2026-11-05 22:05 | bufio 热态（改造前对照，core 6，低负载 5 轮） | [7333.1, 10921.4, 7571.7, 5560.8, 4536.8] 中位 **7333 MiB/s**、std 2438、**CV 34%** | 基线 17695 | ❌ **CV 34% > 20%：基准不合格**（样本 5 MiB / 窗口 0.05 s，违反「100ms–1s」规范）；已派 agent 改造 | 2026-11-05 | 5 轮绑核 |
+
+### M24 json 小对象序列化/反序列化 ns/op
+
+- **历史值**：无（2026-11-05 首次入账）
+- **测量命令**：`taskset -c 1 /tmp/perf_uncovered/bench_json`（同一进程内 parse + dump 两段，各 5 轮）
+- **环境**：WSL Ubuntu / 宿主 12 vCPU / 20 GB；`taskset -c 1`；5 轮取中位；`-O2 -std=c++20 -DNDEBUG`，链接 `.build-bento-wsl` Release 库
+- **日期**：2026-11-05
+- **脚本路径**：`tests/bench/perf_uncovered/bench_json.cpp`
+- **状态**：`实测`（反序列化 **873.1 ns/op、1.145 M ops/s、CV 3.18%**；序列化 **261.8 ns/op、3.820 M ops/s、CV 3.78%**；均 CV<5%）
+- **备注**：5 字段小对象（id/name/ok/score/tags）；反序列化含 `JsonScanDepth` 迭代栅栏；开销主体是 nlohmann DOM 的堆分配。
+
+### M25 orm 单行 insert / 主键 select ns/op
+
+- **历史值**：无（`tests/storage/orm_bench.cpp` 有 1e6 行对照，但未入台账）
+- **测量命令**：`taskset -c 1 /tmp/perf_uncovered/bench_orm`（insert 与 select 各 5 轮）
+- **环境**：WSL Ubuntu / `taskset -c 1`；SQLite 文件库（WAL、synchronous=NORMAL）；每轮 DELETE 清表后插入 1e5 行；固定 1e5 次/轮，不足 120 ms 重复 K 轮取均值
+- **日期**：2026-11-05
+- **脚本路径**：`tests/bench/perf_uncovered/bench_orm.cpp`（直编 `src/storage/db.cpp` + `src/storage/orm.cpp`，该构建未产出 storage 库）
+- **状态**：`实测`（insert **520.0 ns/op、1.923 M ops/s、CV 1.43%**；select **2278.3 ns/op、0.439 M ops/s、CV 2.89%**）
+- **备注**：select 比 insert 慢 4.4×，差在 `Result`/行对象构造与语句缓存查找；两者 CV 均 <3%。
+
+### M26 config INI 解析（1e4 键）/ 单键查找 ns/op
+
+- **历史值**：无
+- **测量命令**：`taskset -c 1 /tmp/perf_uncovered/bench_config`
+- **环境**：WSL Ubuntu / `taskset -c 1`；100 段 × 100 键 = 1e4 键；5 轮取中位
+- **日期**：2026-11-05
+- **脚本路径**：`tests/bench/perf_uncovered/bench_config.cpp`
+- **状态**：`实测`（整份解析 **1.511 ms/次 = 6.62 M keys/s、CV 4.72%**；单键 `Get` **17.4 ns/op、CV 4.53%**）
+- **备注**：口径是 `IniFile::Parse`——`Config::LoadFromIni` 只接受静态注册项，无法凭空加载 1e4 个未注册键；`keys/s = ops/s × 1e4`。
+
+### M27 error 构造 + 格式化 ns/op
+
+- **历史值**：无
+- **测量命令**：`taskset -c 1 /tmp/perf_uncovered/bench_error`
+- **环境**：WSL Ubuntu / `taskset -c 1`；5 轮取中位
+- **日期**：2026-11-05
+- **脚本路径**：`tests/bench/perf_uncovered/bench_error.cpp`
+- **状态**：`实测`（`NewError`+`Message()` **28.2 ns/op、35.4 M ops/s、CV 5.42%**；`Wrap` 单层 **62.6 ns/op、16.0 M ops/s、CV 5.31%**）
+- **备注**：CV 5.3–5.4% 略高于 5% 门槛但远低于 20%，可重复；开销主体是 `shared_ptr` 控制块分配与 `Message()` 的 string 拷贝。
+
+### M28 log 写一行 ns/op（基准不合格）
+
+- **历史值**：无
+- **测量命令**：`taskset -c 1 /tmp/perf_uncovered/bench_log`
+- **环境**：WSL Ubuntu / `taskset -c 1`；5 轮取中位；Sink 为原子计数器、不落盘
+- **日期**：2026-11-05
+- **脚本路径**：`tests/bench/perf_uncovered/bench_log.cpp`
+- **状态**：`实测（基准不合格）`（**18.8 ns/行、53.1 M 行/s，CV 21.67% > 20%**）
+- **备注**：`LogItemWorker::Submit` = 过滤 + PatternFormatter + Sink 分发；每行一次 `std::string` 渲染导致分配器抖动，小窗口无法摊薄。下轮改用预分配缓冲 Formatter 或加大窗口后复测。
+
+### M29 hook read(2) 包装开销 ns/op
+
+- **历史值**：无
+- **测量命令**：`taskset -c 1 /tmp/perf_uncovered/bench_hook`（基线）与
+  `LD_PRELOAD=/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/libgo2cpp_hook.so taskset -c 1 /tmp/perf_uncovered/bench_hook`
+- **环境**：WSL Ubuntu / `taskset -c 1`；AF_UNIX socketpair 非阻塞，每次读 1 字节（数据已在内核缓冲区，不 park Fiber）；各 5 轮
+- **日期**：2026-11-05
+- **脚本路径**：`tests/bench/perf_uncovered/bench_hook.cpp`（对照在 `run_5rounds.sh` 中成对执行）
+- **状态**：`实测`（基线 **698.6 ns/read、CV 4.02%**；Hook 打开 **760.6 ns/read、CV 1.97%**；**净开销 +62.1 ns、+8.9%**）
+- **备注**：口径是「read 系统调用 + Hook 包装（fd 元数据查找 + OpEnabled 判定）」，不含 park 与 Fiber 调度。
+
+### M30 io IOManager 空任务吞吐 ns/op
+
+- **历史值**：无
+- **测量命令**：`taskset -c 1 /tmp/perf_uncovered/bench_io`
+- **环境**：WSL Ubuntu / `taskset -c 1`；IOManager 默认配置，主线程批量 `go()` 后自旋等待全部完成；5 轮取中位
+- **日期**：2026-11-05
+- **脚本路径**：`tests/bench/perf_uncovered/bench_io.cpp`
+- **状态**：`实测`（**549.8 ns/任务、1.819 M ops/s、CV 18.92%**）
+- **备注**：CV 5–20%，worker 唤醒受调度抖动影响；口径是事件循环的提交→执行→完成上限，不含真实 fd 等待；真实 IO 吞吐由 fd 就绪频率决定。
+
+### M31 resilience 熔断/限流判定 ns/op
+
+- **历史值**：无
+- **测量命令**：`taskset -c 1 /tmp/perf_uncovered/bench_resilience`
+- **环境**：WSL Ubuntu / `taskset -c 1`；CircuitBreaker 处于 Closed，RateLimiter 桶容量 1e9；5 轮取中位
+- **日期**：2026-11-05
+- **脚本路径**：`tests/bench/perf_uncovered/bench_resilience.cpp`
+- **状态**：`实测`（`CircuitBreaker::Allow` **19.6 ns/op、51.1 M ops/s、CV 4.03%**；`RateLimiter::TryAcquire(1.0)` **26.7 ns/op、37.5 M ops/s、CV 3.45%**）
+- **备注**：两者都是「1 次互斥量 + 1 次 steady_clock::now()」的判定路径；不涉及阻塞/排队。
+
+### M32 relay Hub 注册/查找/注销 ns/op
+
+- **历史值**：无（`tests/relay/bench_relay.cpp` 有同口径 1e6 次迭代，但未入台账）
+- **测量命令**：`taskset -c 1 /tmp/perf_uncovered/bench_relay`
+- **环境**：WSL Ubuntu / `taskset -c 1`；1024 个房间 key 轮转；5 轮取中位
+- **日期**：2026-11-05
+- **脚本路径**：`tests/bench/perf_uncovered/bench_relay.cpp`
+- **状态**：`实测`（**77.6 ns/op、12.9 M ops/s、CV 2.45%**）
+- **备注**：一次 op = `Register` + `Lookup` + `Unregister`，conn 为 `shared_ptr<NullStream>`（只承载引用计数）。
+
+### M33 trace span 创建/派生/编码 ns/op
+
+- **历史值**：无
+- **测量命令**：`taskset -c 1 /tmp/perf_uncovered/bench_trace`
+- **环境**：WSL Ubuntu / `taskset -c 1`；5 轮取中位
+- **日期**：2026-11-05
+- **脚本路径**：`tests/bench/perf_uncovered/bench_trace.cpp`
+- **状态**：`实测`（`CreateRoot` **5.0 ns/op、198 M ops/s、CV 2.77%**；`ChildSpan` **1.4 ns/op、699 M ops/s、CV 15.45%**；`ToHeader` 72 B **55.3 ns/op、18.1 M ops/s、CV 4.30%**）
+- **备注**：`ChildSpan` 绝对值仅 1.4 ns，计时噪声占比高（CV 15.45%）；`CreateRoot` 含两次 64 位随机数生成。
+
+### M34 metrics counter/gauge 更新 ns/op
+
+- **历史值**：无
+- **测量命令**：`taskset -c 1 /tmp/perf_uncovered/bench_metrics`
+- **环境**：WSL Ubuntu / `taskset -c 1`；独立 Counter/Gauge（不经 Registry 导出）；5 轮取中位
+- **日期**：2026-11-05
+- **脚本路径**：`tests/bench/perf_uncovered/bench_metrics.cpp`
+- **状态**：`实测`（`Counter::Inc` **3.60 ns/op、278 M ops/s、CV 3.70%**；`Gauge::Add` **3.39 ns/op、295 M ops/s、CV 3.70%**；`Gauge::Set` **3.02 ns/op、331 M ops/s、CV 4.05%**）
+- **备注**：全部为无锁原子路径（relaxed fetch_add / CAS 循环 / atomic store）；三者 CV 均 <5%。
+
+### M35 memory/arena 分配 ns/op
+
+- **历史值**：无
+- **测量命令**：`taskset -c 1 /tmp/perf_uncovered/bench_arena`
+- **环境**：WSL Ubuntu / `taskset -c 1`；`Arena(64 KiB)` 上连续 `Allocate(64)`；5 轮取中位
+- **日期**：2026-11-05
+- **脚本路径**：`tests/bench/perf_uncovered/bench_arena.cpp`（直编 `src/storage/arena.cpp`）
+- **状态**：`实测`（**36.0 ns/op、27.8 M ops/s、CV 19.73%**）
+- **备注**：CV 5–20%，块边界（64 KiB 用尽→新块）放大了内存抖动；口径为纯分配，不含写入后的使用成本。
