@@ -45,7 +45,7 @@
 | `- [x]` `src/concurrency/scheduler.cpp` | worker 唤醒、sysmon（**已审 2026-11-05：无丢唤醒**，见执行记录） |
 | `- [x]` `src/concurrency/timer.cpp` | 定时器队列唤醒（**已审 2026-11-05：无严重丢唤醒**，见执行记录） |
 | `- [x]` `src/concurrency/context.cpp` | cancel 传播（**已审 2026-11-05：无丢唤醒**，见执行记录） |
-| `include/go2cpp/concurrency/channel.hpp` + `channel.cpp` | `Channel::Send/Recv` 阻塞 |
+| `- [x]` `include/go2cpp/concurrency/channel.hpp` + `channel.cpp` | `Channel::Send/Recv` 阻塞（**已审 2026-11-05：无丢唤醒**，见执行记录） |
 
 ### P1（请求路径，8 个）
 
@@ -156,3 +156,4 @@ cv_.wait(lock, [&] { return closed_; });   // 谓词版 wait，内部 while
 | 2026-11-05 15:00 | `scheduler.cpp`（P0 第 3 项） | ✅ **无丢唤醒**。三处 condvar 分别核对：① `Task` 终态等待（`:1096-1115`）`unique_lock` + 谓词 `wait`，`notify_terminal`（`:1154-1165`）用 Dekker（`terminal` release + `waiters` seq_cst）先判「有无等待者」，有则**先拿 `waiter->mutex` 做登记屏障再锁外 notify_all**——等待方在持锁状态下完成「登记+谓词复查」，锁保证通知必在登记之后，无窗口；② worker 睡眠（`:6629`）`condition.wait_for(lock, timeout, pred)` 标准谓词版，`notify_worker` 的锁外 `notify_one` 由 POSIX condvar「释放锁+挂起」的原子性保证不丢；③ sysmon（`:2616`）同样是谓词版 `wait_for`。无需修改。 |
 | 2026-11-05 15:15 | `timer.cpp`（P0 第 4 项） | ✅ **无严重丢唤醒**。等待方两处都是**谓词版**（`:922` `m_cv.wait(lock, pred)`、`:954` `m_cv.wait_until(lock, deadline, pred)`）；notify 共 6 处（`:364/419/441/485/522/772`），前 4 处在 `lock_guard(m_mutex)` 内。**关键兜底**：`wait_until` 带 deadline——即便某处 notify 落在窗口内丢失，定时器也会在 deadline 到期时自然醒来，不会永久睡死。结论：不用改。 |
 | 2026-11-05 15:30 | `context.cpp`（P0 第 5 项） | ✅ **无丢唤醒**（标准 Dekker）。等待方 `:494-499` 持 `st.mutex` 后判谓词、**同锁内** `++waiter_count`（`WaiterScope`），再谓词版 `wait`；唤醒方 `Signal` `:682-698` **同锁内** `done.store(release)` + 读 `waiter_count`，**锁外** `notify_all`。两条交错：① 唤醒先拿锁 → 读计数 0 跳过 notify，但等待方随后判谓词必见 `done=true` 直接返回；② 等待方先登记 → 唤醒方读计数 ≥1 必 notify。无窗口。三处 wait 均带谓词/超时（`:497/520/542`）。 |
+| 2026-11-05 15:45 | `channel.hpp` + `channel.cpp`（P0 第 6 项，P0 收尾） | ✅ **无丢唤醒**。① `SelectWaitState`（`:800-855`）：`TrySelect`/`TrySelectPair` 持锁置 `m_selected`（`:766-775`/`:800-812`）、锁外 `notify_one`；等待方 `WaitFor`/`Wait`（`:821-837`）都是 `unique_lock(m_mutex)` + **谓词版** wait（谓词 `m_selected \|\| m_cancelled \|\| ctx->IsDone()` 在锁内检查）——置位与谓词同锁 = Dekker，无窗口；② `Cancel()`（`:844-853`）锁内置 `m_cancelled`、锁外 notify，同型；③ `m_change_cv`（`:2050/2084/2871`）`wait_for(lock, timeout, pred)` 带超时 + 谓词，即使 notify 丢失也会在超时后重检。P0 六文件全部审完。 |
