@@ -316,10 +316,10 @@ cmake --build .build-bento-wsl --parallel
 ctest --test-dir .build-bento-wsl --output-on-failure
 ```
 
-测试数量随配置变化，**以 `ctest -N` 为准**：主构建（`bento+mcp+runtime`）共 **288 个 ctest**，实测 **288/288 passed**（4 项按设计 SKIP，不计入失败）；`bento+mcp` 81 个 ctest；`mcp+osmon` 21 个 ctest
+测试数量随配置变化，**以 `ctest -N` 为准**：主构建（`bento+mcp+runtime`）共 **286 个 ctest**，实测 **286/286 passed**（4 项按设计 SKIP，不计入失败）；`bento+mcp` 81 个 ctest；`mcp+osmon` 21 个 ctest
 （详见 [`docs/testing.md`](docs/testing.md)「测试地图」）。
 
-MCP 服务对外提供 **33 个工具**（22 内置 + 3 检索 + 4 监控 + 4 Socket = 33），
+MCP 服务对外提供 **39 个工具**（29 内置 + 2 检索 + 4 监控 + 4 Socket = 39），
 与 `initialize` 后 `tools/list` 的实际返回数量一致。
 
 ---

@@ -30,7 +30,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol
 `--http`、`--plugins`、`--resources`、`--model`、`--base-url`、`--api-key`、
 `--no-retrieval`、`--embedding-dim`、`-v`。
 
-服务端提供 **33 个工具**（22 内置 + 3 检索 + 4 监控 + 4 Socket）、2 个资源（`bacio:///quote`、
+服务端提供 **39 个工具**（29 内置 + 2 检索 + 4 监控 + 4 Socket）、2 个资源（`bacio:///quote`、
 `document:///life-choices.txt`）、1 个提示。初始化后可发 `tools/list` 查看。
 
 ## 测试
