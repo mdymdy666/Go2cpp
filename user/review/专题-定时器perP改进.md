@@ -41,8 +41,8 @@ type timers struct {
 
 | 阶段 | 内容 | 验收 |
 |---|---|---|
-| **P1（本次）** | 把全局 `multimap` 拆成 **per-P 的 `multimap`**；`TimerService::Schedule` 按 `hash(线程id) % P数` 或「当前 P 的本地队列」落桶；每个 P 的 timer 由该 P 的 worker 在空闲时检查（或每 P 一个 `cv`） | 功能不变、单线程瓶颈消除、`ctest` 全过 |
-| **P2** | 每个 P 一个轻量 timer 线程（或复用 `IOManager` 的 poller 做 deadline 检查）；P 销毁时迁移 timer | 100 万 timer 插入/删除压测、回调并发度 |
+| **P1（本次）** | 把全局 `multimap` 拆成 **per-P 的 `multimap`**；`Schedule` 按「当前线程的 P id」或 hash 落桶；每个分片一个 timer 线程 | 功能不变、单线程瓶颈消除、`ctest` 全过 |
+| **P2** | 复用 worker 做 timer 检查（而非每分片一个线程）；P 销毁时迁移 | 100 万 timer 插入/删除压测、回调并发度 |
 | **P3** | IO deadline 保持现状（搭车 epoll）——**不要并入 timer 堆** | — |
 
 ## 三、必须保留的现有正确性
@@ -57,7 +57,7 @@ type timers struct {
 
 | 风险 | 缓解 |
 |---|---|
-| per-P 后「跨 P 的 timer 取消」需要找到正确的 P | `Timer::State` 记录所属 P 的 id；取消时按 id 路由 |
+| per-P 后「跨 P 的 timer 取消」需要找到正确的 P | `Timer::State` 记录所属分片 id；取消时按 id 路由 |
 | P 销毁时 timer 丢失 | 迁移到「当前 P」或「默认 P」 |
 | 回调并发带来线程安全问题 | 回调契约本来就是「可能在任意线程执行」——保持 |
 | 测试覆盖 | 现有 `test_timer*.cpp` 必须全过 + 新增并发压测 |
@@ -66,10 +66,10 @@ type timers struct {
 
 - [ ] 读 `timer.cpp` 的 `Impl` 全部（1343 行）——理解 `m_entries`/`m_generation`/`Cancel`/`Run`
 - [ ] 设计 per-P 数据结构（`std::vector<PerPTimer>`，每个含 `multimap` + `mutex` + `cv`）
-- [ ] `Schedule` 路由到 P（按当前线程的 P id，或 round-robin）
-- [ ] 每个 P 的 timer 执行：复用 P 的 worker 空闲检查，或每 P 一个 timer 线程（先做后者，简单）
-- [ ] `Cancel` 按 `State::owner_p` 路由
-- [ ] 迁移（P 销毁时）
+- [ ] `Schedule` 路由到分片（按当前线程 id 或 round-robin）
+- [ ] 每个分片的 timer 执行：P1 先每分片一个线程，P2 再复用 worker
+- [ ] `Cancel` 按 `State::owner` 路由
+- [ ] 迁移（分片销毁时）
 - [ ] 测试：功能 + 100 万 timer 压测 + 并发回调
 - [ ] 性能对比：现状 vs per-P（插入/删除吞吐、回调延迟 p99）
 
@@ -77,9 +77,7 @@ type timers struct {
 
 `TimerService::Run()` 的 `cv.wait_until` 是丢唤醒排查清单里的 **P0 第 4 项**——本次改造要**同时**检查：
 - `m_generation` 递增与 `cv` 通知是否同锁（当前看是 `m_generation.load()` + `wait_until` 谓词，需确认）；
-- per-P 后每个 P 的 `cv` 同样要遵守「置位 + notify 同锁」。
-
----
+- per-P 后每个分片的 `cv` 同样要遵守「置位 + notify 同锁」。
 
 ## 七、完成后的流程（三件套 + 正确性审查）
 
@@ -89,24 +87,24 @@ per-P 改造（P1）落地后，**必须按三件套顺序验收**，不能只�
 
 | # | 阶段 | 验收标准 |
 |---|---|---|
-| **① 架构** | per-P 分片已落地 | 分片数、路由策略、 路由、迁移策略都有明确文档；单线程瓶颈消除（100 万 timer 压测） |
-| **② 汇编** |  取证热函数 | 至少取证：（插入路径）、（等待/弹出）、（查找）；记录指令数/call 数/分配数/原子数；**前后对比**（改造前 vs 改造后） |
-| **③ 正确性** | 全量验证 | 现有  全过；新增「并发到期 / 跨分片取消 / 分片销毁迁移」用例；**ASan/UBSan/TSan 三套 0 报告**；Test project /mnt/e/CodexWorkspace/Go2Cpp 全绿 |
+| **① 架构** | per-P 分片已落地 | 分片数、路由策略、`Cancel` 路由、迁移策略都有明确文档；单线程瓶颈消除（100 万 timer 压测） |
+| **② 汇编** | `objdump` 取证热函数 | 至少取证：`Schedule`（插入路径）、`Run`（等待/弹出）、`Cancel`（查找）；记录指令数/call 数/分配数/原子数；**前后对比**（改造前 vs 改造后） |
+| **③ 正确性** | 全量验证 | 现有 `test_timer` 系列全过；新增「并发到期 / 跨分片取消 / 分片销毁迁移」用例；**ASan/UBSan/TSan 三套 0 报告**；`ctest -R timer` 全绿 |
 
 ### 正确性审查（三件套之后）
 
-按  的 4 步法审查新代码：
+按 `docs/plans/lost-wakeup-plan.md` 的 4 步法审查新代码：
 
-- [ ] 每个 PerPTimer 的 ：谓词 atomic/同锁 + ；**置位 + notify 同锁**；
-- [ ]  在分片后是否仍然有效（每分片一个 generation？）；
-- [ ]  路由到错误分片的后果（返回失败 vs 静默丢）；
+- [ ] 每个分片的 `cv`：谓词 atomic/同锁 + while；**置位 + notify 同锁**；
+- [ ] `m_generation` 在分片后是否仍然有效（每分片一个 generation？）；
+- [ ] `Cancel` 路由到错误分片的后果（返回失败 vs 静默丢）；
 - [ ] 分片销毁/迁移时在途 timer 的处理；
-- [ ] 回调异常路径（）在分片线程上是否仍安全；
+- [ ] 回调异常路径（`m_exception_handler`）在分片线程上是否仍安全；
 - [ ] 析构顺序（先停线程再销毁 multimap）。
 
 ### 交付物
 
-1. 代码（ / ）；
-2. （汇编取证）；
+1. 代码（`timer.cpp` / `timer.hpp`）；
+2. `docs/reports/asm-timer.md`（汇编取证）；
 3. 三件套验收表（架构/汇编/正确性各一行，含证据）；
-4. 审查记录（）。
+4. 审查记录（`user/review/定时器-审查.md`）。
