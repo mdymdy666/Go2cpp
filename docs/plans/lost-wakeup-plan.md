@@ -143,6 +143,23 @@ cv_.wait(lock, [&] { return closed_; });   // 谓词版 wait，内部 while
 
 ## 七、防复发（机制）
 
+### 7.0 根因整改：三套 WaitNode 同构（2026-11-05 用户指出）
+
+今天 3 例丢唤醒之所以「修 N 遍」，根因是**等待节点有三套各自独立的实现**：
+
+| 位置 | 名字 |
+|---|---|
+|  | （公共基类，但只有 channel 用） |
+|  | （独立一套） |
+|  | （独立一套） |
+
+链表操作、generation 校验、唤醒协议、TLS 池各重复 2–3 份。整改方案（分 4 步）见
+：抽 ，三处继承，只留特化
+（channel 的 select / sync 的 granted / parking 的 timeout）。
+
+**这是「防复发」的第一优先级**——统一节点基类后，丢唤醒类 bug 只需要修一处。
+
+
 1. **代码规范**：`docs/engineering-standards.md` 加「条件变量三规则」；
 2. **CI 检查**：新增静态检查脚本（扫 `notify` 是否在锁外，可用 clang-tidy 自定义 check 或简单 grep）；
 3. **测试模板**：所有 condvar 使用点必须有一个「注入延迟」的回归测试（今天 `MuxStream` 的教训）。

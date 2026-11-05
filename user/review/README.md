@@ -25,6 +25,10 @@ user/review/<模块>-review.md
 
 | 文档 | 说明 |
 |---|---|
+|  | 从底到顶的文件级审查顺序（16+14 步） |
+|  | 类级审查顺序（18+18 步，含 file:line） |
+|  | TimerService 改 Go per-P 模式（⏸ 暂缓，设计保留） |
+|  | 三套 WaitNode 同构整改（待开工） |
 | `docs/reports/baseline-review-2026-11-04.md` | 11-04 基座大改审查（6 路，P0×1/P1×8/P2×8/P3×5） |
 | `docs/reports/2026-11-01-asm-concurrency-review.md` | 11-01 并发汇编审查 |
 | `docs/reports/2026-11-01-asm-network-review.md` | 11-01 网络汇编审查 |
