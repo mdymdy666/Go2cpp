@@ -29,6 +29,7 @@ user/review/<模块>-review.md
 | `user/review/审查顺序-类级.md` | 类级审查顺序（18+18 步，每类带 file:line） |
 | `user/review/专题-定时器perP改进.md` | TimerService 改 Go per-P 模式（⏸ 暂缓，设计保留） |
 | `user/review/WaitNode统一-整改.md` | 三套 WaitNode 同构整改（待开工，丢唤醒专项防复发的第一优先级） |
+| `user/review/专项-Fiber链级元信息.md` | Fiber 链级元信息集中化（当前实现拆散在 FiberRecord 上，中间节点引用会读到过时值） |
 
 ## 接上的历史文档
 
@@ -51,3 +52,9 @@ user/review/<模块>-review.md
 2. 我读代码，把用户的意见逐条按上面格式记进 `user/review/<模块>-review.md`；
 3. 用户确认/补充后，我更新状态（待评估 → 已确认 → 已修）；
 4. 每条意见落点写清 `file:line`，避免空泛。
+
+## 本对话的边界（2026-11-05 用户明确）
+
+- **不进行实际代码编写工作**：不派 agent 实施、不改源码、不跑构建；
+- **不问「是否开工」**：所有专项/整改只记录设计与状态，等用户另行安排；
+- 我的产出只有：**读代码 + 归档用户的意见与建议 + 必要时更新文档状态**。
