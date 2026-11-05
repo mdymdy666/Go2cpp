@@ -775,6 +775,10 @@ int main(int argc, char** argv) {
     config.port = port;
     config.worker_threads = 8;
     config.max_queued_connections = 512;
+    // 读取总时限必须覆盖 32 MiB 上传：组件默认 10 s 等价于要求 ≥3.2 MiB/s
+    // 稳定上行，手机/家宽上传会在 body 中途被静默断连（无 HTTP 响应，前端
+    // 只看到 error）。这里与上传路由的上游超时（120 s）对齐：273 KiB/s 即可。
+    config.request_timeout = std::chrono::milliseconds(120000);
     config.health_timeout = std::chrono::milliseconds(500);
     // 非空 auth 会让组件自动安装 AuthMiddleware。
     config.auth = VerifyBearer;
