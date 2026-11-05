@@ -52,7 +52,7 @@
 | 文件 | 重点 |
 |---|---|
 | `- [x]` `src/network/io.cpp` | IOManager 事件队列（**已审 2026-11-05：无严重丢唤醒**，见执行记录） |
-| `src/tunnel/{mux,server,client}` | 已修 2 处，剩余 `Entry` 的 wait |
+| `- [x]` `src/tunnel/{mux,server,client}` | 已修 2 处（`b176c7f`/`8ebeb53`/`850e813`），**复查剩余：无丢唤醒**（见执行记录） |
 | `src/relay/{relay_pipe,splice_pipe,lease}.cpp` | 数据面 |
 | `src/rpc/server.cpp` | 新增的请求队列 |
 | `src/app/{gateway,realtime_room,transport}.cpp` | 应用层 |
@@ -158,3 +158,4 @@ cv_.wait(lock, [&] { return closed_; });   // 谓词版 wait，内部 while
 | 2026-11-05 15:30 | `context.cpp`（P0 第 5 项） | ✅ **无丢唤醒**（标准 Dekker）。等待方 `:494-499` 持 `st.mutex` 后判谓词、**同锁内** `++waiter_count`（`WaiterScope`），再谓词版 `wait`；唤醒方 `Signal` `:682-698` **同锁内** `done.store(release)` + 读 `waiter_count`，**锁外** `notify_all`。两条交错：① 唤醒先拿锁 → 读计数 0 跳过 notify，但等待方随后判谓词必见 `done=true` 直接返回；② 等待方先登记 → 唤醒方读计数 ≥1 必 notify。无窗口。三处 wait 均带谓词/超时（`:497/520/542`）。 |
 | 2026-11-05 15:45 | `channel.hpp` + `channel.cpp`（P0 第 6 项，P0 收尾） | ✅ **无丢唤醒**。① `SelectWaitState`（`:800-855`）：`TrySelect`/`TrySelectPair` 持锁置 `m_selected`（`:766-775`/`:800-812`）、锁外 `notify_one`；等待方 `WaitFor`/`Wait`（`:821-837`）都是 `unique_lock(m_mutex)` + **谓词版** wait（谓词 `m_selected \|\| m_cancelled \|\| ctx->IsDone()` 在锁内检查）——置位与谓词同锁 = Dekker，无窗口；② `Cancel()`（`:844-853`）锁内置 `m_cancelled`、锁外 notify，同型；③ `m_change_cv`（`:2050/2084/2871`）`wait_for(lock, timeout, pred)` 带超时 + 谓词，即使 notify 丢失也会在超时后重检。P0 六文件全部审完。 |
 | 2026-11-05 16:00 | `io.cpp`（P1 第 1 项） | ✅ **无严重丢唤醒**。两处 condvar：① `callback_cv`（`:455-470`）`end_callback` 在 `lock_guard(callback_mutex)` 内清 `callback_active`、锁外 `notify_all`，`stop_callbacks` 用 `unique_lock` + **谓词版** wait——Dekker（置位与谓词同锁），无窗口；② `m_queue_cv`（`:2013-2021`）`wait_for(lock, effective, pred)` **带超时 + 谓词**，即使 notify 落在窗口内丢失，超时后也会重检 `m_queue_depth`/`m_stop_poller`，不会永久睡死。生产端 `notify_one/all` 在锁外属正常写法（等待方是谓词版）。不用改。 |
+| 2026-11-05 16:15 | `tunnel/{mux,server,client}`（P1 第 2 项） | ✅ **无丢唤醒**（含此前 3 处修复的复查）。① `MuxStream::m_cv`（`mux.cpp:267`）`wait(lock, pred)` 谓词版；`Close/MarkPeerClosed`（`:325-334`）**已修**为持 `m_mutex` 的 `lock_guard` 内 CAS + notify_all（注释写明窗口与 TSan 症状），网络动作移到锁外；② `m_ack_cv`（`:430/662/751`）、`m_closed_cv`（`:663/935`）、client 的 `m_state_cv`（`:171/474/484/491/539/563`）与 `workers->cv`（`:152`）全部 `wait_for(lock, timeout, pred)`——**带超时兜底**，即使 notify 丢失也会超时重检。无需修改。 |
