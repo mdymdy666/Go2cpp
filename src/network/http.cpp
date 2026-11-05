@@ -394,7 +394,7 @@ std::string Response::to_string(bool head_request) const {
 }
 
 Parser::Parser(ParserLimits limits) : m_limits(limits) {}
-void Parser::reset() { m_buffer.clear(); m_chunked_body.clear(); m_chunk_scan_pos = 0; m_header_parsed = false; m_body_start_offset = 0; m_content_length = 0; m_chunked = false; m_has_length = false; m_no_body = false; m_finished = false; m_response_close_delimited = false; m_body_start = 0; m_response_to_head = false; m_error.clear(); }
+void Parser::reset() { m_buffer.clear(); m_chunked_body.clear(); m_chunk_scan_pos = 0; m_chunk_erased = 0; m_chunk_cursor_valid = false; m_header_parsed = false; m_body_start_offset = 0; m_content_length = 0; m_chunked = false; m_has_length = false; m_no_body = false; m_finished = false; m_response_close_delimited = false; m_body_start = 0; m_response_to_head = false; m_error.clear(); }
 ParseResult Parser::feed(std::string_view bytes, Request& request) { return feed_impl(bytes, false, &request, nullptr); }
 ParseResult Parser::feed(std::string_view bytes, Response& response) { return feed_impl(bytes, true, nullptr, &response); }
 ParseResult Parser::finish(Response& response) {
@@ -652,11 +652,21 @@ body_phase:
     } else if (chunked) {
         // 增量 chunked 解析：游标与已解码 body 必须跨 feed 复用。原实现把
         // cursor/body 放在栈上，NeedMore 时丢弃，下一次从 body_start 全量
-        // 重扫——6 MiB body + 1 KiB feed 是 O(n²)（实测 1.6 s）。这里游标是
-        // m_buffer 内绝对偏移：NeedMore 分支不擦除缓冲，偏移在后续 feed 中
-        // 依然有效；只有真正完成时才把 body 移交调用方并清空状态。
-        if (m_chunk_scan_pos == 0) m_chunk_scan_pos = body_start;
+        // 重扫——6 MiB body + 1 KiB feed 是 O(n²)（实测 1.6 s）。游标是
+        // m_buffer 内的相对偏移，配 m_chunk_erased 记录已擦除量：NeedMore 时
+        // 缓冲只保留当前未完成的 chunk/trailer，完成时才交付 body 并清空状态。
+        if (!m_chunk_cursor_valid) { m_chunk_scan_pos = body_start; m_chunk_cursor_valid = true; }
         std::size_t cursor = m_chunk_scan_pos;
+        // NeedMore 前把已解析完的前缀从 m_buffer 擦掉：否则整条 chunked 报文
+        // （6 MiB body → 6.3 MiB wire）一直驻留缓冲，随 feed 反复 realloc/
+        // memcpy（累计约 2× 总量），并把解析期间的工作集推高 6 MiB 以上。
+        // 擦除后 m_chunk_scan_pos 变成相对偏移（0），m_chunk_erased 记录累计量。
+        const auto trim_parsed_prefix = [this](std::size_t keep_from) {
+            if (keep_from == 0) return;
+            m_buffer.erase(0, keep_from);
+            m_chunk_scan_pos = 0;
+            m_chunk_erased += keep_from;
+        };
         while (true) {
             const std::size_t chunk_line_start = cursor;
             const auto end = m_buffer.find("\r\n", cursor);
@@ -665,7 +675,7 @@ body_phase:
                 // 的长串把缓冲撑到 body 上限。
                 if (m_buffer.size() - cursor > m_limits.max_line_bytes)
                     return {ParseState::Error, bytes.size(), "chunk line too large"};
-                m_chunk_scan_pos = chunk_line_start;
+                trim_parsed_prefix(chunk_line_start);
                 return {ParseState::NeedMore, bytes.size(), {}};
             }
             const auto line = std::string_view(m_buffer).substr(cursor, end - cursor);
@@ -683,7 +693,7 @@ body_phase:
                         // 上限 16 KiB，重扫代价可忽略），已解码 body 保持不动。
                         if (m_buffer.size() - cursor > m_limits.max_trailer_bytes)
                             return {ParseState::Error, bytes.size(), "trailers too large"};
-                        m_chunk_scan_pos = chunk_line_start;
+                        trim_parsed_prefix(chunk_line_start);
                         return {ParseState::NeedMore, bytes.size(), {}};
                     }
                 } else {
@@ -714,7 +724,7 @@ body_phase:
             // 数据不完整时游标回到块行起点：下次重新解析大小行但不会重复
             // append（append 只发生在完整性检查之后），body 也不会丢。
             if (cursor > std::numeric_limits<std::size_t>::max() - chunk_size - 2 || m_buffer.size() < cursor + chunk_size + 2) {
-                m_chunk_scan_pos = chunk_line_start;
+                trim_parsed_prefix(chunk_line_start);
                 return {ParseState::NeedMore, bytes.size(), {}};
             }
             m_chunked_body.append(m_buffer, cursor, chunk_size); cursor += chunk_size; if (m_buffer.compare(cursor, 2, "\r\n") != 0) return {ParseState::Error, bytes.size(), "chunk terminator missing"}; cursor += 2;
@@ -726,12 +736,15 @@ body_phase:
         if (m_buffer.size() < body_end) return {ParseState::NeedMore, bytes.size(), {}};
         if (response) result->body.assign(m_buffer, body_start, content_length); else request->body.assign(m_buffer, body_start, content_length);
     }
-    const std::size_t consumed = body_end; m_buffer.erase(0, consumed); m_finished = true;
+    // consumed 必须仍是「整条报文占用的字节数」（含此前已擦除的前缀），
+    // 而缓冲里只剩本次 feed 的 body_end 字节。
+    const std::size_t consumed = m_chunk_erased + body_end; m_buffer.erase(0, body_end); m_finished = true;
     // 本条消息的 framing 快照与消息同生命周期：不复位的话，一旦将来放开
     // 「完成后再 feed 下一条」（类注释称 Parser 可重复使用），m_header_parsed
     // 快路径会用上一条的 m_no_body/m_chunked 静默吞掉下一条 body。
     m_header_parsed = false; m_body_start_offset = 0; m_content_length = 0;
     m_has_length = false; m_no_body = false; m_chunked = false; m_chunk_scan_pos = 0;
+    m_chunk_erased = 0; m_chunk_cursor_valid = false;
     if (response) result->close = has_connection_token(result->header, "close");
     else request->close = has_connection_token(request->header, "close") || request->version == "HTTP/1.0";
     // consumed 语义：本报文在 m_buffer 中占用的字节数（跨 feed 累积），不是本次

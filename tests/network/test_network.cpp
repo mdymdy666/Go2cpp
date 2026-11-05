@@ -464,6 +464,43 @@ void run_network_tests() {
                                std::to_string(chunked_elapsed.count()) + " ms vs close-delimited " +
                                std::to_string(close_elapsed.count()) + " ms");
     }
+    // chunked 前缀擦除（NeedMore 时把已解析完的 wire 移出 m_buffer）后，
+    // consumed 必须仍是「整条报文占用的字节数」，body 也必须完整——这是
+    // 解析器交给调用方切分流水线剩余字节的契约。
+    {
+        const std::string byte_wire =
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+            "4\r\nabcd\r\n3\r\nefg\r\n0\r\n\r\n";
+        go2cpp::http::Parser byte_parser;
+        go2cpp::http::Response byte_response;
+        go2cpp::http::ParseResult byte_result{};
+        for (std::size_t i = 0; i < byte_wire.size(); ++i) {
+            byte_result = byte_parser.feed(std::string_view(byte_wire.data() + i, 1),
+                                           byte_response);
+            if (byte_result.state == go2cpp::http::ParseState::Complete) break;
+            GO2CPP_CHECK(byte_result.state == go2cpp::http::ParseState::NeedMore);
+        }
+        GO2CPP_CHECK(byte_result.state == go2cpp::http::ParseState::Complete);
+        GO2CPP_CHECK(byte_result.consumed == byte_wire.size());
+        GO2CPP_CHECK(byte_response.body == "abcdefg");
+        // trailers 也必须在前缀擦除后照常解析（0 块行与 trailer 可能分属不同 feed）。
+        const std::string trailer_wire =
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+            "2\r\nhi\r\n0\r\nX-Trail: yes\r\n\r\n";
+        go2cpp::http::Parser trailer_parser;
+        go2cpp::http::Response trailer_response;
+        go2cpp::http::ParseResult trailer_result{};
+        for (std::size_t i = 0; i < trailer_wire.size(); ++i) {
+            trailer_result = trailer_parser.feed(
+                std::string_view(trailer_wire.data() + i, 1), trailer_response);
+            if (trailer_result.state == go2cpp::http::ParseState::Complete) break;
+            GO2CPP_CHECK(trailer_result.state == go2cpp::http::ParseState::NeedMore);
+        }
+        GO2CPP_CHECK(trailer_result.state == go2cpp::http::ParseState::Complete);
+        GO2CPP_CHECK(trailer_result.consumed == trailer_wire.size());
+        GO2CPP_CHECK(trailer_response.body == "hi");
+        GO2CPP_CHECK(trailer_response.trailer.has("X-Trail"));
+    }
     // chunked 跨 feed 状态必须随 reset() 清理：复用同一 Parser 解析下一条
     // 消息时，不能把上一条已解码 body 拼进来（m_chunked_body/m_chunk_scan_pos）。
     {

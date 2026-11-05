@@ -331,9 +331,14 @@ private:
     /// chunked 已解码 body；跨 feed 累积，完成时 move 给 Response/Request。
     /// 与 m_chunk_scan_pos 一起把增量解析从 O(n²) 降到 O(n)。
     std::string m_chunked_body;
-    /// 下一个 chunk-size 行在 m_buffer 中的绝对偏移；0 表示尚未开始。
-    /// NeedMore 不清空缓冲，因此该偏移在后续 feed 中仍然有效。
+    /// 下一个 chunk-size 行在 m_buffer 中的相对偏移；只在 m_chunk_cursor_valid
+    /// 为 true 时有意义（NeedMore 会擦除已完成前缀，见 m_chunk_erased）。
     std::size_t m_chunk_scan_pos{0};
+    /// chunked 消息已从 m_buffer 擦除的字节数（跨 feed 累积）。Complete 时
+    /// consumed = m_chunk_erased + body_end，保持「整条报文占用字节数」语义。
+    std::size_t m_chunk_erased{0};
+    /// m_chunk_scan_pos 是否已初始化：区分「尚未开始」与「相对偏移恰为 0」。
+    bool m_chunk_cursor_valid{false};
     /// 当前响应对应 HEAD 请求；`set_response_to_head()` 设置，解析时跳过 body。
     bool m_response_to_head{false};
     // 响应没有长度/分块标记时，body 由连接 EOF 定界；保存头后偏移，
