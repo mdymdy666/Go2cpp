@@ -2422,6 +2422,62 @@ bool Store::FillCommentLikes(std::int64_t viewer_id,
     return true;
 }
 
+bool Store::FillVideoLikes(std::int64_t viewer_id,
+                           std::vector<StoredVideo>* videos,
+                           std::string* error) {
+    // step1: 空页/匿名直接返回——不产生 SQL，也不当作错误。
+    if (videos == nullptr || videos->empty()) {
+        return true;
+    }
+    if (viewer_id <= 0) {
+        for (auto& video : *videos) {
+            video.liked = false;
+        }
+        return true;
+    }
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return false;
+    }
+    // step2: 拼 IN 列表。元素全是库内自增 id，无用户输入，不存在注入面；
+    //        一条 SELECT 拿到整页已赞集合，避免 N+1。
+    std::string ids;
+    ids.reserve(videos->size() * 8);
+    for (std::size_t i = 0; i < videos->size(); ++i) {
+        if (i != 0) {
+            ids += ',';
+        }
+        ids += std::to_string((*videos)[i].id);
+    }
+    std::unordered_map<std::int64_t, bool> liked;
+    auto rows = m_db->Query(
+        "SELECT video_id FROM likes WHERE user_id = ?"
+        " AND video_id IN (" + ids + ")",
+        viewer_id);
+    if (!rows) {
+        if (error != nullptr) {
+            *error = "查询已赞视频失败: " + DescribeError(rows.Err());
+        }
+        return false;
+    }
+    while (rows.Value().Next()) {
+        liked[rows.Value().Int64(0)] = true;
+    }
+    if (rows.Value().Err()) {
+        if (error != nullptr) {
+            *error = "遍历已赞视频失败: " + DescribeError(rows.Value().Err());
+        }
+        return false;
+    }
+    // step3: 回填；没有记录的保持未赞。
+    for (auto& video : *videos) {
+        video.liked = liked.find(video.id) != liked.end();
+    }
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // 消息通知中心：notifications
 // ---------------------------------------------------------------------------

@@ -41,6 +41,9 @@ struct Video {
     std::int64_t clip_start_ms{0};  ///< 裁剪起点（毫秒，含）；0=从头播。
     std::int64_t clip_end_ms{0};    ///< 裁剪终点（毫秒，不含）；0=到片尾。
     std::vector<std::string> tags;  ///< 话题标签（由标题提取；空 = 无话题）。
+    /// 当前查看者是否已点赞（第 13 轮新增）。匿名请求恒为 false，由 feed
+    /// 服务按 Bearer 身份回填；前端据此在刷新后恢复 ♥ 状态。
+    bool liked{false};
 };
 
 /// @brief feed 流中的一项：视频 + 作者名。

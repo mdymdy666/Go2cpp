@@ -555,6 +555,10 @@ douyin::Video PublicVideo(const douyin::StoredVideo& stored) {
     video.clip_start_ms = stored.clip_start_ms;
     video.clip_end_ms = stored.clip_end_ms;
     video.tags = douyin::ExtractTags(stored.title);
+    // `liked` 由调用方按查看者回填（详情 HasLiked、列表批量
+    // FillVideoLikes）；回填前保持 false（匿名语义）。不在这里发 SQL，
+    // 否则每个列表元素一次查询，退化成 N+1。
+    video.liked = stored.liked;
     return video;
 }
 
@@ -1294,6 +1298,14 @@ bool HandleDetail(douyin::Store& store, const douyin::HttpRequest& request,
         if (blocked) {
             return Fail(response, 404, "视频不存在");
         }
+        // 详情页刷新后要恢复 ♥：登录态用单条 HasLiked（主键查询），
+        // 查不到/查询失败按未赞处理，不阻断详情。
+        std::string like_error;
+        stored.liked = store.HasLiked(id, viewer, &like_error);
+        if (!like_error.empty()) {
+            std::fprintf(stderr, "[%s] 查询详情点赞态失败: %s\n", kServiceName,
+                         like_error.c_str());
+        }
     }
 
     std::string author;
@@ -1655,6 +1667,12 @@ bool HandleMine(douyin::Store& store, const douyin::HttpRequest& request,
                      error.c_str());
         return Fail(response, 500, "数据库错误");
     }
+    // 一页一条 SQL 回填 liked，避免逐条查询。
+    if (!store.FillVideoLikes(actor, &videos, &error)) {
+        std::fprintf(stderr, "[%s] 回填我的视频点赞态失败: %s\n", kServiceName,
+                     error.c_str());
+        return Fail(response, 500, "数据库错误");
+    }
 
     std::string body = "{\"ok\":true,\"items\":[";
     for (std::size_t i = 0; i < videos.size(); ++i) {
@@ -1741,6 +1759,11 @@ bool HandleFavorites(douyin::Store& store, const douyin::HttpRequest& request,
     std::string error;
     if (!store.ListFavorites(actor, limit, &videos, &error)) {
         std::fprintf(stderr, "[%s] 查询收藏列表失败: %s\n", kServiceName,
+                     error.c_str());
+        return Fail(response, 500, "数据库错误");
+    }
+    if (!store.FillVideoLikes(actor, &videos, &error)) {
+        std::fprintf(stderr, "[%s] 回填收藏列表点赞态失败: %s\n", kServiceName,
                      error.c_str());
         return Fail(response, 500, "数据库错误");
     }

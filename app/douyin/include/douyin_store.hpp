@@ -82,6 +82,7 @@ struct StoredVideo {
     std::string cover_url;          ///< 封面（`videos/cover_*.jpg`）；空=同名 jpg。
     std::int64_t clip_start_ms{0};  ///< 裁剪起点（毫秒，含）；0=从头播。
     std::int64_t clip_end_ms{0};    ///< 裁剪终点（毫秒，不含）；0=到片尾。
+    bool liked{false};              ///< 查看者是否已赞；由 FillVideoLikes 回填。
 };
 
 /// @brief `comments` 表里的一行评论（C5）。
@@ -817,6 +818,28 @@ class Store {
     bool FillCommentLikes(std::int64_t viewer_id,
                           std::vector<StoredComment>* comments,
                           std::string* error);
+
+    /**
+     * @brief 批量回填视频的 `liked`（一条 SQL 覆盖整页）。
+     *
+     * @param viewer_id [in] 当前查看者 id；<=0 表示匿名（`liked` 全 false）。
+     * @param videos [in,out] 视频列表，不可为 nullptr；进入时读 `id`，
+     *        返回时写 `liked`。空列表直接返回 true。
+     * @param error [out] 失败时写错误文本；成功时保持原值。
+     * @return 成功返回 true；失败时 `videos` 里已写入的值未定义。
+     *
+     * ## 定位
+     * feed 列表恢复「已点赞」状态的**唯一**入口。第 13 轮前 feed 只返回
+     * `like_count`、不返回 `liked`，前端只能靠 localStorage，刷新/换设备后
+     * 点赞态丢失（用户可见 bug）。逐条查是 N+1，这里固定 1 条 SQL。
+     * 错了会怎样：登录用户刷新首页后 ♥ 全部变空心，再点一次会 409/重复。
+     *
+     * ## 性能
+     * `likes` 主键前缀 `video_id` 命中索引；IN 列表只含库内自增 id。
+     */
+    bool FillVideoLikes(std::int64_t viewer_id,
+                        std::vector<StoredVideo>* videos,
+                        std::string* error);
 
     // ---- 消息通知中心：notifications（第 2 轮新增，只加不改既有） ----
 

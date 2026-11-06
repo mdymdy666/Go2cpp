@@ -1738,3 +1738,45 @@ latest（服务重启）→ `resume_gap`，客户端走 REST 全量刷新。
 - 报告：`app/douyin/docs/user-journey-audit.md`。
 - 后续（未修）：直播 0 房间、私信 0 会话、举报 0 条（缺演示数据）；
   点赞状态只存 localStorage，feed 不回传 `liked`；`app/douyin\r/` 垃圾目录待清。
+
+## 2026-11-06 第 15 轮（修真实浏览器 E2E 发现的 3 个用户可见 bug）
+
+- 触发：`app/douyin/tests/ui/`（Playwright，真实 chromium）跑出 2 过 3 败；
+  这些都是 curl 层验收看不见、但用户在浏览器里一定能看到的问题。
+- 修复：
+  1) **点赞刷新后丢失（P0）**
+     - 根因①（后端）：`Video` 结构没有 `liked`，feed 只回 `like_count`，
+       前端只能靠 localStorage，换设备/刷新即丢。
+       → `Video/StoredVideo` 加 `liked`；`Store::FillVideoLikes()` 用一条
+       `SELECT video_id FROM likes WHERE user_id=? AND video_id IN (...)` 整页
+       批量回填（不 N+1）；feed 两个流、视频详情（单条 `HasLiked`）、
+       我的视频/收藏、`/api/user/:id/liked` 全部回填。
+     - 根因②（前端渲染时机）：`buildSlide` 里在 `rail.appendChild(likeBtn)`
+       **之前**调用 `paintLike(slide, …)`，而 paintLike 用
+       `slide.querySelector('.like-btn')` 找按钮——此时按钮还没进 DOM，
+       函数静默 return，服务端 `liked:true` 也永远渲染成空心 ♡。
+       → 改为直接操作 `likeBtn` 对象（toggle `liked` 类 + ♥/♡ + aria-pressed）。
+     - 验证：登录后刷新，20 张卡里 18 张恢复实心 ♥（seed 数据真实赞数）。
+  2) **搜索框聚焦看不到「历史 / 热搜」（P0）**
+     - 根因：`#searchDiscover`（🕘 历史 + 🔥 热搜）被放在 `#searchView` 内部，
+       而该视图默认 `hidden`，只有先提交搜索才可见；首页导航 `#navSearch`
+       又完全没有 focus 处理——第 11 轮做的功能用户根本碰不到。
+     - 修法：把发现面板提升到 body 层级、改成 fixed 浮层；`navSearch`
+       的 focus/click 即弹出并贴住输入框下方（视口内夹紧），搜索页输入框
+       复用同一份 DOM；点外部 / Esc 关闭；空搜索框输入时重新弹出。
+  3) **登录态（P1）**
+     - 根因：E2E 脚本 `_login` 直接 fetch `/api/login`，而产品真实入口是
+       `POST /api/user/login`（网关无 `/api/login`，返回 404 route not found），
+       token 从未写入 localStorage，后续点赞全被当匿名——**测试脚本 bug，
+       不是产品 bug**（产品登录按钮一直走对路径）。
+     - 修法：E2E 改为走真实 UI（填右上角邮箱/密码 → 点登录 → 等 token），
+       刷新后断言 `signed-in`（退出按钮出现）。
+- 关键文件：`include/douyin_home_page.hpp`、`include/douyin_proto.hpp`、
+  `include/douyin_store.hpp`、`src/douyin_proto.cpp`、`src/douyin_store.cpp`、
+  `src/feed_service.cpp`、`src/video_service.cpp`、`src/user_service.cpp`、
+  `tests/ui/test_e2e_flow.py`。
+- 测试：`tests/ui/` 8 个 Playwright 用例（真实 chromium）全过（修前 3 败）；
+  `scripts/accept_all.sh` 103 PASS / 0 FAIL；`build.sh`（-Werror）零告警。
+- 截图：`app/douyin/logs/ui_fixed.png`（已登录 + 实心 ♥ + 搜索下拉历史/热搜）。
+- 遗留：热搜靠 `search_history` 7 天聚合，空库时显示「暂无热搜」空态；
+  演示环境无人搜索，需要的话可加「视频话题兜底」或运营配置。

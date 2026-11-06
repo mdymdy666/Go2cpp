@@ -672,7 +672,18 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     font-size: 14px; outline: none;
   }
   #searchView .profile-top input:focus { border-color: rgba(37, 244, 238, .5); }
-  .search-discover { padding: 4px 16px 28px; overflow: auto; }
+  /* 搜索发现浮层：导航搜索框与搜索页输入框共用一份 DOM，聚焦即下拉。
+     必须在 #searchView(z-index:68) 之上，否则搜索页里会被顶栏盖住。 */
+  .search-discover {
+    position: fixed; z-index: 96;
+    padding: 6px 14px 12px;
+    background: #16161f;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    box-shadow: 0 18px 44px rgba(0, 0, 0, .55);
+    overflow-y: auto;
+    max-height: min(64vh, 460px);
+  }
   .sd-block { margin: 14px 0 4px; }
   .sd-head {
     display: flex; align-items: center; justify-content: space-between;
@@ -1169,6 +1180,20 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
   </div>
 </header>
 
+  <div class="search-discover" id="searchDiscover" hidden>
+    <div class="sd-block">
+      <div class="sd-head">
+        <b>🕘 搜索历史</b>
+        <button class="sd-clear" id="shClear" type="button">清空</button>
+      </div>
+      <div class="sh-list" id="shList"></div>
+    </div>
+    <div class="sd-block">
+      <div class="sd-head"><b>🔥 热搜</b></div>
+      <div class="hot-list" id="hotList"></div>
+    </div>
+  </div>
+
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
 <main class="feed" id="feed" aria-label="推荐视频流"></main>
@@ -1323,19 +1348,6 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     <input id="searchInput" type="search" placeholder="搜索用户 / 视频 / 话题"
            autocomplete="off" spellcheck="false">
     <button class="btn-primary" id="searchSubmit" type="button">搜索</button>
-  </div>
-  <div class="search-discover" id="searchDiscover" hidden>
-    <div class="sd-block">
-      <div class="sd-head">
-        <b>🕘 搜索历史</b>
-        <button class="sd-clear" id="shClear" type="button">清空</button>
-      </div>
-      <div class="sh-list" id="shList"></div>
-    </div>
-    <div class="sd-block">
-      <div class="sd-head"><b>🔥 热搜</b></div>
-      <div class="hot-list" id="hotList"></div>
-    </div>
   </div>
   <div class="search-suggest" id="searchSuggest" hidden></div>
   <div class="search-tabs" id="searchTabs">
@@ -3788,6 +3800,16 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
 
     rail.appendChild(railAvatar);
     rail.appendChild(likeBtn);
+    /* 刷新后恢复点赞态（第 13 轮）：登录态以服务端 v.liked 为准，后端没给
+       字段时退回 localStorage 旧行为。这里直接操作 likeBtn 对象，不能走
+       paintLike(slide)：它内部用 slide.querySelector 找按钮，而此刻 rail
+       还没挂进 slide，会静默 return——用户刷新后永远看到空心 ♡
+       （2026-11-06 E2E 抓到的真实 bug）。 */
+    var likedNow = !!(typeof v.liked === 'boolean' ? v.liked : state.likes[id]);
+    likeBtn.classList.toggle('liked', likedNow);
+    likeBtn.querySelector('.ico').textContent = likedNow ? '♥' : '♡';
+    likeBtn.setAttribute('aria-pressed', likedNow ? 'true' : 'false');
+    if (likedNow) { state.likes[id] = 1; } else { delete state.likes[id]; }
     rail.appendChild(favBtn);
     rail.appendChild(cmtBtn);
     rail.appendChild(shareBtn);
@@ -4090,7 +4112,24 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     }).catch(function () {});
   }
 
-  function showSearchDiscover() {
+  /* 把浮层贴到锚点输入框下方；左右夹紧在视口内，窄屏不会被裁掉。 */
+  function placeSearchDiscover(anchor) {
+    if (!anchor) { return; }
+    var r = anchor.getBoundingClientRect();
+    var width = Math.max(r.width, 300);
+    var maxLeft = Math.max(8, window.innerWidth - width - 8);
+    var left = Math.min(Math.max(8, r.left), maxLeft);
+    searchDiscoverEl.style.left = left + 'px';
+    searchDiscoverEl.style.top = Math.round(r.bottom + 8) + 'px';
+    searchDiscoverEl.style.width = width + 'px';
+  }
+
+  /**
+   * 显示「历史 + 热搜」浮层。
+   * @param {Element=} anchor 触发它的输入框；省略时保持上次位置。
+   */
+  function showSearchDiscover(anchor) {
+    placeSearchDiscover(anchor);
     searchDiscoverEl.hidden = false;
     searchTabs.hidden = true;
     searchBody.hidden = true;
@@ -5368,7 +5407,7 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     runSearch(searchInput.value, searchState.tab);
   });
   searchInput.addEventListener('focus', function () {
-    if (!String(searchInput.value || '').trim()) { showSearchDiscover(); }
+    if (!String(searchInput.value || '').trim()) { showSearchDiscover(searchInput); }
   });
   searchInput.addEventListener('input', function () {
     if (!String(searchInput.value || '').trim()) {
@@ -5380,6 +5419,16 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     requestSuggest();
   });
   shClear.addEventListener('click', clearHistory);
+  document.addEventListener('click', function (e) {
+    if (searchDiscoverEl.hidden) { return; }
+    if (searchDiscoverEl.contains(e.target)) { return; }
+    if (e.target === navSearch || navSearch.contains(e.target)) { return; }
+    if (e.target === searchInput || searchInput.contains(e.target)) { return; }
+    hideSearchDiscover();
+  });
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape' && !searchDiscoverEl.hidden) { hideSearchDiscover(); }
+  });
   searchInput.addEventListener('keydown', function (e) {
     if (e.key !== 'Enter') { return; }
     e.preventDefault();
@@ -5388,7 +5437,22 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
   document.getElementById('navSearchBtn').addEventListener('click', function () {
     runSearch(navSearch.value, 'user');
   });
+  navSearch.addEventListener('focus', function () {
+    showSearchDiscover(navSearch);
+  });
+  navSearch.addEventListener('click', function () {
+    showSearchDiscover(navSearch);
+    navSearch.focus();
+  });
+  navSearch.addEventListener('input', function () {
+    if (String(navSearch.value || '').trim()) {
+      searchDiscoverEl.hidden = true;
+    } else {
+      showSearchDiscover(navSearch);
+    }
+  });
   navSearch.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape') { hideSearchDiscover(); return; }
     if (e.key !== 'Enter') { return; }
     e.preventDefault();
     runSearch(navSearch.value, 'user');

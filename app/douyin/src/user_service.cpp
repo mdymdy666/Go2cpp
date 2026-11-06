@@ -604,6 +604,9 @@ douyin::Video PublicVideo(const douyin::StoredVideo& stored) {
     video.cover_url = stored.cover_url;
     video.clip_start_ms = stored.clip_start_ms;
     video.clip_end_ms = stored.clip_end_ms;
+    // 与 video 服务一致：liked 由调用方按查看者回填
+    // （HandleProfileTab 里的批量 FillVideoLikes），这里只负责透传。
+    video.liked = stored.liked;
     return video;
 }
 
@@ -755,6 +758,14 @@ bool HandleProfileTab(douyin::Store& store, const douyin::HttpRequest& request,
         }
         std::fprintf(stderr, "[%s] 查询主页 %s 失败: %s\n", kServiceName,
                      ProfileTabName(tab), error.c_str());
+        return Fail(response, 500, "数据库错误");
+    }
+
+    // step4.5: 一页一条 SQL 回填「当前查看者是否赞过」，前端据 liked
+    //          渲染已赞 ♥；匿名 viewer=0 时全 false，不产生 SQL。
+    if (!store.FillVideoLikes(viewer, &videos, &error)) {
+        std::fprintf(stderr, "[%s] 回填主页视频点赞态失败: %s\n", kServiceName,
+                     error.c_str());
         return Fail(response, 500, "数据库错误");
     }
 

@@ -146,6 +146,7 @@ std::string ToFeedJson(const douyin::StoredVideo& stored,
     video.clip_start_ms = stored.clip_start_ms;
     video.clip_end_ms = stored.clip_end_ms;
     video.tags = douyin::ExtractTags(stored.title);
+    video.liked = stored.liked;
 
     douyin::FeedItem item;
     item.video = std::move(video);
@@ -155,13 +156,29 @@ std::string ToFeedJson(const douyin::StoredVideo& stored,
 
 /**
  * @brief 查询视频并补齐作者名，输出统一响应。
- * @param store 存储。
- * @param videos 已按热度序切好的一页。
- * @param next_cursor 下一页游标（空串表示没有）。
- * @param response 输出。
+ *
+ * @param store 存储，不可为空。
+ * @param viewer [in] 当前查看者 user_id；<=0 匿名（`liked` 全 false）。
+ * @param videos [in,out] 已按热度序切好的一页；进入时读，返回时回填 `liked`
+ *        （第 13 轮：feed 必须带上「我赞过没」，否则前端刷新后丢点赞态）。
+ * @param next_cursor [in] 下一页游标（空串表示没有）。
+ * @param response [out] 输出。
+ * @return 成功 true；数据库错误时已写 500 并返回 true（响应已产生）。
+ *
+ * ## 定位
+ * 推荐流与关注流共用的唯一响应出口，`liked` 回填放在这里，避免两个
+ * handler 各写一遍导致行为分叉。
  */
-bool WriteFeed(douyin::Store& store, const std::vector<douyin::StoredVideo>& videos,
+bool WriteFeed(douyin::Store& store, std::int64_t viewer,
+               std::vector<douyin::StoredVideo>& videos,
                const std::string& next_cursor, douyin::HttpResponse* response) {
+    // step1: 整页批量回填 liked（一条 SQL；匿名跳过）。
+    std::string like_error;
+    if (!store.FillVideoLikes(viewer, &videos, &like_error)) {
+        std::fprintf(stderr, "[%s] 回填点赞态失败: %s\n", kServiceName,
+                     like_error.c_str());
+        return Fail(response, 500, "数据库错误");
+    }
     std::string body = "{\"ok\":true,\"items\":[";
     for (std::size_t i = 0; i < videos.size(); ++i) {
         std::string author;
@@ -203,7 +220,7 @@ bool HandleFeed(douyin::Store& store, const douyin::HttpRequest& request,
                      error.c_str());
         return Fail(response, 500, "数据库错误");
     }
-    return WriteFeed(store, videos, next_cursor, response);
+    return WriteFeed(store, viewer, videos, next_cursor, response);
 }
 
 /// @brief 关注流（只含已关注作者）。
@@ -230,7 +247,7 @@ bool HandleFollowingFeed(douyin::Store& store, const douyin::HttpRequest& reques
                      error.c_str());
         return Fail(response, 500, "数据库错误");
     }
-    return WriteFeed(store, videos, next_cursor, response);
+    return WriteFeed(store, actor, videos, next_cursor, response);
 }
 
 /// @brief 总路由。

@@ -132,7 +132,8 @@ std::string ToJson(const Video& value) {
                        Key("created_at") + std::to_string(value.created_at) + "," +
                        Key("cover_url") + "\"" + EscapeJson(value.cover_url) + "\"," +
                        Key("clip_start_ms") + std::to_string(value.clip_start_ms) + "," +
-                       Key("clip_end_ms") + std::to_string(value.clip_end_ms) + ",";
+                       Key("clip_end_ms") + std::to_string(value.clip_end_ms) + "," +
+                       Key("liked") + (value.liked ? "true" : "false") + ",";
     body += Key("tags") + "[";
     for (std::size_t i = 0; i < value.tags.size(); ++i) {
         if (i != 0) {
