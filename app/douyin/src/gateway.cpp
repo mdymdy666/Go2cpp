@@ -170,8 +170,8 @@ bool VerifyBearer(const Request& request, std::string* user_id, std::string* err
  *
  * ## 并发/失败语义
  * - 调用约束：worker 线程并发调用，本类无状态，可安全共享；
- * - 不变量：路径为 `/`、`/index.html` 或 `/v/<数字>`（可带尾斜杠）、
- *   且方法为 GET/HEAD 时返回 true。
+ * - 不变量：路径为 `/` 或 `/index.html`、且方法为 GET/HEAD 时返回 true；
+ *   `/v/<id>` 不再由本类接管（第 4 轮改为 video 服务直出的分享落地页）。
  */
 class HomeMatcher final : public Matcher {
 public:
@@ -189,17 +189,8 @@ public:
         if (path == "/" || path == "/index.html") {
             return true;
         }
-        // step3: 短视频直达 `/v/<数字>`（允许一个尾斜杠），页面按 pathname 解析 id。
-        if (path.size() > 3 && path.compare(0, 3, "/v/") == 0) {
-            std::size_t i = 3;
-            while (i < path.size() && path[i] >= '0' && path[i] <= '9') {
-                ++i;
-            }
-            if (i > 3 && (i == path.size() ||
-                          (i + 1 == path.size() && path[i] == '/'))) {
-                return true;
-            }
-        }
+        // step3: `/v/<id>` 交给分享落地页路由（RouteSpec `/v/**`）转发给
+        // video 服务，这里不再返回首页 SPA。
         return false;
     }
 };
@@ -807,6 +798,25 @@ int main(int argc, char** argv) {
     });
     // 上传体积闸门：放在路由/转发之前，超 32 MiB 的请求不产生上游连接。
     gateway->Use(LimitUploadSize);
+    // 分享落地页：通用网关转发前会擦掉 Host 头（避免上游拿到错误的 vhost），
+    // 但落地页的 OG 标签需要绝对地址（og:url/og:image/og:video）。这里只对
+    // `/v/` 前缀把原始 Host 注入 X-Forwarded-Host，上游据此拼绝对 URL；
+    // 不信任入站自带的 X-Forwarded-Host（覆盖为真实 Host，防属性注入）。
+    gateway->Use([](Request& request, Response& response,
+                    const Next& next) -> Result<void> {
+        const std::string_view path = request.path_view();
+        if (path.size() > 3 && path.compare(0, 3, "/v/") == 0) {
+            const std::string host = request.header.get("Host");
+            if (!host.empty()) {
+                request.header.set("X-Forwarded-Host", host);
+            }
+            const std::string proto = request.header.get("X-Forwarded-Proto");
+            if (proto == "https") {
+                request.header.set("X-Forwarded-Proto", proto);
+            }
+        }
+        return next();
+    });
 
     // 可观测性：先 trace（给请求打 trace id）再 metrics（统计耗时与状态码）。
     douyin::observability::Init();
@@ -860,7 +870,11 @@ int main(int argc, char** argv) {
         AddRoute(gateway.get(), kWriteMask, "/api/live/**", kLivePort, true, 10,
                  "live-write") &&
         AddRoute(gateway.get(), method_mask::kAll, "/api/search/**", kSearchPort,
-                 false, 0, "search");
+                 false, 0, "search") &&
+        // 分享落地页 `/v/<id>`：独立 HTML（不是首页 SPA），由 video 服务渲染。
+        // 与静态视频路由 `/videos/**` 前缀不同，互不干扰。
+        AddRoute(gateway.get(), kReadMask, "/v/**", kVideoPort, false, 0,
+                 "share-landing");
     if (!routes_ok) {
         return 1;
     }

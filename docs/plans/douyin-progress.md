@@ -2,10 +2,10 @@
 
 | 项 | 内容 |
 |---|---|
-| 盘点时间 | 2026-11-06（第 3 轮） |
+| 盘点时间 | 2026-11-06（第 4 轮） |
 | 盘点范围 | `app/douyin/` 全部源码（7 服务 + 网关 + 单页前端） |
 | 盘点方式 | 读 REQUIREMENTS.md、逐服务路由表、前端函数/元素清单、关键词扫描、跑既有验收 |
-| 基线 | `scripts/accept_all.sh` → 70 PASS / 0 FAIL；`scripts/accept_notifications.sh` → 92 PASS / 0 FAIL；`scripts/accept_report_block.sh` → **79 PASS / 0 FAIL** |
+| 基线 | `scripts/accept_all.sh` → 70 PASS / 0 FAIL；`scripts/accept_notifications.sh` → 92 PASS / 0 FAIL；`scripts/accept_report_block.sh` → 79 PASS / 0 FAIL；`scripts/accept_share_landing.sh` → **88 PASS / 0 FAIL** |
 
 > 说明：本文档只记录**代码里核实过**的能力。摘要里提到但代码未命中的项，
 > 统一标「待核实」，不当作已完成。
@@ -52,6 +52,9 @@
       拉黑/取消/状态/黑名单 5 个接口；feed / 视频详情 / 评论 / 搜索 / 通知 /
       收藏 / 话题 7 处读过滤；评论/点赞/关注写接口防骚扰（403）；前端「⋯」菜单、
       举报弹窗、黑名单抽屉
+- [x] **分享落地页（第 4 轮新增）**：`/v/:id` 由 video 服务 SSR 直出独立页面
+      （播放器 / 作者关注 / 点赞评论数 / 评论区翻页 / 下载分享 + OG 预览）；
+      已删除、被拉黑作者一律 404，匿名按公开页处理
 
 ### 4. 发现与话题
 
@@ -83,7 +86,7 @@
 | 2 | ~~消息通知中心~~ | 高 | — | **本轮已完成** |
 | 3 | ~~举报 / 拉黑~~ | 高 | — | **本轮已完成** |
 | 3.1 | 举报列表后台（运营端） | 中 | 1 h | 目前只落库，无管理接口；见 `reports.status` |
-| 4 | 分享落地页 `/v/:id` | 中高 | 1 h | 分享出去的链接直接定位到该视频（当前只有首页 hash 路由） |
+| 4 | ~~分享落地页 `/v/:id`~~ | 中高 | — | **本轮已完成**（独立 SSR 页 + OG 预览） |
 | 5 | 个人主页三 tab（作品/喜欢/收藏） | 中高 | 1.5 h | 需要 `/api/video/liked`；主页目前只有作品 |
 | 6 | 评论 @mention | 中 | 2 h | 输入 @ 弹候选 + 评论渲染高亮 + 通知联动 |
 | 7 | 草稿箱 | 中 | 1 h | 前端已有 localStorage 使用；需明确草稿持久化与恢复入口 |
@@ -264,11 +267,82 @@
 - **方向坑**：`IsBlocked(user_id 拉黑者, blocked_id 被拉黑者)` 的参数顺序在「viewer 拉黑作者」与
   「作者拉黑 viewer」两个场景里相反；视频详情最初写反，导致只挡了一个方向。现在详情/评论/写接口都做双向检查。
 
-## 六、下一轮建议
+## 六、第 4 轮交付：分享落地页 `/v/:id`
 
-1. 分享落地页 `/v/:id`（#4）：目前只有 hash 路由与 feed 内 `jumpToVideo`。
-2. 举报运营后台：`reports.status` 只有 pending，缺列表/处理接口与页面。
-3. 「待核实」四项：@mention / 草稿 / WS Resume / 压缩——要么补实现，要么从
+### 架构
+
+| 层 | 改动 |
+|---|---|
+| 网关 `src/gateway.cpp` | 首页 Matcher 不再接管 `/v/<id>`（原来直接回首页 SPA）；新增 `GET/HEAD /v/**` → video 服务的公开读路由（`share-landing`）；对 `/v/` 前缀注入 `X-Forwarded-Host` / `X-Forwarded-Proto` |
+| video 服务 `src/video_service.cpp` | 新增 `HandleSharePage`：解析 id + 站点前缀 → 查视频 → 拉黑双向过滤 → 作者/计数/播放/封面 → 首屏评论（20 条 + 游标）→ 输出 HTML；`Handle()` 里按 `/v/` 前缀分流 |
+| 模板 `include/douyin_share_page.hpp` | 新文件：`BuildSharePage` / `BuildShareNotFound` / `EscapeHtml` / `TruncateUtf8` / `TimeAgo`；内联 CSS+JS，自包含无外部依赖 |
+
+> 为什么不在网关拼页面：网关没有业务库句柄，SSR 需要视频、作者、评论、点赞、关注五份数据，
+> 在网关侧要 3~4 次内部 HTTP + JSON 解析；放到 video 服务后是进程内一次查询，
+> 且「已删除 404 / 被拉黑 404」与 `/api/video/:id` 的语义天然一致。
+
+### OG / 预览标签（服务端写死，爬虫无需执行 JS）
+
+| 标签 | 内容 |
+|---|---|
+| `og:type` | `video.other` |
+| `og:site_name` / `og:title` / `og:description` | 站点名 / 标题 / 「标题 · @作者 · ♥ N · 💬 M」 |
+| `og:url` | 落地页绝对地址（`http://host/v/<id>`，前缀随部署） |
+| `og:image` + `og:image:width/height` | 同名封面 `videos/<name>.jpg`（`std::filesystem` 确认存在，否则 demo 封面兜底），绝对地址 |
+| `og:video` + `og:video:type` | 绝对播放地址 + `video/mp4` |
+| `twitter:card` / `twitter:title` / `twitter:description` / `twitter:image` | `summary_large_image` + 同上内容 |
+| `link rel="canonical"` | 落地页地址 |
+
+### 页面能力（移动端优先单列）
+
+- 播放器 `<video controls playsinline preload=metadata>` + 封面，`max-height:72vh`；
+- 标题 + 点赞数 / 评论数 / 发布日期；
+- 作者行：首字母头像 + 昵称 + 关注按钮（登录后 `POST|DELETE /api/user/:id/follow`，
+  SSR 直出「已关注」态，匿名显示「关注」）；
+- 操作栏：点赞（`POST|DELETE /api/like`，乐观更新计数）、下载（`<a download>`）、
+  分享（`navigator.share`，不可用时复制链接）；
+- 评论区：SSR 首屏 20 条（`max-height:62vh` 可滚动）+「加载更多」
+  （`/api/comment/:id?cursor=`）+ 发评论（`POST /api/comment`）+
+  单条点赞（`/api/comment/:id/like`）；未登录操作提示「回首页登录」；
+- 404 页：独立 HTML + `noindex`，含「回首页看更多」，不加载首页 SPA。
+
+### 验收
+
+- `bash app/douyin/build.sh` → 8 个二进制全 ok，`-Werror -Wpedantic` 零告警
+- `bash scripts/accept_share_landing.sh` → **88 PASS / 0 FAIL**（9 组）
+- `bash scripts/accept_all.sh` → **70 PASS / 0 FAIL**（回归）
+- `bash scripts/accept_comment_like.sh` / `accept_notifications.sh` /
+  `accept_report_block.sh` → 33 / 92 / 79 PASS（回归）
+- 覆盖：页面元素（video/作者/关注/点赞/评论/下载/分享）、6 个 OG + 4 个 Twitter 标签、
+  XSS 转义（标题含 `<script>`）、25 条评论 SSR 20 条 + 第二页 5 条、
+  不存在 / 非数字 / 0 / 已删除 404、viewer 拉黑作者 404、作者拉黑 viewer 404、
+  匿名不受个人黑名单影响、关注/点赞态只对本人渲染、HEAD、尾斜杠、首页与 API 回归
+- 性能（loopback，20 次串行）：`GET /v/<id>` TTFB **avg 0.77 ms / max 1.02 ms**，
+  页面 16.8 KB
+
+### 踩坑记录
+
+- **症状**：`edit` / `write` 工具对 `\\wsl.localhost\...` 路径报 `ENOTSUP`
+  （原子 rename 在 9P 上不支持）。
+- **绕过**：文件先写 Windows 侧 `.dsh_tmp/`，再 `wsl bash -lc "cp /mnt/e/... /UserData/..."`；
+  WSL 内批量替换用 `python3` 脚本（读-改-写 + 命中次数断言）。
+- **路径**：本机存在 `E:\UserData\CodexWorkSpace\Go2cpp` 影子目录（历史误建），
+  真树只在 WSL `/UserData/CodexWorkSpace/Go2cpp`；本轮曾误写一次，已搬回并删除误建的那一棵。
+
+- **症状**：落地页在评论头像处出现非法 UTF-8（浏览器乱码；Python 读取直接抛
+  `UnicodeDecodeError`，`wc` 之前完全看不出来）。
+- **原因**：`std::string::substr(0, 1)` / `who[3]` 是按**字节**取「首字符」，
+  「用户 #1」的第 4 个字节正好是「户」的中间字节，页面里留下半个码点。
+- **修复**：作者头像用 `FirstUtf8Char` 取完整码点；评论头像固定 `#`
+  （与 JS 追加的评论行一致）。
+- **教训**：C++ 里凡是「取首字符」的地方都要确认按码点还是按字节；
+  验收脚本要加一次 `decode('utf-8')`，否则非法字节在终端里看不出来。
+
+## 七、下一轮建议
+
+1. 个人主页三 tab（#5）：作品 / 喜欢 / 收藏，需要 `/api/video/liked`。
+2. 举报运营后台：`reports.status` 只有 pending，缺列表 / 处理接口与页面。
+3. 「待核实」三项：@mention / 草稿 / WS Resume / 压缩——要么补实现，要么从
    已完成清单里移除；@mention 可直接复用通知中心的 `mention` 类型。
-4. 前端 JS 无 node/qjs：本轮用 Python 做「括号/字符串闭合 + 关键片段」检查
-   （已覆盖整页 script），后续可接 quickjs 对整页做 `--check`。
+4. 落地页增强：评论回复折叠、作者其它作品、播放进度记忆；分享卡片的
+   `og:image` 可选自动截帧（当前复用同名 jpg / demo 封面）。

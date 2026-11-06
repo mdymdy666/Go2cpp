@@ -32,6 +32,7 @@
 #include "douyin_auth.hpp"
 #include "douyin_http.hpp"
 #include "douyin_proto.hpp"
+#include "douyin_share_page.hpp"
 #include "douyin_store.hpp"
 #include "douyin_tag.hpp"
 #include "go2cpp/storage/db.hpp"
@@ -1030,6 +1031,285 @@ bool HandleDetail(douyin::Store& store, const douyin::HttpRequest& request,
     return true;
 }
 
+
+/// @brief 从 `<前缀>/v/<id>` 解析视频 id 与站点前缀。
+///
+/// @param path [in] 请求路径，如 `/v/12`、`/douyin/v/12`（允许一个尾斜杠）；
+///        借用，函数内不保留引用。
+/// @param id [out] 解析成功时写视频 id（>0）；失败时保持原值不变。
+/// @param base_path [out] 成功时写站点前缀（`""` 或 `/douyin`，无尾斜杠）；
+///        失败时保持原值不变。
+/// @return 路径合法返回 true；否则返回 false，调用方回 404 落地页。
+///
+/// ## 定位
+/// 落地页路由的唯一路径解析点。错了会怎样：把 `/v/abc` 当成合法 id 去查库
+/// （浪费一次查询），或把公网前缀 `/douyin` 丢掉导致页面内视频/接口 404。
+bool ParseSharePath(std::string_view path, std::int64_t* id,
+                    std::string* base_path) {
+    constexpr std::string_view kMarker = "/v/";
+    const std::size_t marker = path.rfind(kMarker);
+    if (marker == std::string_view::npos) {
+        return false;
+    }
+    std::string_view rest = path.substr(marker + kMarker.size());
+    if (!rest.empty() && rest.back() == '/') {
+        rest.remove_suffix(1);
+    }
+    // 18 位十进制足以覆盖 int64，同时挡掉超长数字串造成的溢出。
+    if (rest.empty() || rest.size() > 18) {
+        return false;
+    }
+    std::int64_t value = 0;
+    for (const char c : rest) {
+        if (c < '0' || c > '9') {
+            return false;
+        }
+        value = value * 10 + (c - '0');
+    }
+    if (value <= 0) {
+        return false;
+    }
+    std::string prefix(path.substr(0, marker));
+    while (!prefix.empty() && prefix.back() == '/') {
+        prefix.pop_back();
+    }
+    *id = value;
+    *base_path = std::move(prefix);
+    return true;
+}
+
+/// @brief 站点源（`http://host[:port]`）；拿不到合法 Host 时返回空串。
+///
+/// @param request [in] 入站请求；只读 `X-Forwarded-Host` / `Host` /
+///        `X-Forwarded-Proto`。借用。
+/// @return 绝对地址前缀；空串表示未知（渲染层退回相对 URL）。
+///
+/// ## 定位
+/// OG 标签（og:url / og:image / og:video）需要绝对地址，微信/QQ 的抓取器
+/// 不执行 JS、也不补全相对路径。网关转发时会擦掉 Host 头，因此由网关中间件
+/// 注入 `X-Forwarded-Host`；本函数只信任该头与入站 Host，并过滤控制字符，
+/// 避免把攻击者构造的头拼进 HTML 属性。
+std::string ShareOrigin(const douyin::HttpRequest& request) {
+    std::string host = request.Header("X-Forwarded-Host");
+    if (host.empty()) {
+        host = request.Header("Host");
+    }
+    // 多级代理会追加 `,` 分隔的多个 host，只取第一个。
+    const std::size_t comma = host.find(',');
+    if (comma != std::string::npos) {
+        host.resize(comma);
+    }
+    for (const char c : host) {
+        const unsigned char byte = static_cast<unsigned char>(c);
+        if (byte <= 0x20 || byte == 0x7F || c == '<' || c == '>') {
+            return std::string();
+        }
+    }
+    if (host.empty()) {
+        return std::string();
+    }
+    std::string proto = request.Header("X-Forwarded-Proto");
+    if (proto != "https") {
+        proto = "http";
+    }
+    return proto + "://" + host;
+}
+
+/// @brief DB 里的 url → 落地页可播放地址（带站点前缀）。
+///
+/// @param prefix [in] 站点前缀（`"/"` 或 `"/douyin/"`）；借用。
+/// @param url [in] videos.url 列；借用。可为绝对 http(s)、`videos/x.mp4`、
+///        裸文件名或空串。
+/// @param id [in] 视频 id；url 为空时用它选 demo 兜底片（1~5）。
+/// @return 可直接写进 `<video src>` 的地址；调用方负责 HTML 转义。
+std::string ShareVideoUrl(const std::string& prefix, const std::string& url,
+                          std::int64_t id) {
+    if (url.rfind("http://", 0) == 0 || url.rfind("https://", 0) == 0) {
+        return url;
+    }
+    if (url.rfind("videos/", 0) == 0) {
+        return prefix + url;
+    }
+    if (url.rfind('/', 0) == 0) {
+        return url;
+    }
+    if (url.empty()) {
+        return prefix + "videos/demo" + std::to_string((id % 5) + 1) + ".mp4";
+    }
+    return prefix + "videos/" + url;
+}
+
+/// @brief DB 里的 url → 封面地址（同名 jpg 存在才用，否则用 demo 封面兜底）。
+///
+/// @param prefix [in] 站点前缀（`"/"` 或 `"/douyin/"`）；借用。
+/// @param url [in] videos.url 列；借用。
+/// @param id [in] 视频 id；兜底封面按 `(id % 5) + 1` 选。
+/// @return 封面地址；文件是否真的存在由本函数用 std::filesystem 确认，
+///         避免 OG 图 404（聊天窗口里表现为空白预览）。
+std::string SharePosterUrl(const std::string& prefix, const std::string& url,
+                           std::int64_t id) {
+    std::string name = url;
+    const std::size_t slash = name.rfind('/');
+    if (slash != std::string::npos) {
+        name = name.substr(slash + 1);
+    }
+    const std::size_t dot = name.rfind('.');
+    if (dot != std::string::npos) {
+        name = name.substr(0, dot);
+    }
+    if (!name.empty()) {
+        std::error_code ec;
+        const std::filesystem::path poster =
+            std::filesystem::path(WebDir()) / "videos" / (name + ".jpg");
+        if (std::filesystem::exists(poster, ec) && !ec) {
+            return prefix + "videos/" + name + ".jpg";
+        }
+    }
+    return prefix + "videos/demo" + std::to_string((id % 5) + 1) + ".jpg";
+}
+
+/**
+ * @brief 渲染分享落地页 `GET /v/:id`（服务端直出完整 HTML）。
+ *
+ * @param store [in,out] 已打开的存储——本函数只读；内部可能触发 ORM 语句
+ *        缓存，多进程 WAL 下由调用方保证请求边界 `ResetStatements()`。
+ * @param request [in] 入站请求——借用；读 Authorization（可选身份）、
+ *        Host / X-Forwarded-* 头；不读 body。
+ * @param path [in] 请求路径（`/v/12` 或 `/douyin/v/12`）；借用，生命周期
+ *        与 request 相同。
+ * @param response [out] 出站响应——成功 200 + HTML；视频不存在 / 已删除 /
+ *        被拉黑 404 + HTML；数据库错误 500 + JSON（极端路径，浏览器看到
+ *        错误文本也可以接受）。不可为 nullptr。
+ * @return 恒为 true（表示本路由已处理）；调用方**不要**再走 `/api/video`
+ *         的 404 兜底。
+ *
+ * ## 定位
+ * 分享链接的唯一落地点：微信/QQ/复制链接打开的 `/v/:id` 都由这里直出页面。
+ * 错了会怎样：分享卡片没有标题/封面（OG 缺失）、被拉黑作者重新可见（过滤
+ * 漏掉）、或已删除视频仍返回 200（爬虫缓存死链）。因此 404 与拉黑都必须
+ * 在**渲染之前**判定。
+ *
+ * ## 步骤
+ * step1. 解析 id 与站点前缀；失败直接 404 页（不查库）；
+ * step2. 查视频行；不存在/已删除 → 404 页，数据库错误 → 500；
+ * step3. 登录者做拉黑双向检查，命中 → 404 页（不暴露「被屏蔽」）；
+ * step4. 组装页面数据：作者、点赞/评论计数、播放/封面地址；
+ * step5. 查第一页评论并批量回填点赞；失败只降级为空评论，不影响整页；
+ * step6. 输出 HTML，`Cache-Control: no-store`（计数随互动变化）。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：服务单线程事件循环内调用；store 非线程安全；
+ * - 原子性：只读，无写入；评论查询失败与点赞回填失败都不会让页面 500；
+ * - 失败语义：404 用 HTML 页表达（人可读），500 用既有 JSON 错误体；
+ * - 不变量：返回 200 时页面里的 og:title/og:image/og:video 一定非空。
+ */
+bool HandleSharePage(douyin::Store& store, const douyin::HttpRequest& request,
+                     std::string_view path, douyin::HttpResponse* response) {
+    // step1: 路径解析；404 页同样需要 base_path / origin 才能「回首页」。
+    std::int64_t video_id = 0;
+    std::string base_path;
+    const bool parsed = ParseSharePath(path, &video_id, &base_path);
+    const std::string origin = ShareOrigin(request);
+    auto not_found = [response, &origin, &base_path]() {
+        response->status = 404;
+        response->content_type = "text/html; charset=utf-8";
+        response->headers["Cache-Control"] = "no-store";
+        response->headers["X-Content-Type-Options"] = "nosniff";
+        response->body = douyin::BuildShareNotFound(base_path, origin);
+        return true;
+    };
+    if (!parsed) {
+        return not_found();
+    }
+    // step2: 视频行；软删/真删在存储层都表现为「查不到」，统一 404。
+    douyin::StoredVideo stored;
+    std::string error;
+    if (!store.FindVideo(video_id, &stored, &error)) {
+        if (!error.empty()) {
+            std::fprintf(stderr, "[%s] 查询落地页视频失败: %s\n", kServiceName,
+                         error.c_str());
+            return Fail(response, 500, "数据库错误");
+        }
+        return not_found();
+    }
+    // step3: 拉黑双向过滤——viewer 拉黑作者，或作者拉黑 viewer，都按 404 隐藏；
+    // 匿名请求没有身份，不做个人黑名单（与 feed/详情一致）。
+    const std::int64_t viewer = ViewerId(request);
+    if (viewer > 0) {
+        bool blocked = false;
+        if (!store.IsBlocked(viewer, stored.user_id, &blocked, &error) ||
+            (!blocked &&
+             !store.IsBlocked(stored.user_id, viewer, &blocked, &error))) {
+            std::fprintf(stderr, "[%s] 查询落地页拉黑状态失败: %s\n",
+                         kServiceName, error.c_str());
+            return Fail(response, 500, "数据库错误");
+        }
+        if (blocked) {
+            return not_found();
+        }
+    }
+    // step4: 页面数据；作者名查不到只显示「用户 #id」，不阻断页面。
+    douyin::SharePageData data;
+    data.video_id = video_id;
+    data.title = stored.title;
+    data.author_id = stored.user_id;
+    std::string author;
+    if (!store.FindUserName(stored.user_id, &author, &error)) {
+        author.clear();
+    }
+    data.author_name = std::move(author);
+    data.like_count = stored.like_count;
+    data.comment_count = stored.comment_count;
+    data.created_at = stored.created_at;
+    data.base_path = base_path;
+    data.origin = origin;
+    const std::string prefix = base_path + "/";
+    data.video_url = ShareVideoUrl(prefix, stored.url, video_id);
+    data.poster_url = SharePosterUrl(prefix, stored.url, video_id);
+    if (viewer > 0) {
+        bool following = false;
+        std::string status_error;
+        data.liked = store.HasLiked(video_id, viewer, &status_error);
+        if (store.IsFollowing(viewer, stored.user_id, &following,
+                              &status_error)) {
+            data.following = following;
+        }
+    }
+    // step5: 评论区第一页（20 条）；失败只降级空评论，不回 500。
+    std::vector<douyin::StoredComment> comments;
+    std::string next_cursor;
+    if (!store.ListComments(video_id, "", 20, &comments, &next_cursor, &error,
+                            viewer)) {
+        std::fprintf(stderr, "[%s] 查询落地页评论失败: %s\n", kServiceName,
+                     error.c_str());
+        comments.clear();
+    } else {
+        if (!store.FillCommentLikes(viewer, &comments, &error)) {
+            std::fprintf(stderr, "[%s] 回填落地页评论点赞失败: %s\n",
+                         kServiceName, error.c_str());
+        }
+        data.comments.reserve(comments.size());
+        for (const auto& comment : comments) {
+            douyin::ShareComment item;
+            item.id = comment.id;
+            item.user_id = comment.user_id;
+            item.content = comment.content;
+            item.created_at = comment.created_at;
+            item.like_count = comment.like_count;
+            item.liked = comment.liked;
+            data.comments.push_back(std::move(item));
+        }
+        data.next_cursor = std::move(next_cursor);
+    }
+    // step6: 输出；no-store 防止分享页点赞/评论数被缓存成旧值。
+    response->status = 200;
+    response->content_type = "text/html; charset=utf-8";
+    response->headers["Cache-Control"] = "no-store";
+    response->headers["X-Content-Type-Options"] = "nosniff";
+    response->body = douyin::BuildSharePage(data);
+    return true;
+}
+
 /// @brief 我的视频（热度序 + cursor 分页）。
 bool HandleMine(douyin::Store& store, const douyin::HttpRequest& request,
                 douyin::HttpResponse* response) {
@@ -1512,6 +1792,14 @@ bool Handle(douyin::Store& store, const douyin::HttpRequest& request,
                          ",\"errors\":" + std::to_string(g_metrics.errors) + "}";
         return true;
     }
+    // 分享落地页：`/v/<id>`（公网前缀下是 `/<prefix>/v/<id>`）直出独立 HTML。
+    // 必须放在 `/api/...` 各分支之前？不：`/api/video/12` 不含 `/v/` 子串，
+    // 这里只按 `/v/` 判定，不会截走 API 路由。
+    if ((request.method == "GET" || request.method == "HEAD") &&
+        request.path.find("/v/") != std::string::npos) {
+        return HandleSharePage(store, request, request.path, response);
+    }
+
     if (request.path == "/api/tag/list") {
         if (request.method == "GET") {
             return HandleTagList(store, request, response);
