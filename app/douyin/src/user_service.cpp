@@ -160,6 +160,26 @@ bool HandleLogin(douyin::Store& store, const douyin::HttpRequest& request,
     return true;
 }
 
+/**
+ * @brief 尝试解析可选的 Bearer token，用于「当前查看者」相关字段。
+ * @param request [in] 原始请求；Authorization 头可为空。
+ * @return 有效 token 的 user_id；无 token / 签名非法 / 过期一律返回 0（匿名）。
+ * @note 资料页是公开接口，token 无效**不应**回 401；这里只影响 is_blocked
+ *       等「查看者视角」字段。
+ */
+std::int64_t ViewerId(const douyin::HttpRequest& request) {
+    const std::string token = douyin::BearerToken(request);
+    if (token.empty()) {
+        return 0;
+    }
+    douyin::TokenInfo info;
+    std::string error;
+    if (!douyin::VerifyToken(token, NowSeconds(), &info, &error)) {
+        return 0;
+    }
+    return info.user_id;
+}
+
 /// @brief 取资料（含关注数/粉丝数/当前登录者的关注状态）。
 bool HandleProfile(douyin::Store& store, const douyin::HttpRequest& request,
                    std::int64_t id, douyin::HttpResponse* response) {
@@ -194,10 +214,22 @@ bool HandleProfile(douyin::Store& store, const douyin::HttpRequest& request,
             is_following = false;
         }
     }
+    // 拉黑状态：只有登录用户看别人主页时才有意义；自己/匿名恒 false。
+    // 前端据此显示「已拉黑」并隐藏作品，避免拉黑后还能从主页绕进去。
+    bool is_blocked = false;
+    const std::int64_t viewer = ViewerId(request);
+    if (viewer > 0 && viewer != id) {
+        if (!store.IsBlocked(viewer, id, &is_blocked, &error)) {
+            std::fprintf(stderr, "[%s] 查询拉黑状态失败: %s\n", kServiceName,
+                         error.c_str());
+            is_blocked = false;
+        }
+    }
     std::string user_json = douyin::ToJson(PublicUser(stored));
     user_json.pop_back();  // 去掉结尾 '}'，追加计数字段
     user_json += ",\"followers\":" + std::to_string(followers) +
-                 ",\"following\":" + std::to_string(following) + "}";
+                 ",\"following\":" + std::to_string(following) +
+                 ",\"is_blocked\":" + (is_blocked ? "true" : "false") + "}";
     response->status = 200;
     response->body = std::string("{\"ok\":true,\"is_following\":") +
                      (is_following ? "true" : "false") + ",\"user\":" +
@@ -242,6 +274,27 @@ bool HandleFollow(douyin::Store& store, const douyin::HttpRequest& request,
     }
     if (!found) {
         return Fail(response, 404, "用户不存在");
+    }
+    // 防骚扰：被对方拉黑后不能再关注（否则拉黑只是单方面看不见，对方仍
+    // 会收到关注通知）。
+    if (follow) {
+        bool blocked = false;
+        if (!store.IsBlocked(target_id, actor, &blocked, &error)) {
+            std::fprintf(stderr, "[%s] 查询拉黑状态失败: %s\n", kServiceName,
+                         error.c_str());
+            return Fail(response, 500, "数据库错误");
+        }
+        if (blocked) {
+            return Fail(response, 403, "对方已把你拉黑");
+        }
+        if (!store.IsBlocked(actor, target_id, &blocked, &error)) {
+            std::fprintf(stderr, "[%s] 查询拉黑状态失败: %s\n", kServiceName,
+                         error.c_str());
+            return Fail(response, 500, "数据库错误");
+        }
+        if (blocked) {
+            return Fail(response, 403, "你已拉黑对方，请先取消拉黑");
+        }
     }
     // 写前清空 ORM 语句缓存：FindUserById 提前结束会残留读游标，
     // 多服务共享 WAL 库时会让本进程的写触发 SQLITE_BUSY_SNAPSHOT。
@@ -346,6 +399,145 @@ bool HandleFollowList(douyin::Store& store, const douyin::HttpRequest& request,
     return true;
 }
 
+/**
+ * @brief 拉黑 / 取消拉黑：`POST|DELETE /api/user/:id/block`。
+ *
+ * @param store [in,out] 已打开的存储；借用。
+ * @param request [in] 原始请求；必须带有效 Bearer token。
+ * @param target_id [in] 被拉黑者 id（>0），由 `ParseUserPath` 解析。
+ * @param block [in] true=拉黑，false=取消。
+ * @param response [out] 成功写 `{ok,blocked,already}`；失败写统一错误体。
+ * @return 恒为 true（已处理）。
+ *
+ * ## 定位
+ * 拉黑关系的唯一写入口。错了会怎样：重复行让黑名单出现同一个人两次，
+ * 或取消拉黑后 feed 仍过滤。
+ *
+ * ## 步骤
+ * step1. 鉴权（拉黑是登录操作，匿名 401）。
+ * step2. 拒绝拉黑自己（400），确认目标用户存在（404）。
+ * step3. 写/删 blocks（唯一键 + INSERT OR IGNORE 保证幂等）。
+ * step4. 输出当前状态；重复拉黑 `already=true`，未拉黑时取消也成功。
+ */
+bool HandleBlock(douyin::Store& store, const douyin::HttpRequest& request,
+                 std::int64_t target_id, bool block,
+                 douyin::HttpResponse* response) {
+    // step1: 鉴权。
+    std::int64_t actor = 0;
+    if (!RequireToken(request, response, &actor)) {
+        return true;
+    }
+    // step2: 目标校验。
+    if (actor == target_id) {
+        return Fail(response, 400, "不能拉黑自己");
+    }
+    douyin::StoredUser target;
+    std::string error;
+    if (!store.FindUserById(target_id, &target, &error)) {
+        if (!error.empty()) {
+            std::fprintf(stderr, "[%s] 查询用户失败: %s\n", kServiceName,
+                         error.c_str());
+            return Fail(response, 500, "数据库错误");
+        }
+        return Fail(response, 404, "用户不存在");
+    }
+    // step3: 写库。写前清缓存，避免读游标残留触发 BUSY_SNAPSHOT。
+    store.ResetStatements();
+    bool already = false;
+    if (block) {
+        const int inserted = store.BlockUser(actor, target_id, &error);
+        if (inserted < 0) {
+            std::fprintf(stderr, "[%s] 拉黑失败: %s\n", kServiceName,
+                         error.c_str());
+            return Fail(response, 500, "数据库错误");
+        }
+        already = inserted == 0;
+    } else if (!store.UnblockUser(actor, target_id, &error)) {
+        std::fprintf(stderr, "[%s] 取消拉黑失败: %s\n", kServiceName,
+                     error.c_str());
+        return Fail(response, 500, "数据库错误");
+    }
+    // step4: 输出当前状态。
+    response->status = 200;
+    response->body = std::string("{\"ok\":true,\"blocked\":") +
+                     (block ? "true" : "false") + ",\"already\":" +
+                     (already ? "true" : "false") + ",\"user_id\":" +
+                     std::to_string(target_id) + "}";
+    return true;
+}
+
+/**
+ * @brief 查询是否已拉黑：`GET /api/user/:id/block`。
+ * @param store [in,out] 已打开的存储；借用。
+ * @param request [in] 原始请求；必须带有效 Bearer token。
+ * @param target_id [in] 被拉黑者 id（>0）。
+ * @param response [out] 成功写 `{ok,blocked}`；失败写统一错误体。
+ * @return 恒为 true。
+ */
+bool HandleBlockStatus(douyin::Store& store,
+                       const douyin::HttpRequest& request,
+                       std::int64_t target_id,
+                       douyin::HttpResponse* response) {
+    std::int64_t actor = 0;
+    if (!RequireToken(request, response, &actor)) {
+        return true;
+    }
+    bool blocked = false;
+    std::string error;
+    if (!store.IsBlocked(actor, target_id, &blocked, &error)) {
+        std::fprintf(stderr, "[%s] 查询拉黑状态失败: %s\n", kServiceName,
+                     error.c_str());
+        return Fail(response, 500, "数据库错误");
+    }
+    response->status = 200;
+    response->body = std::string("{\"ok\":true,\"blocked\":") +
+                     (blocked ? "true" : "false") + ",\"user_id\":" +
+                     std::to_string(target_id) + "}";
+    return true;
+}
+
+/**
+ * @brief 黑名单列表：`GET /api/user/blocks`。
+ * @param store [in,out] 已打开的存储；借用。
+ * @param request [in] 原始请求；必须带有效 Bearer token。
+ * @param response [out] 成功写 `{ok,items,total}`；失败写统一错误体。
+ * @return 恒为 true。
+ *
+ * ## 定位
+ * 黑名单管理页的唯一数据源（一次 JOIN 回填昵称，不逐条查）。
+ */
+bool HandleBlockList(douyin::Store& store, const douyin::HttpRequest& request,
+                     douyin::HttpResponse* response) {
+    std::int64_t actor = 0;
+    if (!RequireToken(request, response, &actor)) {
+        return true;
+    }
+    std::vector<douyin::StoredBlock> items;
+    std::string error;
+    if (!store.ListBlocks(actor, &items, &error)) {
+        std::fprintf(stderr, "[%s] 查询黑名单失败: %s\n", kServiceName,
+                     error.c_str());
+        return Fail(response, 500, "数据库错误");
+    }
+    std::string body = "{\"ok\":true,\"items\":[";
+    for (std::size_t i = 0; i < items.size(); ++i) {
+        if (i != 0) {
+            body += ',';
+        }
+        body += "{\"id\":" + std::to_string(items[i].id) +
+                ",\"user_id\":" + std::to_string(items[i].user_id) +
+                ",\"blocked_id\":" + std::to_string(items[i].blocked_id) +
+                ",\"blocked_name\":\"" +
+                douyin::JsonEscape(items[i].blocked_name) +
+                "\",\"created_at\":" +
+                std::to_string(items[i].created_at) + "}";
+    }
+    body += "],\"total\":" + std::to_string(items.size()) + "}";
+    response->status = 200;
+    response->body = std::move(body);
+    return true;
+}
+
 /// @brief 从 `/api/user/<id>` 或 `/api/user/<id>/<suffix>` 解析 id 与后缀。
 bool ParseUserPath(const std::string& path, std::int64_t* id, std::string* suffix) {
     constexpr std::string_view kPrefix = "/api/user/";
@@ -386,6 +578,15 @@ bool Handle(douyin::Store& store, const douyin::HttpRequest& request,
         return true;
     }
 
+    // 黑名单列表是固定路径，必须放在 `/api/user/<id>` 解析之前——否则
+    // `blocks` 会被当成非数字 id 直接落到 404。
+    if (request.path == "/api/user/blocks") {
+        if (request.method == "GET") {
+            return HandleBlockList(store, request, response);
+        }
+        return Fail(response, 405, "方法不允许");
+    }
+
     constexpr std::string_view kRegister = "/api/user/register";
     constexpr std::string_view kLogin = "/api/user/login";
     if (request.method == "POST" && request.path == kRegister) {
@@ -412,6 +613,18 @@ bool Handle(douyin::Store& store, const douyin::HttpRequest& request,
         }
         if (request.method == "DELETE") {
             return HandleFollow(store, request, id, false, response);
+        }
+        return Fail(response, 405, "方法不允许");
+    }
+    if (suffix == "block") {
+        if (request.method == "POST") {
+            return HandleBlock(store, request, id, true, response);
+        }
+        if (request.method == "DELETE") {
+            return HandleBlock(store, request, id, false, response);
+        }
+        if (request.method == "GET") {
+            return HandleBlockStatus(store, request, id, response);
         }
         return Fail(response, 405, "方法不允许");
     }

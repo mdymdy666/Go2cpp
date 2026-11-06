@@ -160,6 +160,31 @@ std::string EncodeFeedCursor(std::uint64_t seed, std::size_t index);
 bool DecodeFeedCursor(const std::string& cursor, std::uint64_t* seed,
                       std::size_t* index);
 
+/// @brief `reports` 表里的一行举报（内容治理，第 3 轮新增）。
+/// @note 唯一键 `(reporter_id, target_type, target_id)`：同一个人对同一个
+///       目标只能举报一次，重复提交返回已有记录而不是新增。
+struct StoredReport {
+    std::int64_t id{0};           ///< 自增主键。
+    std::int64_t reporter_id{0};  ///< 举报者 id。
+    std::string target_type;      ///< 目标类型：video / comment / user。
+    std::int64_t target_id{0};    ///< 目标 id（配合 target_type）。
+    std::string reason;           ///< 举报原因（短标签，1~50 字）。
+    std::string detail;           ///< 补充说明（可空，<=500 字）。
+    std::string status;           ///< pending / handled。
+    std::int64_t created_at{0};   ///< Unix 秒。
+};
+
+/// @brief `blocks` 表里的一行拉黑记录（第 3 轮新增）。
+/// @note `blocked_name` 不是表列：查询时 `LEFT JOIN users` 回填，避免
+///       冗余昵称、改名后不同步。
+struct StoredBlock {
+    std::int64_t id{0};             ///< 自增主键。
+    std::int64_t user_id{0};        ///< 拉黑者。
+    std::int64_t blocked_id{0};     ///< 被拉黑者。
+    std::string blocked_name;       ///< 被拉黑者昵称（JOIN 回填；可能为空）。
+    std::int64_t created_at{0};     ///< Unix 秒。
+};
+
 /// @brief `upload_sessions` 表里的一行分片上传会话（断点续传状态）。
 /// @note `upload_id` 是服务端生成的 UUID v4，同时是继续上传的唯一凭据；
 ///       `path` 只由服务端拼出（`web/videos/.upload_<upload_id>.part`），
@@ -371,7 +396,7 @@ class Store {
      */
     bool ListFeed(const std::string& cursor, std::int64_t limit,
                   std::vector<StoredVideo>* out, std::string* next_cursor,
-                  std::string* error);
+                  std::string* error, std::int64_t viewer_id = 0);
 
     /**
      * @brief 关注流：只含 `user_id` 已关注作者的视频，排序与游标同 `ListFeed`。
@@ -454,7 +479,8 @@ class Store {
      */
     bool ListComments(std::int64_t video_id, const std::string& cursor,
                       std::int64_t limit, std::vector<StoredComment>* out,
-                      std::string* next_cursor, std::string* error);
+                      std::string* next_cursor, std::string* error,
+                      std::int64_t viewer_id = 0);
 
     /**
      * @brief 某条顶层评论的二级回复，按 `created_at` 正序（同秒按 id 正序）。
@@ -467,7 +493,7 @@ class Store {
      */
     bool ListReplies(std::int64_t video_id, std::int64_t parent_id,
                      std::int64_t limit, std::vector<StoredComment>* out,
-                     std::string* error);
+                     std::string* error, std::int64_t viewer_id = 0);
 
     /// @brief 按 id 查评论；未找到返回 false 且 error 为空。
     bool FindComment(std::int64_t id, StoredComment* out, std::string* error);
@@ -613,6 +639,76 @@ class Store {
                                        const std::vector<std::int64_t>& ids,
                                        bool all, std::string* error);
 
+    // ---- 举报 / 拉黑：reports / blocks（第 3 轮新增，只加不改既有） ----
+
+    /// @brief `AddReport` 的结果：新建 / 重复 / 失败。
+    enum class ReportResult { kCreated = 0, kDuplicate = 1, kError = 2 };
+
+    /**
+     * @brief 写一条举报（同一个人对同一目标只能一条，唯一键兜底）。
+     *
+     * @param reporter_id [in] 举报者 id（>0，登录用户）。
+     * @param target_type [in] 目标类型：`video` / `comment` / `user`；
+     *        其它值视为脏数据，**不要**入库。
+     * @param target_id [in] 目标 id（>0；目标是否存在由服务层先查）。
+     * @param reason [in] 原因标签（1~50 字，服务层校验，存储层不截断）。
+     * @param detail [in] 补充说明（可空，<=500 字由服务层校验）。
+     * @param out [out] 成功（含重复）时写库里的那条举报；可为 nullptr。
+     * @param error [out] 失败时写错误文本；成功时保持原值。
+     * @return
+     * - `ReportResult::kCreated`：本次新插入（服务层回 201）；
+     * - `ReportResult::kDuplicate`：唯一键冲突，`out` 是已有记录（回 200）；
+     * - `ReportResult::kError`：参数非法或数据库错误（服务层回 500/400）。
+     *
+     * ## 定位
+     * 举报写入的唯一提交点。错了会怎样：同一个人刷出成千上万条重复举报，
+     * 运营后台无法按目标聚合。
+     */
+    ReportResult AddReport(std::int64_t reporter_id,
+                           const std::string& target_type,
+                           std::int64_t target_id, const std::string& reason,
+                           const std::string& detail, StoredReport* out,
+                           std::string* error);
+
+    /// @brief 按唯一键查举报；未找到返回 false 且 error 为空。
+    bool FindReport(std::int64_t reporter_id, const std::string& target_type,
+                    std::int64_t target_id, StoredReport* out,
+                    std::string* error);
+
+    /**
+     * @brief 拉黑用户（幂等：`INSERT OR IGNORE`，唯一键 `(user_id, blocked_id)`）。
+     * @param user_id [in] 拉黑者（登录用户）。
+     * @param blocked_id [in] 被拉黑者；**不能等于** user_id（服务层先挡）。
+     * @param error [out] 失败时写错误文本；成功时保持原值。
+     * @return 1=本次新增；0=之前已拉黑；-1=数据库错误。
+     */
+    int BlockUser(std::int64_t user_id, std::int64_t blocked_id,
+                  std::string* error);
+
+    /**
+     * @brief 取消拉黑（幂等：没拉黑也不报错）。
+     * @param user_id [in] 拉黑者。
+     * @param blocked_id [in] 被拉黑者。
+     * @param error [out] 失败时写错误文本。
+     * @return 成功返回 true（含「本来就没拉黑」）。
+     */
+    bool UnblockUser(std::int64_t user_id, std::int64_t blocked_id,
+                     std::string* error);
+
+    /// @brief 是否已拉黑；数据库错误时返回 false（error 非空）。
+    bool IsBlocked(std::int64_t user_id, std::int64_t blocked_id, bool* out,
+                   std::string* error);
+
+    /**
+     * @brief 黑名单列表：按拉黑时间倒序，一次 JOIN 回填昵称。
+     * @param user_id [in] 拉黑者。
+     * @param out [out] 追加到末尾（不清空调用方已有内容）。
+     * @param error [out] 失败时写错误文本。
+     * @return 成功返回 true（可能是空列表）。
+     */
+    bool ListBlocks(std::int64_t user_id, std::vector<StoredBlock>* out,
+                    std::string* error);
+
     // ---- C6 搜索：name/title 包含匹配（大小写不敏感） ----
 
     /**
@@ -623,12 +719,12 @@ class Store {
      */
     bool SearchUsers(const std::string& query, std::int64_t limit,
                      std::int64_t offset, std::vector<StoredUser>* out,
-                     std::string* error);
+                     std::string* error, std::int64_t viewer_id = 0);
 
     /// @brief 搜索视频：`lower(title) LIKE lower('%q%')`，按 id 倒序。
     bool SearchVideos(const std::string& query, std::int64_t limit,
                       std::int64_t offset, std::vector<StoredVideo>* out,
-                      std::string* error);
+                      std::string* error, std::int64_t viewer_id = 0);
 
     // ---- C7 直播：rooms + room_viewers（只加不改既有） ----
 

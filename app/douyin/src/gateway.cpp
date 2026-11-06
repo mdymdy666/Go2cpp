@@ -841,6 +841,10 @@ int main(int argc, char** argv) {
                  0, "feed") &&
         AddRoute(gateway.get(), kWriteMask, "/api/like/**", kInteractionPort, true,
                  10, "like") &&
+        // 举报：全方法转发，非 POST 由上游回 405；鉴权与目标校验都在上游，
+        // 这样匿名 POST 仍是 401、GET 仍是 405（与其它写接口语义一致）。
+        AddRoute(gateway.get(), method_mask::kAll, "/api/report",
+                 kInteractionPort, false, 10, "report") &&
         AddRoute(gateway.get(), kReadMask, "/api/comment/**", kInteractionPort,
                  false, 0, "comment-read") &&
         AddRoute(gateway.get(), kWriteMask, "/api/comment/**", kInteractionPort,

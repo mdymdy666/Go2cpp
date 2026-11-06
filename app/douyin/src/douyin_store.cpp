@@ -283,7 +283,33 @@ constexpr const char* kSchemaSql =
     "CREATE INDEX IF NOT EXISTS idx_notifications_unread "
     "ON notifications(user_id, read_at, created_at);"
     "CREATE INDEX IF NOT EXISTS idx_notifications_timeline "
-    "ON notifications(user_id, created_at DESC, id DESC);";
+    "ON notifications(user_id, created_at DESC, id DESC);"
+    // 举报：唯一键挡住「同一个人对同一目标反复举报」；status 留给运营后台，
+    // 用户接口不暴露举报列表。
+    "CREATE TABLE IF NOT EXISTS reports ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  reporter_id INTEGER NOT NULL,"
+    "  target_type TEXT NOT NULL,"
+    "  target_id INTEGER NOT NULL,"
+    "  reason TEXT NOT NULL,"
+    "  detail TEXT NOT NULL DEFAULT '',"
+    "  status TEXT NOT NULL DEFAULT 'pending',"
+    "  created_at INTEGER NOT NULL,"
+    "  UNIQUE(reporter_id, target_type, target_id)"
+    ");"
+    "CREATE INDEX IF NOT EXISTS idx_reports_status "
+    "ON reports(status, created_at DESC);"
+    // 拉黑：唯一键 (user_id, blocked_id) 同时是幂等键；索引前缀 user_id
+    // 让「取我的黑名单」和 NOT IN 子查询都只扫本人这几行。
+    "CREATE TABLE IF NOT EXISTS blocks ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  user_id INTEGER NOT NULL,"
+    "  blocked_id INTEGER NOT NULL,"
+    "  created_at INTEGER NOT NULL,"
+    "  UNIQUE(user_id, blocked_id)"
+    ");"
+    "CREATE INDEX IF NOT EXISTS idx_blocks_user "
+    "ON blocks(user_id, created_at DESC);";
 
 /// @brief 把 `Error` 写成可读文本。
 std::string DescribeError(const go2cpp::storage::Error& error) {
@@ -332,6 +358,42 @@ void ReadCommentRow(go2cpp::storage::Rows* rows, StoredComment* out) {
     out->content = rows->Text(3);
     out->created_at = rows->Int64(4);
     out->parent_id = rows->Int64(5);
+}
+
+/**
+ * @brief 读一页评论：多取一条判断 next_cursor，再裁剪到 limit。
+ * @param rows [in,out] 已执行成功的查询结果集，借用。
+ * @param limit [in] 期望条数；<=0 时直接返回 true。
+ * @param next_cursor [out] 还有下一页时写游标，否则空串。
+ * @param out [out] 追加到末尾。
+ * @param error [out] 遍历失败时写错误文本。
+ * @return 成功返回 true。
+ */
+bool ReadCommentPage(go2cpp::storage::Rows* rows, std::int64_t limit,
+                     std::string* next_cursor,
+                     std::vector<StoredComment>* out, std::string* error) {
+    std::vector<StoredComment> page;
+    while (rows->Next()) {
+        StoredComment comment;
+        ReadCommentRow(rows, &comment);
+        page.push_back(std::move(comment));
+    }
+    if (rows->Err()) {
+        if (error != nullptr) {
+            *error = "遍历评论失败: " + DescribeError(rows->Err());
+        }
+        return false;
+    }
+    if (static_cast<std::int64_t>(page.size()) > limit) {
+        page.resize(static_cast<std::size_t>(limit));
+        if (!page.empty()) {
+            *next_cursor = EncodeCommentCursor(page.back());
+        }
+    }
+    for (StoredComment& comment : page) {
+        out->push_back(std::move(comment));
+    }
+    return true;
 }
 
 /**
@@ -889,7 +951,7 @@ int Store::DeleteVideo(std::int64_t id, std::int64_t user_id,
 
 bool Store::ListFeed(const std::string& cursor, std::int64_t limit,
                      std::vector<StoredVideo>* out, std::string* next_cursor,
-                     std::string* error) {
+                     std::string* error, std::int64_t viewer_id) {
     next_cursor->clear();
     if (!Ok()) {
         if (error != nullptr) {
@@ -915,9 +977,17 @@ bool Store::ListFeed(const std::string& cursor, std::int64_t limit,
     // 随机推荐：池子是全库视频，**不按作者过滤**——本人视频也在池中，
     // 因此随机首屏能刷到自己（旧热度序会把 0 互动的新视频挤到末页）。
     std::vector<StoredVideo> all;
-    const std::string sql =
+    std::string sql =
         std::string("SELECT ") + kVideoColumns + " FROM videos";
-    if (!LoadVideos(*m_db, sql, &all, error)) {
+    if (viewer_id > 0) {
+        // 拉黑过滤：被拉黑作者的视频不进候选池，随机洗牌前就剔掉，
+        // 否则分页后再过滤会出现「这一页不满 20 条」的空洞。
+        sql += " WHERE user_id NOT IN"
+               " (SELECT blocked_id FROM blocks WHERE user_id = ?)";
+        if (!LoadVideos(*m_db, sql, &all, error, viewer_id)) {
+            return false;
+        }
+    } else if (!LoadVideos(*m_db, sql, &all, error)) {
         return false;
     }
     std::mt19937_64 engine(seed);
@@ -949,11 +1019,14 @@ bool Store::ListFollowingFeed(std::int64_t user_id, const std::string& cursor,
         return false;
     }
     std::vector<StoredVideo> all;
+    // 拉黑过滤：关注流里被拉黑作者同样不出现（不必先取关，拉黑立即生效）。
     const std::string sql = std::string("SELECT ") + kVideoColumns +
                             " FROM videos WHERE user_id IN (SELECT followee_id "
-                            "FROM follows WHERE follower_id = ?)" +
+                            "FROM follows WHERE follower_id = ?)"
+                            " AND user_id NOT IN (SELECT blocked_id FROM blocks"
+                            " WHERE user_id = ?)" +
                             kVideoOrder;
-    if (!LoadVideos(*m_db, sql, &all, error, user_id)) {
+    if (!LoadVideos(*m_db, sql, &all, error, user_id, user_id)) {
         return false;
     }
     PageVideos(all, cursor, limit, out, next_cursor);
@@ -1123,8 +1196,9 @@ bool Store::ListFavorites(std::int64_t user_id, std::int64_t limit,
     auto rows = m_db->Query(
         "SELECT v.id, v.user_id, v.title, v.url, v.like_count, v.comment_count, "
         "v.created_at FROM favorites f JOIN videos v ON v.id = f.video_id "
-        "WHERE f.user_id = ? ORDER BY f.created_at DESC, v.id DESC LIMIT ?",
-        user_id, limit);
+        "WHERE f.user_id = ? AND v.user_id NOT IN (SELECT blocked_id FROM blocks"
+        " WHERE user_id = ?) ORDER BY f.created_at DESC, v.id DESC LIMIT ?",
+        user_id, user_id, limit);
     if (!rows) {
         if (error != nullptr) {
             *error = "查询收藏列表失败: " + DescribeError(rows.Err());
@@ -1170,7 +1244,8 @@ std::int64_t Store::AddComment(std::int64_t video_id, std::int64_t user_id,
 
 bool Store::ListComments(std::int64_t video_id, const std::string& cursor,
                          std::int64_t limit, std::vector<StoredComment>* out,
-                         std::string* next_cursor, std::string* error) {
+                         std::string* next_cursor, std::string* error,
+                         std::int64_t viewer_id) {
     next_cursor->clear();
     if (!Ok()) {
         if (error != nullptr) {
@@ -1194,48 +1269,47 @@ bool Store::ListComments(std::int64_t video_id, const std::string& cursor,
 
     std::string sql = std::string("SELECT ") + kCommentColumns +
                       " FROM comments WHERE video_id = ? AND parent_id = 0";
+    if (viewer_id > 0) {
+        sql += " AND user_id NOT IN"
+               " (SELECT blocked_id FROM blocks WHERE user_id = ?)";
+    }
     if (has_cursor) {
         sql += " AND (created_at < ? OR (created_at = ? AND id < ?))";
     }
     sql += " ORDER BY created_at DESC, id DESC LIMIT ?";
 
+    if (has_cursor && viewer_id > 0) {
+        auto rows = m_db->Query(sql, video_id, viewer_id, cursor_created,
+                                cursor_created, cursor_id, limit + 1);
+        if (!rows) {
+            if (error != nullptr) {
+                *error = "查询评论失败: " + DescribeError(rows.Err());
+            }
+            return false;
+        }
+        if (!ReadCommentPage(&rows.Value(), limit, next_cursor, out, error)) {
+            return false;
+        }
+        return true;
+    }
     auto rows = has_cursor
                     ? m_db->Query(sql, video_id, cursor_created, cursor_created,
                                   cursor_id, limit + 1)
-                    : m_db->Query(sql, video_id, limit + 1);
+                    : (viewer_id > 0
+                           ? m_db->Query(sql, video_id, viewer_id, limit + 1)
+                           : m_db->Query(sql, video_id, limit + 1));
     if (!rows) {
         if (error != nullptr) {
             *error = "查询评论失败: " + DescribeError(rows.Err());
         }
         return false;
     }
-    std::vector<StoredComment> page;
-    while (rows.Value().Next()) {
-        StoredComment comment;
-        ReadCommentRow(&rows.Value(), &comment);
-        page.push_back(std::move(comment));
-    }
-    if (rows.Value().Err()) {
-        if (error != nullptr) {
-            *error = "遍历评论失败: " + DescribeError(rows.Value().Err());
-        }
-        return false;
-    }
-    if (static_cast<std::int64_t>(page.size()) > limit) {
-        page.resize(static_cast<std::size_t>(limit));
-        if (!page.empty()) {
-            *next_cursor = EncodeCommentCursor(page.back());
-        }
-    }
-    for (StoredComment& comment : page) {
-        out->push_back(std::move(comment));
-    }
-    return true;
+    return ReadCommentPage(&rows.Value(), limit, next_cursor, out, error);
 }
 
 bool Store::ListReplies(std::int64_t video_id, std::int64_t parent_id,
                         std::int64_t limit, std::vector<StoredComment>* out,
-                        std::string* error) {
+                        std::string* error, std::int64_t viewer_id) {
     if (!Ok()) {
         if (error != nullptr) {
             *error = "数据库尚未打开";
@@ -1245,10 +1319,34 @@ bool Store::ListReplies(std::int64_t video_id, std::int64_t parent_id,
     if (limit <= 0) {
         return true;
     }
-    auto rows = m_db->Query(std::string("SELECT ") + kCommentColumns +
-                                " FROM comments WHERE video_id = ? AND parent_id = ?"
-                                " ORDER BY created_at ASC, id ASC LIMIT ?",
-                            video_id, parent_id, limit);
+    std::string sql = std::string("SELECT ") + kCommentColumns +
+                      " FROM comments WHERE video_id = ? AND parent_id = ?";
+    if (viewer_id > 0) {
+        sql += " AND user_id NOT IN"
+               " (SELECT blocked_id FROM blocks WHERE user_id = ?)";
+        sql += " ORDER BY created_at ASC, id ASC LIMIT ?";
+        auto rows = m_db->Query(sql, video_id, parent_id, viewer_id, limit);
+        if (!rows) {
+            if (error != nullptr) {
+                *error = "查询回复失败: " + DescribeError(rows.Err());
+            }
+            return false;
+        }
+        while (rows.Value().Next()) {
+            StoredComment comment;
+            ReadCommentRow(&rows.Value(), &comment);
+            out->push_back(std::move(comment));
+        }
+        if (rows.Value().Err()) {
+            if (error != nullptr) {
+                *error = "遍历回复失败: " + DescribeError(rows.Value().Err());
+            }
+            return false;
+        }
+        return true;
+    }
+    sql += " ORDER BY created_at ASC, id ASC LIMIT ?";
+    auto rows = m_db->Query(sql, video_id, parent_id, limit);
     if (!rows) {
         if (error != nullptr) {
             *error = "查询回复失败: " + DescribeError(rows.Err());
@@ -1553,16 +1651,20 @@ bool Store::ListNotifications(std::int64_t user_id, const std::string& cursor,
         "SELECT n.id, n.user_id, n.actor_id, COALESCE(u.name, ''), n.kind,"
         " n.target_type, n.target_id, n.content, n.created_at, n.read_at"
         " FROM notifications n LEFT JOIN users u ON u.id = n.actor_id"
-        " WHERE n.user_id = ?";
+        " WHERE n.user_id = ?"
+        // 被拉黑者触发的通知不展示：列表与未读数用同一个条件，避免徽章
+        // 数字比列表多。
+        " AND n.actor_id NOT IN (SELECT blocked_id FROM blocks"
+        " WHERE user_id = ?)";
     if (has_cursor) {
         sql += " AND (n.created_at < ? OR (n.created_at = ? AND n.id < ?))";
     }
     sql += " ORDER BY n.created_at DESC, n.id DESC LIMIT ?";
 
     auto rows = has_cursor
-                    ? m_db->Query(sql, user_id, cursor_created, cursor_created,
-                                  cursor_id, limit + 1)
-                    : m_db->Query(sql, user_id, limit + 1);
+                    ? m_db->Query(sql, user_id, user_id, cursor_created,
+                                  cursor_created, cursor_id, limit + 1)
+                    : m_db->Query(sql, user_id, user_id, limit + 1);
     if (!rows) {
         if (error != nullptr) {
             *error = "查询通知失败: " + DescribeError(rows.Err());
@@ -1612,8 +1714,9 @@ std::int64_t Store::CountUnreadNotifications(std::int64_t user_id,
         return -1;
     }
     auto rows = m_db->Query(
-        "SELECT COUNT(*) FROM notifications WHERE user_id = ? AND read_at = 0",
-        user_id);
+        "SELECT COUNT(*) FROM notifications WHERE user_id = ? AND read_at = 0"
+        " AND actor_id NOT IN (SELECT blocked_id FROM blocks WHERE user_id = ?)",
+        user_id, user_id);
     if (!rows) {
         if (error != nullptr) {
             *error = "统计未读通知失败: " + DescribeError(rows.Err());
@@ -1684,11 +1787,142 @@ std::int64_t Store::MarkNotificationsRead(std::int64_t user_id,
 }
 
 // ---------------------------------------------------------------------------
-// C6 搜索
+// 举报 / 拉黑：reports / blocks
 // ---------------------------------------------------------------------------
 
-bool Store::SearchUsers(const std::string& query, std::int64_t limit,
-                        std::int64_t offset, std::vector<StoredUser>* out,
+namespace {
+
+/// @brief 合法举报目标类型。
+bool IsValidReportTarget(std::string_view type) {
+    return type == "video" || type == "comment" || type == "user";
+}
+
+/// @brief 读当前行（列顺序见 `Store::AddReport` / `FindReport` 的 SELECT）。
+void ReadReportRow(go2cpp::storage::Rows* rows, StoredReport* out) {
+    out->id = rows->Int64(0);
+    out->reporter_id = rows->Int64(1);
+    out->target_type = rows->Text(2);
+    out->target_id = rows->Int64(3);
+    out->reason = rows->Text(4);
+    out->detail = rows->Text(5);
+    out->status = rows->Text(6);
+    out->created_at = rows->Int64(7);
+}
+
+}  // namespace
+
+Store::ReportResult Store::AddReport(std::int64_t reporter_id,
+                                     const std::string& target_type,
+                                     std::int64_t target_id,
+                                     const std::string& reason,
+                                     const std::string& detail,
+                                     StoredReport* out, std::string* error) {
+    // step1: 参数校验——脏数据进库只能人工清理，宁可不写。
+    if (reporter_id <= 0 || target_id <= 0 || reason.empty() ||
+        !IsValidReportTarget(target_type)) {
+        if (error != nullptr) {
+            *error = "举报参数非法";
+        }
+        return ReportResult::kError;
+    }
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return ReportResult::kError;
+    }
+    const std::int64_t now = static_cast<std::int64_t>(std::time(nullptr));
+    // step2: 直接 INSERT，让唯一键决定是否重复——先查后插在并发下会双写。
+    auto inserted = m_db->Exec(
+        "INSERT INTO reports(reporter_id, target_type, target_id, reason,"
+        " detail, status, created_at) VALUES(?, ?, ?, ?, ?, 'pending', ?)",
+        reporter_id, target_type, target_id, reason, detail, now);
+    if (!inserted) {
+        // step3: 唯一键冲突 = 已经举报过；把已有记录返回，接口保持幂等。
+        if (inserted.Err().IsConstraint()) {
+            if (FindReport(reporter_id, target_type, target_id, out, error)) {
+                return ReportResult::kDuplicate;
+            }
+            if (error != nullptr && error->empty()) {
+                *error = "查询已有举报失败";
+            }
+            return ReportResult::kError;
+        }
+        if (error != nullptr) {
+            *error = "写举报失败: " + DescribeError(inserted.Err());
+        }
+        return ReportResult::kError;
+    }
+    if (out != nullptr) {
+        out->id = inserted.Value().last_insert_row_id;
+        out->reporter_id = reporter_id;
+        out->target_type = target_type;
+        out->target_id = target_id;
+        out->reason = reason;
+        out->detail = detail;
+        out->status = "pending";
+        out->created_at = now;
+    }
+    return ReportResult::kCreated;
+}
+
+bool Store::FindReport(std::int64_t reporter_id,
+                       const std::string& target_type, std::int64_t target_id,
+                       StoredReport* out, std::string* error) {
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return false;
+    }
+    auto rows = m_db->Query(
+        "SELECT id, reporter_id, target_type, target_id, reason, detail,"
+        " status, created_at FROM reports"
+        " WHERE reporter_id = ? AND target_type = ? AND target_id = ?",
+        reporter_id, target_type, target_id);
+    if (!rows) {
+        if (error != nullptr) {
+            *error = "查询举报失败: " + DescribeError(rows.Err());
+        }
+        return false;
+    }
+    if (!rows.Value().Next()) {
+        return false;
+    }
+    if (out != nullptr) {
+        ReadReportRow(&rows.Value(), out);
+    }
+    return true;
+}
+
+int Store::BlockUser(std::int64_t user_id, std::int64_t blocked_id,
+                     std::string* error) {
+    if (user_id <= 0 || blocked_id <= 0 || user_id == blocked_id) {
+        if (error != nullptr) {
+            *error = "拉黑参数非法";
+        }
+        return -1;
+    }
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return -1;
+    }
+    auto inserted = m_db->Exec(
+        "INSERT OR IGNORE INTO blocks(user_id, blocked_id, created_at)"
+        " VALUES(?, ?, ?)",
+        user_id, blocked_id, static_cast<std::int64_t>(std::time(nullptr)));
+    if (!inserted) {
+        if (error != nullptr) {
+            *error = "拉黑失败: " + DescribeError(inserted.Err());
+        }
+        return -1;
+    }
+    return inserted.Value().changes > 0 ? 1 : 0;
+}
+
+bool Store::UnblockUser(std::int64_t user_id, std::int64_t blocked_id,
                         std::string* error) {
     if (!Ok()) {
         if (error != nullptr) {
@@ -1696,12 +1930,126 @@ bool Store::SearchUsers(const std::string& query, std::int64_t limit,
         }
         return false;
     }
-    const std::string pattern = LikePattern(query);
+    auto deleted = m_db->Exec(
+        "DELETE FROM blocks WHERE user_id = ? AND blocked_id = ?", user_id,
+        blocked_id);
+    if (!deleted) {
+        if (error != nullptr) {
+            *error = "取消拉黑失败: " + DescribeError(deleted.Err());
+        }
+        return false;
+    }
+    return true;
+}
+
+bool Store::IsBlocked(std::int64_t user_id, std::int64_t blocked_id,
+                      bool* out, std::string* error) {
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return false;
+    }
     auto rows = m_db->Query(
+        "SELECT 1 FROM blocks WHERE user_id = ? AND blocked_id = ? LIMIT 1",
+        user_id, blocked_id);
+    if (!rows) {
+        if (error != nullptr) {
+            *error = "查询拉黑状态失败: " + DescribeError(rows.Err());
+        }
+        return false;
+    }
+    *out = rows.Value().Next();
+    if (rows.Value().Err()) {
+        if (error != nullptr) {
+            *error = "遍历拉黑状态失败: " + DescribeError(rows.Value().Err());
+        }
+        return false;
+    }
+    return true;
+}
+
+bool Store::ListBlocks(std::int64_t user_id,
+                       std::vector<StoredBlock>* out, std::string* error) {
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return false;
+    }
+    auto rows = m_db->Query(
+        "SELECT b.id, b.user_id, b.blocked_id, COALESCE(u.name, ''),"
+        " b.created_at FROM blocks b LEFT JOIN users u ON u.id = b.blocked_id"
+        " WHERE b.user_id = ? ORDER BY b.created_at DESC, b.id DESC",
+        user_id);
+    if (!rows) {
+        if (error != nullptr) {
+            *error = "查询黑名单失败: " + DescribeError(rows.Err());
+        }
+        return false;
+    }
+    while (rows.Value().Next()) {
+        StoredBlock item;
+        item.id = rows.Value().Int64(0);
+        item.user_id = rows.Value().Int64(1);
+        item.blocked_id = rows.Value().Int64(2);
+        item.blocked_name = rows.Value().Text(3);
+        item.created_at = rows.Value().Int64(4);
+        out->push_back(std::move(item));
+    }
+    if (rows.Value().Err()) {
+        if (error != nullptr) {
+            *error = "遍历黑名单失败: " + DescribeError(rows.Value().Err());
+        }
+        return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// C6 搜索
+// ---------------------------------------------------------------------------
+
+bool Store::SearchUsers(const std::string& query, std::int64_t limit,
+                        std::int64_t offset, std::vector<StoredUser>* out,
+                        std::string* error, std::int64_t viewer_id) {
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return false;
+    }
+    const std::string pattern = LikePattern(query);
+    std::string sql =
         "SELECT id, name, created_at FROM users"
-        " WHERE lower(name) LIKE lower(?) ESCAPE '\\'"
-        " ORDER BY id DESC LIMIT ? OFFSET ?",
-        pattern, limit, offset);
+        " WHERE lower(name) LIKE lower(?) ESCAPE '\\'";
+    if (viewer_id > 0) {
+        sql += " AND id NOT IN (SELECT blocked_id FROM blocks WHERE user_id = ?)";
+        sql += " ORDER BY id DESC LIMIT ? OFFSET ?";
+        auto rows = m_db->Query(sql, pattern, viewer_id, limit, offset);
+        if (!rows) {
+            if (error != nullptr) {
+                *error = "搜索用户失败: " + DescribeError(rows.Err());
+            }
+            return false;
+        }
+        while (rows.Value().Next()) {
+            StoredUser user;
+            user.id = rows.Value().Int64(0);
+            user.name = rows.Value().Text(1);
+            user.created_at = rows.Value().Int64(2);
+            out->push_back(std::move(user));
+        }
+        if (rows.Value().Err()) {
+            if (error != nullptr) {
+                *error = "遍历用户失败: " + DescribeError(rows.Value().Err());
+            }
+            return false;
+        }
+        return true;
+    }
+    sql += " ORDER BY id DESC LIMIT ? OFFSET ?";
+    auto rows = m_db->Query(sql, pattern, limit, offset);
     if (!rows) {
         if (error != nullptr) {
             *error = "搜索用户失败: " + DescribeError(rows.Err());
@@ -1755,7 +2103,7 @@ bool Store::ListAllVideos(std::vector<StoredVideo>* out, std::string* error) {
 
 bool Store::SearchVideos(const std::string& query, std::int64_t limit,
                          std::int64_t offset, std::vector<StoredVideo>* out,
-                         std::string* error) {
+                         std::string* error, std::int64_t viewer_id) {
     if (!Ok()) {
         if (error != nullptr) {
             *error = "数据库尚未打开";
@@ -1763,11 +2111,35 @@ bool Store::SearchVideos(const std::string& query, std::int64_t limit,
         return false;
     }
     const std::string pattern = LikePattern(query);
-    auto rows = m_db->Query(
-        std::string("SELECT ") + kVideoColumns +
-            " FROM videos WHERE lower(title) LIKE lower(?) ESCAPE '\\'"
-            " ORDER BY id DESC LIMIT ? OFFSET ?",
-        pattern, limit, offset);
+    std::string sql = std::string("SELECT ") + kVideoColumns +
+                      " FROM videos WHERE lower(title) LIKE lower(?)"
+                      " ESCAPE '\\'";
+    if (viewer_id > 0) {
+        sql += " AND user_id NOT IN"
+               " (SELECT blocked_id FROM blocks WHERE user_id = ?)";
+        sql += " ORDER BY id DESC LIMIT ? OFFSET ?";
+        auto rows = m_db->Query(sql, pattern, viewer_id, limit, offset);
+        if (!rows) {
+            if (error != nullptr) {
+                *error = "搜索视频失败: " + DescribeError(rows.Err());
+            }
+            return false;
+        }
+        while (rows.Value().Next()) {
+            StoredVideo video;
+            ReadVideoRow(&rows.Value(), &video);
+            out->push_back(std::move(video));
+        }
+        if (rows.Value().Err()) {
+            if (error != nullptr) {
+                *error = "遍历视频失败: " + DescribeError(rows.Value().Err());
+            }
+            return false;
+        }
+        return true;
+    }
+    sql += " ORDER BY id DESC LIMIT ? OFFSET ?";
+    auto rows = m_db->Query(sql, pattern, limit, offset);
     if (!rows) {
         if (error != nullptr) {
             *error = "搜索视频失败: " + DescribeError(rows.Err());

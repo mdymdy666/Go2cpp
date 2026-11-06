@@ -53,6 +53,26 @@ std::int64_t NowSeconds() {
     return static_cast<std::int64_t>(std::time(nullptr));
 }
 
+/**
+ * @brief 尝试解析可选的 Bearer token，用于「当前查看者」拉黑过滤。
+ * @param request [in] 原始请求；Authorization 头可为空。
+ * @return 有效 token 的 user_id；无 token / 非法 / 过期一律 0（匿名）。
+ * @note feed 是公开接口，token 无效不应 401；匿名请求因没有身份，无法
+ *       应用个人黑名单（返回全量，与旧行为一致）。
+ */
+std::int64_t ViewerId(const douyin::HttpRequest& request) {
+    const std::string token = douyin::BearerToken(request);
+    if (token.empty()) {
+        return 0;
+    }
+    douyin::TokenInfo info;
+    std::string error;
+    if (!douyin::VerifyToken(token, NowSeconds(), &info, &error)) {
+        return 0;
+    }
+    return info.user_id;
+}
+
 /// @brief 统一错误响应。
 bool Fail(douyin::HttpResponse* response, int status, std::string_view message) {
     response->status = status;
@@ -169,10 +189,13 @@ bool HandleFeed(douyin::Store& store, const douyin::HttpRequest& request,
     }
     const std::int64_t limit = ParseLimit(request);
 
+    // 拉黑过滤（第 3 轮）：带有效 token 时剔除被拉黑作者的视频；
+    // 匿名请求没有身份，保持全量。
+    const std::int64_t viewer = ViewerId(request);
     std::vector<douyin::StoredVideo> videos;
     std::string next_cursor;
     std::string error;
-    if (!store.ListFeed(cursor, limit, &videos, &next_cursor, &error)) {
+    if (!store.ListFeed(cursor, limit, &videos, &next_cursor, &error, viewer)) {
         std::fprintf(stderr, "[%s] 查询推荐流失败: %s\n", kServiceName,
                      error.c_str());
         return Fail(response, 500, "数据库错误");

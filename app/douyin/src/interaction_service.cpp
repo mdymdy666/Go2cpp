@@ -419,6 +419,26 @@ bool HandleLike(douyin::Store& store, const douyin::HttpRequest& request,
         }
         return Fail(response, 404, "视频不存在");
     }
+    // 防骚扰：被视频作者拉黑后不能再点赞；自己拉黑作者时也要先取消。
+    {
+        bool blocked = false;
+        if (!store.IsBlocked(video.user_id, actor, &blocked, &error)) {
+            std::fprintf(stderr, "[%s] 查询拉黑状态失败: %s\n", kServiceName,
+                         error.c_str());
+            return Fail(response, 500, "数据库错误");
+        }
+        if (blocked) {
+            return Fail(response, 403, "对方已把你拉黑");
+        }
+        if (!store.IsBlocked(actor, video.user_id, &blocked, &error)) {
+            std::fprintf(stderr, "[%s] 查询拉黑状态失败: %s\n", kServiceName,
+                         error.c_str());
+            return Fail(response, 500, "数据库错误");
+        }
+        if (blocked) {
+            return Fail(response, 403, "你已拉黑对方，请先取消拉黑");
+        }
+    }
     const int inserted = store.Like(video_id, actor, &error);
     if (inserted < 0) {
         std::fprintf(stderr, "[%s] 点赞失败: %s\n", kServiceName, error.c_str());
@@ -525,6 +545,28 @@ bool HandleComment(douyin::Store& store, const douyin::HttpRequest& request,
         return Fail(response, 404, "视频不存在");
     }
 
+    // step2.5: 防骚扰——被视频作者拉黑后不能再在其视频下评论（403），
+    //          只做展示过滤的话，拉黑等于没拉。
+    {
+        bool blocked = false;
+        if (!store.IsBlocked(video.user_id, actor, &blocked, &error)) {
+            std::fprintf(stderr, "[%s] 查询拉黑状态失败: %s\n", kServiceName,
+                         error.c_str());
+            return Fail(response, 500, "数据库错误");
+        }
+        if (blocked) {
+            return Fail(response, 403, "对方已把你拉黑");
+        }
+        if (!store.IsBlocked(actor, video.user_id, &blocked, &error)) {
+            std::fprintf(stderr, "[%s] 查询拉黑状态失败: %s\n", kServiceName,
+                         error.c_str());
+            return Fail(response, 500, "数据库错误");
+        }
+        if (blocked) {
+            return Fail(response, 403, "你已拉黑对方，请先取消拉黑");
+        }
+    }
+
     // step3: 可选 parent_id——必须是同一视频下的顶层评论；对回复再回复时
     //        提升到它所属的顶层评论，保证只有两级、不产生悬挂链。
     std::int64_t parent_id = 0;
@@ -607,6 +649,27 @@ bool HandleComments(douyin::Store& store, const douyin::HttpRequest& request,
         }
         return Fail(response, 404, "视频不存在");
     }
+    // 拉黑过滤（第 3 轮）：拉黑区里这个作者的视频连同评论区一起不可见，
+    // 与 feed/详情的 404 语义保持一致。
+    const std::int64_t viewer = ViewerId(request);
+    if (viewer > 0) {
+        bool blocked = false;
+        // 双向：viewer 拉黑作者，或作者拉黑 viewer，评论区都不可见。
+        if (!store.IsBlocked(viewer, video.user_id, &blocked, &error)) {
+            std::fprintf(stderr, "[%s] 查询拉黑状态失败: %s\n", kServiceName,
+                         error.c_str());
+            return Fail(response, 500, "数据库错误");
+        }
+        if (!blocked &&
+            !store.IsBlocked(video.user_id, viewer, &blocked, &error)) {
+            std::fprintf(stderr, "[%s] 查询拉黑状态失败: %s\n", kServiceName,
+                         error.c_str());
+            return Fail(response, 500, "数据库错误");
+        }
+        if (blocked) {
+            return Fail(response, 404, "视频不存在");
+        }
+    }
     std::string cursor;
     if (!ReadCursor(request, &cursor)) {
         return Fail(response, 400, "cursor 非法");
@@ -616,7 +679,7 @@ bool HandleComments(douyin::Store& store, const douyin::HttpRequest& request,
     std::vector<douyin::StoredComment> comments;
     std::string next_cursor;
     if (!store.ListComments(video_id, cursor, limit, &comments, &next_cursor,
-                            &error)) {
+                            &error, viewer)) {
         if (error == "cursor 非法") {
             return Fail(response, 400, "cursor 非法");
         }
@@ -632,7 +695,8 @@ bool HandleComments(douyin::Store& store, const douyin::HttpRequest& request,
     spans.reserve(comments.size());
     for (std::size_t i = 0; i < comments.size(); ++i) {
         std::vector<douyin::StoredComment> replies;
-        if (!store.ListReplies(video_id, comments[i].id, 50, &replies, &error)) {
+        if (!store.ListReplies(video_id, comments[i].id, 50, &replies, &error,
+                               viewer)) {
             std::fprintf(stderr, "[%s] 查询回复失败: %s\n", kServiceName,
                          error.c_str());
             replies.clear();
@@ -644,7 +708,6 @@ bool HandleComments(douyin::Store& store, const douyin::HttpRequest& request,
         spans.emplace_back(begin, all_replies.size());
     }
     // 回填失败只记日志、不阻断：点赞数缺失不该让整页评论 500。
-    const std::int64_t viewer = ViewerId(request);
     if (!store.FillCommentLikes(viewer, &comments, &error)) {
         std::fprintf(stderr, "[%s] 回填评论点赞失败: %s\n", kServiceName,
                      error.c_str());
@@ -749,6 +812,130 @@ bool HandleCommentLike(douyin::Store& store, const douyin::HttpRequest& request,
     response->body = std::string("{\"ok\":true,\"liked\":") +
                      (like ? "true" : "false") + ",\"like_count\":" +
                      std::to_string(one[0].like_count) + "}";
+    return true;
+}
+
+/**
+ * @brief 单条举报序列化为 JSON。
+ * @param item [in] 存储层一行；文本字段全部转义。
+ * @return 单行 JSON 对象。
+ */
+std::string ReportJson(const douyin::StoredReport& item) {
+    return std::string("{\"id\":") + std::to_string(item.id) +
+           ",\"reporter_id\":" + std::to_string(item.reporter_id) +
+           ",\"target_type\":\"" + douyin::JsonEscape(item.target_type) +
+           "\",\"target_id\":" + std::to_string(item.target_id) +
+           ",\"reason\":\"" + douyin::JsonEscape(item.reason) +
+           "\",\"detail\":\"" + douyin::JsonEscape(item.detail) +
+           "\",\"status\":\"" + douyin::JsonEscape(item.status) +
+           "\",\"created_at\":" + std::to_string(item.created_at) + "}";
+}
+
+/**
+ * @brief 举报：`POST /api/report`，body `{target_type,target_id,reason,detail}`。
+ *
+ * @param store [in,out] 已打开的存储；借用。
+ * @param request [in] 原始请求；必须带有效 Bearer token。
+ * @param response [out] 成功写 `{ok,duplicate,report}`；失败写统一错误体。
+ * @return 恒为 true（已处理）。
+ *
+ * ## 定位
+ * 举报的唯一入口。错了会怎样：重复举报刷爆运营表，或举报指向不存在的
+ * 目标/自己的内容。
+ *
+ * ## 步骤
+ * step1. 鉴权——举报必须实名登录，匿名 401。
+ * step2. 校验 target_type / target_id / reason / detail 长度。
+ * step3. 确认目标存在（不存在 404），并拒绝「举报自己」（400）。
+ * step4. 写库：首次 201；唯一键冲突返回已有记录 200 + duplicate=true。
+ */
+bool HandleReport(douyin::Store& store, const douyin::HttpRequest& request,
+                  douyin::HttpResponse* response) {
+    // step1: 鉴权。
+    std::int64_t actor = 0;
+    if (!RequireToken(request, response, &actor)) {
+        return true;
+    }
+    // step2: 字段校验（长度按 UTF-8 码点，不按字节）。
+    std::string target_type;
+    if (!douyin::JsonStringField(request.body, "target_type", &target_type) ||
+        (target_type != "video" && target_type != "comment" &&
+         target_type != "user")) {
+        return Fail(response, 400, "target_type 非法（video/comment/user）");
+    }
+    std::int64_t target_id = 0;
+    if (!JsonIntField(request.body, "target_id", &target_id) || target_id <= 0) {
+        return Fail(response, 400, "target_id 非法");
+    }
+    std::string reason;
+    if (!douyin::JsonStringField(request.body, "reason", &reason) ||
+        IsBlank(reason)) {
+        return Fail(response, 400, "reason 不能为空");
+    }
+    if (Utf8Length(reason) > 50) {
+        return Fail(response, 400, "reason 超过 50 字");
+    }
+    std::string detail;
+    if (douyin::JsonStringField(request.body, "detail", &detail) &&
+        Utf8Length(detail) > 500) {
+        return Fail(response, 400, "detail 超过 500 字");
+    }
+    // step3: 目标存在性 + 不能举报自己（自己的视频/评论/账号都不行）。
+    std::string error;
+    if (target_type == "video") {
+        douyin::StoredVideo video;
+        if (!store.FindVideo(target_id, &video, &error)) {
+            if (!error.empty()) {
+                std::fprintf(stderr, "[%s] 查询举报目标失败: %s\n", kServiceName,
+                             error.c_str());
+                return Fail(response, 500, "数据库错误");
+            }
+            return Fail(response, 404, "视频不存在");
+        }
+        if (video.user_id == actor) {
+            return Fail(response, 400, "不能举报自己");
+        }
+    } else if (target_type == "comment") {
+        douyin::StoredComment comment;
+        if (!store.FindComment(target_id, &comment, &error)) {
+            if (!error.empty()) {
+                std::fprintf(stderr, "[%s] 查询举报目标失败: %s\n", kServiceName,
+                             error.c_str());
+                return Fail(response, 500, "数据库错误");
+            }
+            return Fail(response, 404, "评论不存在");
+        }
+        if (comment.user_id == actor) {
+            return Fail(response, 400, "不能举报自己");
+        }
+    } else {
+        douyin::StoredUser target;
+        if (!store.FindUserById(target_id, &target, &error)) {
+            if (!error.empty()) {
+                std::fprintf(stderr, "[%s] 查询举报目标失败: %s\n", kServiceName,
+                             error.c_str());
+                return Fail(response, 500, "数据库错误");
+            }
+            return Fail(response, 404, "用户不存在");
+        }
+        if (target_id == actor) {
+            return Fail(response, 400, "不能举报自己");
+        }
+    }
+    // step4: 写库。写前清空 ORM 语句缓存，避免读游标残留导致 BUSY_SNAPSHOT。
+    store.ResetStatements();
+    douyin::StoredReport report;
+    const douyin::Store::ReportResult result = store.AddReport(
+        actor, target_type, target_id, reason, detail, &report, &error);
+    if (result == douyin::Store::ReportResult::kError) {
+        std::fprintf(stderr, "[%s] 写举报失败: %s\n", kServiceName, error.c_str());
+        return Fail(response, 500, "数据库错误");
+    }
+    const bool duplicate = result == douyin::Store::ReportResult::kDuplicate;
+    response->status = duplicate ? 200 : 201;
+    response->body = std::string("{\"ok\":true,\"duplicate\":") +
+                     (duplicate ? "true" : "false") + ",\"report\":" +
+                     ReportJson(report) + "}";
     return true;
 }
 
@@ -926,6 +1113,9 @@ bool HandleNotificationsRead(douyin::Store& store,
 bool Handle(douyin::Store& store, const douyin::HttpRequest& request,
             douyin::HttpResponse* response) {
     ++g_metrics.requests;
+    // 请求边界上不应存在未提交事务：清一次 ORM 语句缓存，避免上一请求
+    // 残留的读游标把本连接钉在旧 WAL 快照上（实测：拉黑后通知/评论仍见旧数据）。
+    store.ResetStatements();
     if (request.method == "GET" && request.path == "/health") {
         response->status = 200;
         response->body = std::string("{\"ok\":true,\"service\":\"") +
@@ -946,6 +1136,12 @@ bool Handle(douyin::Store& store, const douyin::HttpRequest& request,
         }
         if (request.method == "DELETE") {
             return HandleUnlike(store, request, response);
+        }
+        return Fail(response, 405, "方法不允许");
+    }
+    if (request.path == "/api/report") {
+        if (request.method == "POST") {
+            return HandleReport(store, request, response);
         }
         return Fail(response, 405, "方法不允许");
     }

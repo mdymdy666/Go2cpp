@@ -19,6 +19,7 @@
  * @copyright MIT License
  */
 
+#include "douyin_auth.hpp"
 #include "douyin_http.hpp"
 #include "douyin_proto.hpp"
 #include "douyin_store.hpp"
@@ -30,6 +31,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <ctime>
 #include <cstdlib>
 #include <filesystem>
 #include <string>
@@ -50,6 +52,30 @@ struct ServiceMetrics {
 };
 
 ServiceMetrics g_metrics;
+
+/// @brief 当前 Unix 秒（token 过期校验用）。
+std::int64_t NowSeconds() {
+    return static_cast<std::int64_t>(std::time(nullptr));
+}
+
+/**
+ * @brief 尝试解析可选的 Bearer token，用于「当前查看者」拉黑过滤。
+ * @param request [in] 原始请求；Authorization 头可为空。
+ * @return 有效 token 的 user_id；无 token / 非法 / 过期一律 0（匿名）。
+ * @note 搜索是公开接口，token 无效不应 401；匿名请求无法应用个人黑名单。
+ */
+std::int64_t ViewerId(const douyin::HttpRequest& request) {
+    const std::string token = douyin::BearerToken(request);
+    if (token.empty()) {
+        return 0;
+    }
+    douyin::TokenInfo info;
+    std::string error;
+    if (!douyin::VerifyToken(token, NowSeconds(), &info, &error)) {
+        return 0;
+    }
+    return info.user_id;
+}
 
 /// @brief 统一错误响应。
 bool Fail(douyin::HttpResponse* response, int status, std::string_view message) {
@@ -220,6 +246,8 @@ bool HandleSearch(douyin::Store& store, const douyin::HttpRequest& request,
         return Fail(response, 400, "cursor 非法");
     }
     const std::int64_t limit = ParseLimit(request);
+    // 拉黑过滤：搜索用户/视频都要剔除被拉黑者（带 token 时）。
+    const std::int64_t viewer = ViewerId(request);
 
     std::string error;
     std::vector<ResultItem> items;
@@ -231,7 +259,8 @@ bool HandleSearch(douyin::Store& store, const douyin::HttpRequest& request,
         const std::int64_t want = limit + 1;
         if (type == "user") {
             std::vector<douyin::StoredUser> users;
-            if (!store.SearchUsers(query, want, offset, &users, &error)) {
+            if (!store.SearchUsers(query, want, offset, &users, &error,
+                                   viewer)) {
                 std::fprintf(stderr, "[%s] 搜索用户失败: %s\n", kServiceName,
                              error.c_str());
                 return Fail(response, 500, "数据库错误");
@@ -245,7 +274,8 @@ bool HandleSearch(douyin::Store& store, const douyin::HttpRequest& request,
             }
         } else {
             std::vector<douyin::StoredVideo> videos;
-            if (!store.SearchVideos(query, want, offset, &videos, &error)) {
+            if (!store.SearchVideos(query, want, offset, &videos, &error,
+                                    viewer)) {
                 std::fprintf(stderr, "[%s] 搜索视频失败: %s\n", kServiceName,
                              error.c_str());
                 return Fail(response, 500, "数据库错误");
@@ -263,12 +293,12 @@ bool HandleSearch(douyin::Store& store, const douyin::HttpRequest& request,
         const std::int64_t span = offset + limit + 1;
         std::vector<douyin::StoredUser> users;
         std::vector<douyin::StoredVideo> videos;
-        if (!store.SearchUsers(query, span, 0, &users, &error)) {
+        if (!store.SearchUsers(query, span, 0, &users, &error, viewer)) {
             std::fprintf(stderr, "[%s] 搜索用户失败: %s\n", kServiceName,
                          error.c_str());
             return Fail(response, 500, "数据库错误");
         }
-        if (!store.SearchVideos(query, span, 0, &videos, &error)) {
+        if (!store.SearchVideos(query, span, 0, &videos, &error, viewer)) {
             std::fprintf(stderr, "[%s] 搜索视频失败: %s\n", kServiceName,
                          error.c_str());
             return Fail(response, 500, "数据库错误");
@@ -301,14 +331,16 @@ bool HandleSearch(douyin::Store& store, const douyin::HttpRequest& request,
     std::vector<douyin::StoredVideo> facet_videos;
     std::vector<TagItem> facet_tags;
     if (type == "user" || type == "all") {
-        if (!store.SearchUsers(query, kFacetLimit, 0, &facet_users, &error)) {
+        if (!store.SearchUsers(query, kFacetLimit, 0, &facet_users, &error,
+                               viewer)) {
             std::fprintf(stderr, "[%s] 搜索用户失败: %s\n", kServiceName,
                          error.c_str());
             return Fail(response, 500, "数据库错误");
         }
     }
     if (type == "video" || type == "all") {
-        if (!store.SearchVideos(query, kFacetLimit, 0, &facet_videos, &error)) {
+        if (!store.SearchVideos(query, kFacetLimit, 0, &facet_videos, &error,
+                                viewer)) {
             std::fprintf(stderr, "[%s] 搜索视频失败: %s\n", kServiceName,
                          error.c_str());
             return Fail(response, 500, "数据库错误");

@@ -345,6 +345,58 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     color: var(--text); background: #23232e; border-radius: 12px;
   }
 
+  /* ---------- 举报 / 拉黑 / 黑名单（第 3 轮） ---------- */
+  .menu-list { display: flex; flex-direction: column; gap: 8px; }
+  .menu-item {
+    padding: 12px 14px; font-size: 13.5px; color: var(--text);
+    background: #1b1b25; border: 1px solid var(--line); border-radius: 12px;
+    text-align: left;
+  }
+  .menu-item:hover { border-color: rgba(255, 255, 255, .24); }
+  .menu-item.danger { color: #ff8fa3; border-color: rgba(254, 44, 85, .35); }
+  .report-reasons { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+  .reason {
+    padding: 7px 12px; font-size: 12.5px; color: var(--muted);
+    background: #1b1b25; border: 1px solid var(--line); border-radius: 999px;
+  }
+  .reason.on {
+    color: #fff; border-color: rgba(254, 44, 85, .7);
+    background: rgba(254, 44, 85, .16);
+  }
+  .report-detail {
+    width: 100%; min-height: 76px; resize: vertical; padding: 10px 12px;
+    background: #1e1e29; color: var(--text); border: 1px solid var(--line);
+    border-radius: 10px; font: inherit; font-size: 13px; outline: none;
+  }
+  .report-detail:focus { border-color: rgba(254, 44, 85, .55); }
+  .report-submit {
+    width: 100%; margin-top: 12px; padding: 11px; font-size: 13.5px;
+    border-radius: 12px;
+  }
+  .block-row {
+    display: flex; align-items: center; gap: 11px;
+    padding: 12px 4px; border-bottom: 1px solid var(--line);
+  }
+  .block-row .avatar { width: 38px; height: 38px; font-size: 16px; }
+  .block-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+  .block-info b {
+    font-size: 13.5px; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .block-info span { font-size: 11.5px; color: var(--muted); }
+  .block-unblock {
+    padding: 6px 12px; font-size: 12px; color: var(--text);
+    background: #23232e; border: 1px solid var(--line); border-radius: 999px;
+    white-space: nowrap;
+  }
+  .block-unblock:hover { border-color: rgba(254, 44, 85, .5); color: #ff8fa3; }
+  .cp-more-btn {
+    margin-left: 8px; padding: 0 6px; font-size: 13px; line-height: 1;
+    color: var(--muted); background: transparent; border-radius: 6px;
+  }
+  .cp-more-btn:hover { color: var(--text); background: rgba(255, 255, 255, .08); }
+  .p-more-btn { padding: 7px 12px; font-size: 13px; }
+
   /* ---------- toast ---------- */
   .toast {
     position: fixed; left: 50%; top: 74px; z-index: 90;
@@ -736,6 +788,8 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     <button class="bell" id="notifBtn" type="button" title="消息通知"
             aria-label="消息通知" style="display:none">🔔<span class="bell-badge"
             id="notifBadge" hidden>0</span></button>
+    <button class="btn-ghost" id="blacklistBtn" type="button" title="黑名单管理"
+            style="display:none">🚫 黑名单</button>
     <span class="who" id="who" title="点击进入我的主页"><span class="dot"></span><b id="whoName"></b></span>
     <input class="login-only" id="email" type="email" value="admin@demo.local"
            placeholder="邮箱" autocomplete="username" spellcheck="false">
@@ -804,6 +858,47 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
   </div>
   <div class="cp-list" id="notifList"><div class="cp-empty">加载中…</div></div>
   <button class="notif-more" id="notifMore" type="button" hidden>加载更多</button>
+</aside>
+
+<div class="share-mask" id="menuMask" hidden></div>
+<div class="share-sheet" id="menuSheet" hidden role="dialog" aria-modal="true" aria-label="更多操作">
+  <div class="ss-head">
+    <b id="menuTitle">更多操作</b>
+    <button class="ss-close" id="menuClose" type="button" aria-label="关闭菜单">✕</button>
+  </div>
+  <div class="menu-list" id="menuList"></div>
+  <button class="ss-cancel" id="menuCancel" type="button">取消</button>
+</div>
+
+<div class="share-mask" id="reportMask" hidden></div>
+<div class="share-sheet" id="reportModal" hidden role="dialog" aria-modal="true" aria-label="举报">
+  <div class="ss-head">
+    <b id="reportTitle">举报</b>
+    <button class="ss-close" id="reportClose" type="button" aria-label="关闭举报">✕</button>
+  </div>
+  <div class="report-reasons" id="reportReasons">
+    <button class="reason on" data-reason="广告营销" type="button">广告营销</button>
+    <button class="reason" data-reason="色情低俗" type="button">色情低俗</button>
+    <button class="reason" data-reason="人身攻击" type="button">人身攻击</button>
+    <button class="reason" data-reason="谣言不实" type="button">谣言不实</button>
+    <button class="reason" data-reason="违法违规" type="button">违法违规</button>
+    <button class="reason" data-reason="其它" type="button">其它</button>
+  </div>
+  <textarea class="report-detail" id="reportDetail" maxlength="500"
+            placeholder="补充说明（选填，最多 500 字）"></textarea>
+  <button class="btn-primary report-submit" id="reportSubmit" type="button">提交举报</button>
+  <button class="ss-cancel" id="reportCancel" type="button">取消</button>
+</div>
+
+<aside class="notif-panel" id="blockPanel" aria-label="黑名单管理" aria-hidden="true">
+  <div class="cp-head">
+    <div class="cp-titles">
+      <b>黑名单管理</b>
+      <span id="blockSub">0 人</span>
+    </div>
+    <button class="cp-close" id="blockClose" type="button" aria-label="关闭黑名单">✕</button>
+  </div>
+  <div class="cp-list" id="blockList"><div class="cp-empty">加载中…</div></div>
 </aside>
 
 <section class="profile-view" id="profileView" hidden aria-label="用户主页">
@@ -1024,12 +1119,15 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     if (favBtn) favBtn.style.display = isIn ? '' : 'none';
     var notifBtn = document.getElementById('notifBtn');
     if (notifBtn) notifBtn.style.display = isIn ? '' : 'none';
+    var blacklistBtn = document.getElementById('blacklistBtn');
+    if (blacklistBtn) blacklistBtn.style.display = isIn ? '' : 'none';
     if (isIn) {
       refreshUnreadNotifications();
     } else {
       notifState.unread = 0;
       paintNotifBadge();
       closeNotifications();
+      closeBlacklist();
     }
     loadFavorites();
   }
@@ -1182,6 +1280,13 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     replyBtn.addEventListener('click', function () { openReplyForm(row, c); });
     who.appendChild(replyBtn);
     who.appendChild(commentLikeButton(c));
+    var cmtMore = document.createElement('button');
+    cmtMore.type = 'button';
+    cmtMore.className = 'cp-more-btn';
+    cmtMore.textContent = '⋯';
+    cmtMore.title = '举报 / 拉黑';
+    cmtMore.addEventListener('click', function () { openCommentMenu(c); });
+    who.appendChild(cmtMore);
 
     var txt = document.createElement('div');
     txt.className = 'cp-txt';
@@ -1265,6 +1370,13 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
       who.appendChild(b);
       who.appendChild(document.createTextNode(' · ' + fmtTime(r.created_at)));
       who.appendChild(commentLikeButton(r));
+      var replyMore = document.createElement('button');
+      replyMore.type = 'button';
+      replyMore.className = 'cp-more-btn';
+      replyMore.textContent = '⋯';
+      replyMore.title = '举报 / 拉黑';
+      replyMore.addEventListener('click', function () { openCommentMenu(r); });
+      who.appendChild(replyMore);
       var t = document.createElement('div');
       t.className = 'cp-txt';
       t.textContent = r.content || '';
@@ -2374,11 +2486,22 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
       openShare(id, v.title);
     });
 
+    var moreBtn = document.createElement('button');
+    moreBtn.type = 'button';
+    moreBtn.className = 'more-btn';
+    moreBtn.innerHTML = '<span class="ico">⋯</span><span>更多</span>';
+    moreBtn.title = '举报 / 拉黑';
+    moreBtn.addEventListener('click', function (e) {
+      e.stopPropagation();
+      openVideoMenu(v, name);
+    });
+
     rail.appendChild(railAvatar);
     rail.appendChild(likeBtn);
     rail.appendChild(favBtn);
     rail.appendChild(cmtBtn);
     rail.appendChild(shareBtn);
+    rail.appendChild(moreBtn);
 
     var openProfile = function (e) {
       e.stopPropagation();
@@ -2751,6 +2874,252 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     }
   }
 
+  /* ---------- 举报 / 拉黑 / 黑名单（第 3 轮） ---------- */
+
+  var menuMaskEl = document.getElementById('menuMask');
+  var menuSheetEl = document.getElementById('menuSheet');
+  var menuTitleEl = document.getElementById('menuTitle');
+  var menuListEl = document.getElementById('menuList');
+  var reportMaskEl = document.getElementById('reportMask');
+  var reportModalEl = document.getElementById('reportModal');
+  var reportTitleEl = document.getElementById('reportTitle');
+  var reportReasonsEl = document.getElementById('reportReasons');
+  var reportDetailEl = document.getElementById('reportDetail');
+  var reportSubmitEl = document.getElementById('reportSubmit');
+  var blockPanelEl = document.getElementById('blockPanel');
+  var blockListEl = document.getElementById('blockList');
+  var blockSubEl = document.getElementById('blockSub');
+  var reportState = { type: '', id: '', reason: '广告营销', busy: false };
+
+  /* 底部动作菜单：item = {label, danger, fn}。同一时间只开一个。 */
+  function openMenu(title, items) {
+    menuTitleEl.textContent = title || '更多操作';
+    menuListEl.innerHTML = '';
+    (items || []).forEach(function (it) {
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'menu-item' + (it.danger ? ' danger' : '');
+      btn.textContent = it.label;
+      btn.addEventListener('click', function () {
+        closeMenu();
+        if (typeof it.fn === 'function') it.fn();
+      });
+      menuListEl.appendChild(btn);
+    });
+    menuMaskEl.hidden = false;
+    menuSheetEl.hidden = false;
+  }
+
+  function closeMenu() {
+    menuMaskEl.hidden = true;
+    menuSheetEl.hidden = true;
+  }
+
+  /* 举报弹窗：默认选中「广告营销」，切换原因即更新状态。 */
+  function openReport(targetType, targetId, label) {
+    if (!state.token) { toast('请先登录再举报', 'err'); return; }
+    reportState.type = targetType;
+    reportState.id = String(targetId || '');
+    reportState.reason = '广告营销';
+    reportState.busy = false;
+    reportTitleEl.textContent = '举报' + (label ? '「' + label + '」' : '');
+    reportDetailEl.value = '';
+    var btns = reportReasonsEl.querySelectorAll('.reason');
+    for (var i = 0; i < btns.length; i++) {
+      btns[i].classList.toggle('on', btns[i].dataset.reason === reportState.reason);
+    }
+    reportMaskEl.hidden = false;
+    reportModalEl.hidden = false;
+  }
+
+  function closeReport() {
+    reportMaskEl.hidden = true;
+    reportModalEl.hidden = true;
+    reportState.busy = false;
+    reportSubmitEl.disabled = false;
+  }
+
+  function submitReport() {
+    if (reportState.busy || !reportState.type || !reportState.id) return;
+    reportState.busy = true;
+    reportSubmitEl.disabled = true;
+    api('api/report', {
+      method: 'POST',
+      body: {
+        target_type: reportState.type,
+        target_id: Number(reportState.id),
+        reason: reportState.reason,
+        detail: (reportDetailEl.value || '').trim()
+      }
+    }).then(function (data) {
+      closeReport();
+      toast(data && data.duplicate
+        ? '你已经举报过这条内容，无需重复提交'
+        : '举报已提交，我们会尽快处理', 'ok');
+    }).catch(function (err) {
+      if (!handleAuthError(err)) {
+        toast('举报失败：' + (err.message || '网络错误'), 'err');
+      }
+    }).then(function () {
+      reportState.busy = false;
+      reportSubmitEl.disabled = false;
+    });
+  }
+
+  /* 拉黑后立刻从本地列表剔除该作者内容；服务端过滤是下一屏的兜底。 */
+  function purgeUserContent(userId) {
+    var uid = String(userId);
+    if (state.panelSlide) {
+      var current = state.items[Number(state.panelSlide.dataset.index)] || {};
+      if (String((current.video || {}).user_id) === uid) closeComments();
+    }
+    var before = state.items.length;
+    state.items = state.items.filter(function (item) {
+      return String((item.video || {}).user_id) !== uid;
+    });
+    if (state.items.length !== before) renderFeed();
+    if (state.profileUserId === uid) hideProfile();
+    if (searchState.data && searchState.data.users) {
+      searchState.data.users = searchState.data.users.filter(function (u) {
+        return String(u.id) !== uid;
+      });
+      renderSearchResults();
+    }
+  }
+
+  /* 拉黑 / 取消拉黑：成功后刷新 feed 与黑名单面板。 */
+  function toggleBlock(userId, name, block) {
+    if (!state.token) {
+      toast('请先登录再拉黑', 'err');
+      return Promise.reject(new Error('未登录'));
+    }
+    var uid = String(userId || '');
+    if (!uid || uid === '0') {
+      toast('用户信息缺失', 'err');
+      return Promise.reject(new Error('用户信息缺失'));
+    }
+    return api('api/user/' + uid + '/block', { method: block ? 'POST' : 'DELETE' })
+      .then(function (data) {
+        if (block) {
+          toast('已拉黑 @' + (name || uid) + '，相关内容已隐藏', 'ok');
+          purgeUserContent(uid);
+        } else {
+          toast('已取消拉黑 @' + (name || uid), 'ok');
+          loadFeed();
+        }
+        loadBlacklist();
+        return data;
+      })
+      .catch(function (err) {
+        if (!handleAuthError(err)) {
+          toast((block ? '拉黑' : '取消拉黑') + '失败：' +
+            (err.message || '网络错误'), 'err');
+        }
+        throw err;
+      });
+  }
+
+  function openBlacklist() {
+    if (!state.token) { toast('请先登录', 'err'); return; }
+    closeNotifications();
+    blockPanelEl.classList.add('open');
+    blockPanelEl.setAttribute('aria-hidden', 'false');
+    loadBlacklist();
+  }
+
+  function closeBlacklist() {
+    blockPanelEl.classList.remove('open');
+    blockPanelEl.setAttribute('aria-hidden', 'true');
+  }
+
+  function loadBlacklist() {
+    if (!state.token) return;
+    api('api/user/blocks').then(function (data) {
+      renderBlacklist(data.items || []);
+    }).catch(function (err) {
+      if (!handleAuthError(err)) {
+        blockListEl.innerHTML = '<div class="cp-empty">黑名单加载失败：' +
+          (err.message || '网络错误') + '</div>';
+      }
+    });
+  }
+
+  function renderBlacklist(items) {
+    blockSubEl.textContent = items.length + ' 人';
+    blockListEl.innerHTML = '';
+    if (!items.length) {
+      blockListEl.innerHTML = '<div class="cp-empty">还没有拉黑任何人</div>';
+      return;
+    }
+    items.forEach(function (it) {
+      var row = document.createElement('div');
+      row.className = 'block-row';
+      var avatar = document.createElement('span');
+      avatar.className = 'avatar';
+      avatar.textContent = initial(it.blocked_name || ('用户' + it.blocked_id));
+      var info = document.createElement('div');
+      info.className = 'block-info';
+      var b = document.createElement('b');
+      b.textContent = '@' + (it.blocked_name || ('用户 #' + it.blocked_id));
+      var t = document.createElement('span');
+      t.textContent = '拉黑于 ' + fmtTime(it.created_at);
+      info.appendChild(b);
+      info.appendChild(t);
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'block-unblock';
+      btn.textContent = '取消拉黑';
+      btn.addEventListener('click', function () {
+        toggleBlock(it.blocked_id, it.blocked_name, false);
+      });
+      row.appendChild(avatar);
+      row.appendChild(info);
+      row.appendChild(btn);
+      blockListEl.appendChild(row);
+    });
+  }
+
+  /* 视频操作栏「⋯」：举报视频 / 拉黑作者。 */
+  function openVideoMenu(v, name) {
+    var uid = String(v.user_id || '');
+    var items = [{
+      label: '举报视频',
+      fn: function () { openReport('video', v.id, v.title || ('视频 #' + v.id)); }
+    }];
+    if (uid && (!state.user || String(state.user.id) !== uid)) {
+      items.push({
+        label: '拉黑作者 @' + (name || ('用户 #' + uid)),
+        danger: true,
+        fn: function () { toggleBlock(uid, name || ('用户 #' + uid), true); }
+      });
+    }
+    openMenu('视频操作', items);
+  }
+
+  /* 评论「⋯」：举报评论 / 拉黑评论作者。 */
+  function openCommentMenu(c) {
+    var uid = String(c.user_id || '');
+    var slide = state.panelSlide;
+    var items = [{
+      label: '举报评论',
+      fn: function () { openReport('comment', c.id, '评论'); }
+    }];
+    if (uid && (!state.user || String(state.user.id) !== uid)) {
+      items.push({
+        label: '拉黑 @用户 #' + uid,
+        danger: true,
+        fn: function () {
+          toggleBlock(uid, '用户 #' + uid, true).then(function () {
+            // 拉黑可能触发 feed 重渲染（评论者也有作品时），旧 slide 会脱离
+            // DOM；此时不再重开评论区，避免索引错位打开错误视频。
+            if (slide && slide.parentNode) openComments(slide);
+          }).catch(function () { /* 失败已 toast */ });
+        }
+      });
+    }
+    openMenu('评论操作', items);
+  }
+
   /* ---------- 用户主页 ---------- */
 
   function renderProfile(user, isFollowing) {
@@ -2810,6 +3179,26 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
         toggleFollow(user, followBtn, stats);
       });
       actions.appendChild(followBtn);
+      var profileMore = document.createElement('button');
+      profileMore.type = 'button';
+      profileMore.className = 'btn-ghost p-more-btn';
+      profileMore.textContent = '⋯';
+      profileMore.title = '举报 / 拉黑';
+      profileMore.addEventListener('click', function () {
+        openMenu('用户操作', [{
+          label: '举报该用户',
+          fn: function () { openReport('user', user.id, name); }
+        }, {
+          label: user.is_blocked ? '取消拉黑' : '拉黑该用户',
+          danger: !user.is_blocked,
+          fn: function () {
+            toggleBlock(user.id, name, !user.is_blocked).then(function () {
+              showProfile(user.id, name);
+            }).catch(function () { /* 失败已 toast */ });
+          }
+        }]);
+      });
+      actions.appendChild(profileMore);
       info.appendChild(actions);
     }
 
@@ -2826,6 +3215,22 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     profileBody.appendChild(note);
 
     var uid = String(user.id);
+    /* 拉黑后主页只显示「已拉黑」和取消入口，不再请求视频列表——否则
+       拉黑等于只挡住 feed，从主页还能绕进去。 */
+    if (!self && user.is_blocked) {
+      note.textContent = '你已拉黑该用户，TA 的视频不会展示';
+      var unblockBtn = document.createElement('button');
+      unblockBtn.type = 'button';
+      unblockBtn.className = 'btn-primary';
+      unblockBtn.textContent = '取消拉黑';
+      unblockBtn.addEventListener('click', function () {
+        toggleBlock(uid, name, false).then(function () {
+          showProfile(uid, name);
+        }).catch(function () { /* 失败已 toast */ });
+      });
+      profileBody.appendChild(unblockBtn);
+      return;
+    }
     /* 自己的主页走 /api/video/mine（只取自己的，不受 feed 热度排序影响）；
        别人的主页仍走 feed 过滤，与既有数据路径兼容。 */
     var source = self ? api('api/video/mine?limit=30') : api('api/feed?limit=100');
@@ -2943,6 +3348,25 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
 
   /* ---------- 事件绑定与启动 ---------- */
 
+  document.getElementById('blacklistBtn').addEventListener('click', openBlacklist);
+  document.getElementById('blockClose').addEventListener('click', closeBlacklist);
+  document.getElementById('menuClose').addEventListener('click', closeMenu);
+  document.getElementById('menuCancel').addEventListener('click', closeMenu);
+  document.getElementById('reportClose').addEventListener('click', closeReport);
+  document.getElementById('reportCancel').addEventListener('click', closeReport);
+  document.getElementById('reportSubmit').addEventListener('click', submitReport);
+  menuMaskEl.addEventListener('click', closeMenu);
+  reportMaskEl.addEventListener('click', closeReport);
+  reportReasonsEl.addEventListener('click', function (e) {
+    var btn = e.target && e.target.closest ? e.target.closest('.reason') : null;
+    if (!btn) return;
+    reportState.reason = btn.dataset.reason || '其它';
+    var all = reportReasonsEl.querySelectorAll('.reason');
+    for (var i = 0; i < all.length; i++) {
+      all[i].classList.toggle('on', all[i] === btn);
+    }
+  });
+
   document.getElementById('loginBtn').addEventListener('click', login);
   document.getElementById('uploadBtn').addEventListener('click', function () {
     if (!state.token) { toast('请先登录', 'err'); return; }
@@ -3038,6 +3462,9 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
   });
   document.addEventListener('keydown', function (e) {
     if (e.key !== 'Escape') return;
+    if (!reportModalEl.hidden) { closeReport(); return; }
+    if (!menuSheetEl.hidden) { closeMenu(); return; }
+    if (blockPanelEl.classList.contains('open')) { closeBlacklist(); return; }
     if (!shareSheet.hidden) { closeShare(); return; }
     if (!favViewEl.hidden) { hideFavorites(); return; }
     if (!tagEl.hidden) { hideTagView(); return; }

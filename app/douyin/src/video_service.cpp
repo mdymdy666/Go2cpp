@@ -172,6 +172,26 @@ bool RequireToken(const douyin::HttpRequest& request, douyin::HttpResponse* resp
     return true;
 }
 
+/**
+ * @brief 尝试解析可选的 Bearer token，用于「当前查看者」拉黑过滤。
+ * @param request [in] 原始请求；Authorization 头可为空。
+ * @return 有效 token 的 user_id；无 token / 非法 / 过期一律 0（匿名）。
+ * @note 视频详情/话题页是公开接口，token 无效不应 401；匿名请求无法
+ *       应用个人黑名单。
+ */
+std::int64_t ViewerId(const douyin::HttpRequest& request) {
+    const std::string token = douyin::BearerToken(request);
+    if (token.empty()) {
+        return 0;
+    }
+    douyin::TokenInfo info;
+    std::string error;
+    if (!douyin::VerifyToken(token, NowSeconds(), &info, &error)) {
+        return 0;
+    }
+    return info.user_id;
+}
+
 /// @brief 生成 UUID v4 文本（36 字符，小写）；上传会话 id 用它防止被枚举。
 std::string NewUuidV4() {
     static std::mt19937_64 engine([] {
@@ -961,9 +981,9 @@ bool HandleUploadStatus(douyin::Store& store, const douyin::HttpRequest& request
     return true;
 }
 
-/// @brief 视频详情（附作者名）。
-bool HandleDetail(douyin::Store& store, std::int64_t id,
-                  douyin::HttpResponse* response) {
+/// @brief 视频详情（附作者名）；被作者拉黑时按 404 隐藏。
+bool HandleDetail(douyin::Store& store, const douyin::HttpRequest& request,
+                  std::int64_t id, douyin::HttpResponse* response) {
     douyin::StoredVideo stored;
     std::string error;
     if (!store.FindVideo(id, &stored, &error)) {
@@ -973,6 +993,28 @@ bool HandleDetail(douyin::Store& store, std::int64_t id,
             return Fail(response, 500, "数据库错误");
         }
         return Fail(response, 404, "视频不存在");
+    }
+    // 拉黑过滤（第 3 轮）：拉黑区里的视频详情一律 404，不暴露「被屏蔽」，
+    // 与 feed/评论列表保持一致。
+    const std::int64_t viewer = ViewerId(request);
+    if (viewer > 0) {
+        bool blocked = false;
+        // 双向：viewer 拉黑作者（内容过滤）或作者拉黑 viewer（防骚扰），
+        // 两种情况下视频都对 viewer 不可见。
+        if (!store.IsBlocked(viewer, stored.user_id, &blocked, &error)) {
+            std::fprintf(stderr, "[%s] 查询拉黑状态失败: %s\n", kServiceName,
+                         error.c_str());
+            return Fail(response, 500, "数据库错误");
+        }
+        if (!blocked &&
+            !store.IsBlocked(stored.user_id, viewer, &blocked, &error)) {
+            std::fprintf(stderr, "[%s] 查询拉黑状态失败: %s\n", kServiceName,
+                         error.c_str());
+            return Fail(response, 500, "数据库错误");
+        }
+        if (blocked) {
+            return Fail(response, 404, "视频不存在");
+        }
     }
 
     std::string author;
@@ -1390,9 +1432,27 @@ bool HandleTagDetail(douyin::Store& store, std::string_view raw_tag,
                      error.c_str());
         return Fail(response, 500, "数据库错误");
     }
+    // 拉黑过滤：话题页也是内容列表，被拉黑作者的视频同样不出现。
+    std::vector<std::int64_t> blocked_ids;
+    const std::int64_t viewer = ViewerId(request);
+    if (viewer > 0) {
+        std::vector<douyin::StoredBlock> blocks;
+        if (!store.ListBlocks(viewer, &blocks, &error)) {
+            std::fprintf(stderr, "[%s] 查询黑名单失败: %s\n", kServiceName,
+                         error.c_str());
+            return Fail(response, 500, "数据库错误");
+        }
+        for (const douyin::StoredBlock& block : blocks) {
+            blocked_ids.push_back(block.blocked_id);
+        }
+    }
     std::vector<douyin::StoredVideo> matched;
     std::vector<std::int64_t> users;
     for (const douyin::StoredVideo& video : videos) {
+        if (std::find(blocked_ids.begin(), blocked_ids.end(), video.user_id) !=
+            blocked_ids.end()) {
+            continue;
+        }
         const std::vector<std::string> tags = douyin::ExtractTags(video.title);
         if (std::find(tags.begin(), tags.end(), tag) == tags.end()) {
             continue;
@@ -1544,7 +1604,7 @@ bool Handle(douyin::Store& store, const douyin::HttpRequest& request,
         return false;
     }
     if (request.method == "GET") {
-        return HandleDetail(store, id, response);
+        return HandleDetail(store, request, id, response);
     }
     if (request.method == "DELETE") {
         return HandleDelete(store, request, id, response);

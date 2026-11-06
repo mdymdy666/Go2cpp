@@ -2,10 +2,10 @@
 
 | 项 | 内容 |
 |---|---|
-| 盘点时间 | 2026-11-06（第 2 轮） |
+| 盘点时间 | 2026-11-06（第 3 轮） |
 | 盘点范围 | `app/douyin/` 全部源码（7 服务 + 网关 + 单页前端） |
 | 盘点方式 | 读 REQUIREMENTS.md、逐服务路由表、前端函数/元素清单、关键词扫描、跑既有验收 |
-| 基线 | `scripts/accept_all.sh` → 70 PASS / 0 FAIL；`scripts/accept_notifications.sh` → 92 PASS / 0 FAIL |
+| 基线 | `scripts/accept_all.sh` → 70 PASS / 0 FAIL；`scripts/accept_notifications.sh` → 92 PASS / 0 FAIL；`scripts/accept_report_block.sh` → **79 PASS / 0 FAIL** |
 
 > 说明：本文档只记录**代码里核实过**的能力。摘要里提到但代码未命中的项，
 > 统一标「待核实」，不当作已完成。
@@ -48,6 +48,11 @@
       右侧通知面板；被赞（视频/评论）/被评论/被回复/被关注写通知，自己触发
       自己不写，重复点赞不重复写；列表固定 2 条 SQL、未读数单条索引 COUNT
 
+- [x] **举报 / 拉黑（第 3 轮新增）**：`reports` / `blocks` 两表；举报去重 +
+      拉黑/取消/状态/黑名单 5 个接口；feed / 视频详情 / 评论 / 搜索 / 通知 /
+      收藏 / 话题 7 处读过滤；评论/点赞/关注写接口防骚扰（403）；前端「⋯」菜单、
+      举报弹窗、黑名单抽屉
+
 ### 4. 发现与话题
 
 - [x] 搜索三分类：用户 / 视频 / 话题（`searchTabs` + 三套行渲染）
@@ -76,7 +81,8 @@
 |---|---|---|---|---|
 | 1 | ~~评论点赞~~ | 高 | — | **本轮已完成** |
 | 2 | ~~消息通知中心~~ | 高 | — | **本轮已完成** |
-| 3 | 举报 / 拉黑 | 高 | 1.5 h | 举报表 + 拉黑过滤 Feed/评论；入口放操作栏「…」 |
+| 3 | ~~举报 / 拉黑~~ | 高 | — | **本轮已完成** |
+| 3.1 | 举报列表后台（运营端） | 中 | 1 h | 目前只落库，无管理接口；见 `reports.status` |
 | 4 | 分享落地页 `/v/:id` | 中高 | 1 h | 分享出去的链接直接定位到该视频（当前只有首页 hash 路由） |
 | 5 | 个人主页三 tab（作品/喜欢/收藏） | 中高 | 1.5 h | 需要 `/api/video/liked`；主页目前只有作品 |
 | 6 | 评论 @mention | 中 | 2 h | 输入 @ 弹候选 + 评论渲染高亮 + 通知联动 |
@@ -185,11 +191,84 @@
 - 原因：每处替换都基于「原始文本」重新读盘，未在内存里累积，写盘时互相覆盖。
 - 教训：多补丁必须用「内存文本累积 + 全部成功后单次落盘」模型，或逐处读-改-写。
 
-## 五、下一轮建议
+## 五、第 3 轮交付：举报 + 拉黑
 
-1. 举报 / 拉黑（#3）：举报表 + 拉黑过滤 Feed/评论，入口放操作栏「…」。
-2. 分享落地页 `/v/:id`（#4）：目前只有 hash 路由与 feed 内 `jumpToVideo`。
+### 存储（第 3 轮新增 2 张表）
+
+| 表 | 列 | 约束 / 索引 |
+|---|---|---|
+| `reports` | `id, reporter_id, target_type, target_id, reason, detail, status, created_at` | `UNIQUE(reporter_id, target_type, target_id)` 防重复举报；`idx_reports_status(status, created_at DESC)` 供运营后台 |
+| `blocks` | `id, user_id（拉黑者）, blocked_id（被拉黑）, created_at` | `UNIQUE(user_id, blocked_id)` 幂等键；`idx_blocks_user(user_id, created_at DESC)` 让「我的黑名单」与 `NOT IN` 子查询只扫本人几行 |
+
+- `target_type` 只接受 `video` / `comment` / `user`，由存储层白名单 + 服务层校验双重拦截；
+- `reason` 1~50 字、`detail` 可空且 <=500 字（UTF-8 码点计数）；
+- 重复举报**不新增行**：`INSERT` 命中唯一键后回查已有记录，接口返回 `200 + duplicate:true`。
+
+### 接口
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/api/report` | 举报；首次 **201**，重复 **200 + duplicate:true**，自己举报自己 400，目标不存在 404，匿名 401 |
+| POST | `/api/user/:id/block` | 拉黑；幂等，重复时 `already:true`；不能拉黑自己（400），目标不存在 404 |
+| DELETE | `/api/user/:id/block` | 取消拉黑；未拉黑也成功（幂等） |
+| GET | `/api/user/:id/block` | 当前登录者是否已拉黑该用户（匿名 401） |
+| GET | `/api/user/blocks` | 黑名单列表（JOIN 回填昵称，按拉黑时间倒序） |
+
+- 网关 `/api/user/**` 已存在；新增 `/api/report` 全方法转发（POST 鉴权在上游，GET 405、匿名 401）；
+- 写前统一 `ResetStatements()`，避免读游标残留触发 `SQLITE_BUSY_SNAPSHOT`。
+
+### 拉黑过滤（覆盖 6 处读 + 4 处写）
+
+| 场景 | 行为 | 实现 |
+|---|---|---|
+| Feed 推荐流 / 关注流 | 不返回被拉黑作者的视频 | `ListFeed` / `ListFollowingFeed` SQL `NOT IN (SELECT blocked_id ...)`；匿名无身份不过滤 |
+| 视频详情 | 404（不暴露「被屏蔽」） | video 服务双向检查：viewer 拉黑作者 **或** 作者拉黑 viewer |
+| 评论列表 / 回复 | 不返回被拉黑用户的评论（含回复） | `ListComments` / `ListReplies` 按 viewer 过滤；视频作者被拉黑时整页 404 |
+| 搜索 | 用户、视频（含 facet）都不返回被拉黑者 | `SearchUsers` / `SearchVideos` 增加 `viewer_id` 过滤；匿名不过滤 |
+| 通知列表 / 未读数 | 被拉黑者触发的通知不展示、不计未读 | `ListNotifications` / `CountUnreadNotifications` 用接收者自身作 `blocks.user_id` 过滤，两处条件一致 |
+| 收藏列表 | 被拉黑作者的收藏视频不展示 | `ListFavorites` SQL 过滤 |
+| 话题页 | 被拉黑作者视频不参与聚合 | video 服务按 `ListBlocks` 集合过滤 |
+| 写接口（防骚扰） | 被拉黑后不能评论 / 点赞 / 关注，返回 403 | interaction 的评论、点赞；user 的关注，均双向检查 |
+
+> 说明：匿名请求没有身份，无法应用个人黑名单，保持全量（与既有行为一致）。
+
+### 前端
+
+- 视频操作栏新增「⋯」→ 底部菜单：**举报视频 / 拉黑作者**；
+- 评论与回复行新增「⋯」→ **举报评论 / 拉黑评论作者**；拉黑后自动关闭并重载评论区；
+- 用户主页新增「⋯」→ **举报该用户 / 拉黑该用户**；已拉黑的用户主页显示「已拉黑」+ 取消入口，不请求、不展示作品；
+- 举报弹窗：6 个原因单选（广告营销/色情低俗/人身攻击/谣言不实/违法违规/其它）+ 500 字补充说明；
+- 顶部栏新增「🚫 黑名单」→ 右侧抽屉列出被拉黑用户（昵称/时间），可逐条取消拉黑；
+- 拉黑成功立即从本地 feed / 搜索结果中剔除该作者内容，并异步刷新黑名单；服务端过滤是下一次请求的兜底；
+- Esc / 遮罩均可关闭菜单、举报弹窗与黑名单抽屉。
+
+### 验收
+
+- `bash app/douyin/build.sh` → 8 个二进制全 ok，`-Werror` 零告警
+- `bash scripts/accept_report_block.sh` → **79 PASS / 0 FAIL**（9 组：举报去重/拉黑接口/feed/详情/评论/搜索/通知/防骚扰/前端 + 唯一约束）
+- `bash scripts/accept_all.sh` → **70 PASS / 0 FAIL**（回归）
+- `bash scripts/accept_notifications.sh` → **92 PASS / 0 FAIL**（回归）
+- `bash scripts/accept_comment_like.sh` → **33 PASS / 0 FAIL**（回归）
+- 前端静态检查：JS 88 KB，括号/引号闭合，77 个 `getElementById` 全部有对应 id，13 个新函数各定义一次
+- 性能（loopback，20 次串行）：`GET /` avg 0.6 ms / max 1.1 ms；`GET /api/feed` avg 0.9 ms / max 1.2 ms；
+  `GET /api/notifications` avg 0.9 ms / max 1.2 ms；`GET /api/search` avg 1.0 ms / max 1.5 ms；`GET /` 134 KB
+- `GET /` → 200，页面含 `reportModal` / `blockPanel` / `menuSheet` / `openReport` / `toggleBlock` / `blacklistBtn`
+
+### 踩坑记录
+
+- **症状**：拉黑后 interaction 服务的通知列表与评论列表仍返回被拉黑者的数据，而点赞接口又能正确 403。
+- **原因**：interaction 的连接被上一请求残留的 ORM 读游标钉在旧 WAL 快照上；写请求提交后才刷新，
+  所以「评论」本身（写）先读到旧状态，其后的「点赞」（写）才看到新拉黑。
+- **修复**：每个请求入口调用 `ResetStatements()` 清 ORM 语句缓存；同类问题可通过「先写一次再读」自证。
+- **教训**：WAL 多进程读的「读不到刚写入的数据」不一定是没提交，先看读连接有没有未结束的语句。
+- **方向坑**：`IsBlocked(user_id 拉黑者, blocked_id 被拉黑者)` 的参数顺序在「viewer 拉黑作者」与
+  「作者拉黑 viewer」两个场景里相反；视频详情最初写反，导致只挡了一个方向。现在详情/评论/写接口都做双向检查。
+
+## 六、下一轮建议
+
+1. 分享落地页 `/v/:id`（#4）：目前只有 hash 路由与 feed 内 `jumpToVideo`。
+2. 举报运营后台：`reports.status` 只有 pending，缺列表/处理接口与页面。
 3. 「待核实」四项：@mention / 草稿 / WS Resume / 压缩——要么补实现，要么从
    已完成清单里移除；@mention 可直接复用通知中心的 `mention` 类型。
 4. 前端 JS 无 node/qjs：本轮用 Python 做「括号/字符串闭合 + 关键片段」检查
-   （只覆盖新增通知块），后续可接 quickjs 对整页做 `--check`。
+   （已覆盖整页 script），后续可接 quickjs 对整页做 `--check`。
