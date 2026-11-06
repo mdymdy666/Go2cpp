@@ -28,6 +28,7 @@
 #include "douyin_live_page.hpp"
 #include "douyin_shutdown.hpp"
 #include "douyin_observability.hpp"
+#include "go2cpp/compress/gzip.hpp"
 #include "go2cpp/app/gateway.hpp"
 #include "go2cpp/network/socket.hpp"
 
@@ -105,6 +106,155 @@ constexpr const char* kWebDir = DOUYIN_WEB_DIR;
 constexpr std::uint64_t kMaxVideoBytes = 64ULL * 1024 * 1024;
 /// @brief 读方法掩码：GET / HEAD。
 constexpr MethodMask kReadMask = method_mask::kGet | method_mask::kHead;
+
+// ---------------------------------------------------------------------------
+// gzip 响应压缩（第 11 轮性能优化）
+// ---------------------------------------------------------------------------
+
+/// @brief 小于该字节数的响应不压缩：gzip 头尾 + 压缩 CPU 反倒不划算。
+constexpr std::size_t kGzipMinBytes = 1024;
+
+/// @brief 把字符串转小写（ASCII）——只用于 media type / 编码 token 比较。
+std::string AsciiLower(std::string_view text) {
+    std::string out(text);
+    for (char& ch : out) {
+        if (ch >= 'A' && ch <= 'Z') {
+            ch = static_cast<char>(ch - 'A' + 'a');
+        }
+    }
+    return out;
+}
+
+/**
+ * @brief 请求是否接受 gzip 编码。
+ * @param header [in] 原始 `Accept-Encoding` 值；可为空。
+ * @return true 表示可以回压缩体。
+ *
+ * ## 定位
+ * 唯一判断点：误判会让客户端拿到无法解码的 body（浏览器只显示乱码）。
+ * 按逗号切分逐项比较，`gzip;q=0` 与通配符 `*` 都按 RFC 7231 处理。
+ */
+bool AcceptsGzip(std::string_view header) {
+    if (header.empty()) {
+        return false;
+    }
+    const std::string lower = AsciiLower(header);
+    std::size_t pos = 0;
+    while (pos <= lower.size()) {
+        const std::size_t comma = lower.find(',', pos);
+        std::string token = lower.substr(
+            pos, comma == std::string::npos ? std::string::npos : comma - pos);
+        // 去掉首尾空格与参数（`gzip;q=0.5` 的 `;` 之后）。
+        const std::size_t semi = token.find(';');
+        const std::string coding = token.substr(0, semi);
+        std::size_t begin = coding.find_first_not_of(' ');
+        std::size_t end = coding.find_last_not_of(' ');
+        const std::string name =
+            begin == std::string::npos ? "" : coding.substr(begin, end - begin + 1);
+        const bool q_zero = token.find("q=0") != std::string::npos;
+        if ((name == "gzip" || name == "x-gzip" || name == "*") && !q_zero) {
+            return true;
+        }
+        if (comma == std::string::npos) {
+            break;
+        }
+        pos = comma + 1;
+    }
+    return false;
+}
+
+/**
+ * @brief 是否为值得压缩的文本 media type。
+ * @param content_type [in] 响应 `Content-Type`（含 charset 参数）。
+ * @return `text/*`、`application/json`、`application/javascript` 为 true。
+ */
+bool IsCompressibleContentType(const std::string& content_type) {
+    const std::string lower = AsciiLower(content_type);
+    const std::size_t semi = lower.find(';');
+    std::string media = lower.substr(0, semi);
+    std::size_t begin = media.find_first_not_of(' ');
+    std::size_t end = media.find_last_not_of(' ');
+    media = begin == std::string::npos ? "" : media.substr(begin, end - begin + 1);
+    if (media.rfind("text/", 0) == 0) {
+        return true;
+    }
+    return media == "application/json" || media == "application/javascript" ||
+           media == "application/x-javascript";
+}
+
+/// @brief 写入内存字符串的 `streams::Writer` 桩（Gzip::Writer 的 sink）。
+class StringSink final {
+public:
+    go2cpp::streams::WriteResult Write(const char* data, std::size_t size) {
+        m_data.append(data, size);
+        return go2cpp::streams::WriteResult{size, {}};
+    }
+    std::string& data() noexcept { return m_data; }
+
+private:
+    std::string m_data;  ///< 压缩后的 gzip 字节流。
+};
+
+/**
+ * @brief 用基座 `go2cpp::compress` 做 gzip 压缩。
+ * @param input [in] 未压缩 body——借用，调用期间有效。
+ * @param output [out] 成功时写完整 gzip 流（含 10 字节头与 crc32/ISIZE 尾）。
+ * @return true=成功；false=压缩器报错（调用方**必须**回原 body，不要发半截流）。
+ *
+ * ## 定位
+ * 唯一压缩入口：Writer 忘记 Close() 会产出没有 crc32 尾的半截流，客户端解码
+ * 报 `ErrUnexpectedEof`；因此错误一律回退到未压缩路径。
+ */
+bool GzipCompress(const std::string& input, std::string* output) {
+    StringSink sink;
+    go2cpp::compress::Gzip::Writer<StringSink> writer(sink);
+    const go2cpp::streams::WriteResult written =
+        writer.Write(input.data(), input.size());
+    if (!written.ok() || written.count != input.size()) {
+        return false;
+    }
+    const go2cpp::ErrorPtr closed = writer.Close();
+    if (closed || writer.Err()) {
+        return false;
+    }
+    *output = std::move(sink.data());
+    return true;
+}
+
+/**
+ * @brief 最终响应装饰器：文本响应按需 gzip（网关所有响应都会经过这里）。
+ * @param request [in] 入站请求（只看 `Accept-Encoding`）。
+ * @param response [in,out] 待下发响应；可压缩时改写 body 并补
+ *        `Content-Encoding: gzip`，所有文本响应都补 `Vary: Accept-Encoding`。
+ *
+ * ## 定位
+ * 压缩的唯一决策点。错了会怎样：给不支持 gzip 的客户端发压缩体 → 页面
+ * 乱码；或对已带 `Content-Encoding` 的上游响应二次压缩 → 解码失败。
+ */
+void DecorateGzip(const Request& request, Response* response) {
+    const std::string content_type = response->header.get("Content-Type");
+    if (!IsCompressibleContentType(content_type)) {
+        return;
+    }
+    // 无论本次是否压缩，都必须声明 Vary：同一 URL 因 Accept-Encoding 不同
+    // 返回不同字节，缓存代理不能混用。
+    response->header.set("Vary", "Accept-Encoding");
+    if (response->header.has("Content-Encoding") || response->has_file() ||
+        response->body.size() <= kGzipMinBytes) {
+        return;
+    }
+    if (!AcceptsGzip(request.header.get("Accept-Encoding"))) {
+        return;
+    }
+    std::string compressed;
+    if (!GzipCompress(response->body, &compressed) ||
+        compressed.size() >= response->body.size()) {
+        // 压缩失败或没有变小：保持原 body，别让客户端解码一个更差的版本。
+        return;
+    }
+    response->body = std::move(compressed);
+    response->header.set("Content-Encoding", "gzip");
+}
 /// @brief 写方法掩码：POST / DELETE / PATCH（需要 Bearer 鉴权）。
 constexpr MethodMask kWriteMask =
     method_mask::kPost | method_mask::kDelete | method_mask::kPatch;
@@ -829,6 +979,9 @@ int main(int argc, char** argv) {
     // 非空 auth 会让组件自动安装 AuthMiddleware。
     config.auth = VerifyBearer;
     config.access_log = false;
+    // 文本响应 >1 KiB 且客户端接受 gzip 时压缩（首页 134 KB 约降到 30 KB）；
+    // 装饰器在所有响应（含错误体与上游转发）离开网关前执行。
+    config.decorate = DecorateGzip;
 
     auto created = Gateway::Create(config);
     if (!created.ok()) {

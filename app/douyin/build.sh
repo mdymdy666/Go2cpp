@@ -61,7 +61,7 @@ CXXFLAGS=(-std=c++17 -O2 -g -Wall -Wextra -Wpedantic -Werror -Wno-unused-paramet
 LDFLAGS=(-L"$BUILD_LIB" -Wl,-rpath,"$BUILD_LIB" -Wl,--start-group
          -lgo2cpp_network -lgo2cpp_io -lgo2cpp_sync -lgo2cpp_context
          -lgo2cpp_error -lgo2cpp_scheduler -lgo2cpp_fiber -lgo2cpp_log
-         -lgo2cpp_hash -lgo2cpp_metrics -Wl,--end-group -lpthread)
+         -lgo2cpp_hash -lgo2cpp_metrics -lgo2cpp_compress -Wl,--end-group -lpthread)
 
 # user 服务额外依赖 storage（libgo2cpp_storage.so + 系统 sqlite3）。
 EXTRA_LDLIBS=()

@@ -101,6 +101,20 @@ struct StoredNotification {
     std::int64_t read_at{0};     ///< 已读 Unix 秒；0 = 未读。
 };
 
+/// @brief `search_history` 表里的一行搜索历史（第 11 轮搜索增强）。
+/// @note 同一用户同一关键词只保留一行：写入时 `ON CONFLICT(user_id, keyword)
+///       DO UPDATE SET created_at`，列表天然「去重按最近」。
+struct SearchHistoryEntry {
+    std::string keyword;         ///< 搜索词（1~50 字，由 service 校验）。
+    std::int64_t created_at{0};  ///< 最近一次搜索的 Unix 秒。
+};
+
+/// @brief 热搜条目：关键词 + 最近 7 天的搜索次数。
+struct SearchHotKeyword {
+    std::string keyword;    ///< 关键词（去重后）。
+    std::int64_t count{0};  ///< 最近 7 天被搜索的次数。
+};
+
 /**
  * @brief 编码视频分页游标：`"<created_at>-<id>"`（十进制，两个非负整数）。
  * @param video 游标指向的视频（通常是本页最后一条）。
@@ -936,6 +950,64 @@ class Store {
     bool SearchVideos(const std::string& query, std::int64_t limit,
                       std::int64_t offset, std::vector<StoredVideo>* out,
                       std::string* error, std::int64_t viewer_id = 0);
+
+    // ---- 搜索增强（第 11 轮）：历史 / 热搜 / 建议 ----
+
+    /**
+     * @brief 记录一次搜索：同一用户同一关键词只保留一行（INSERT OR REPLACE，
+     *        旧行被替换成新 id + 新时间，历史列表因此去重且「最近」可排序）。
+     * @param user_id [in] 搜索者 id（>0；匿名搜索不记录）。
+     * @param keyword [in] 搜索词（已 trim、非空、<=50 字，由 service 校验）。
+     * @param error [out] 失败时写错误文本；成功时保持原值。
+     * @return 成功返回 true。
+     */
+    bool RecordSearchHistory(std::int64_t user_id, const std::string& keyword,
+                             std::string* error);
+
+    /**
+     * @brief 本人搜索历史，按最近搜索时间倒序。
+     * @param limit [in] 最多返回条数（1~50，调用方已夹取）。
+     * @param out [out] 追加到末尾（不清空调用方已有内容）。
+     * @param error [out] 失败时写错误文本。
+     * @return 成功返回 true（可能为空列表）。
+     */
+    bool ListSearchHistory(std::int64_t user_id, std::int64_t limit,
+                           std::vector<SearchHistoryEntry>* out,
+                           std::string* error);
+
+    /**
+     * @brief 删除搜索历史：`keyword` 非空只删该条，空串清空全部。
+     * @param user_id [in] 本人 id（同时作为 SQL 条件，防越权）。
+     * @param keyword [in] 要删除的关键词；空串表示清空。
+     * @param error [out] 失败时写错误文本。
+     * @return 受影响行数；出错返回 -1。
+     */
+    int DeleteSearchHistory(std::int64_t user_id, const std::string& keyword,
+                            std::string* error);
+
+    /**
+     * @brief 热搜：最近 7 天搜索历史按关键词聚合，单条 `GROUP BY`。
+     * @param since [in] 统计起点（Unix 秒，含）；调用方传 now-7d。
+     * @param limit [in] 最多返回条数（1~20，调用方已夹取）。
+     * @param out [out] 按次数降序、同次数按最近搜索时间降序。
+     * @param error [out] 失败时写错误文本。
+     * @return 成功返回 true（可能为空列表）。
+     */
+    bool SearchHotKeywords(std::int64_t since, std::int64_t limit,
+                           std::vector<SearchHotKeyword>* out,
+                           std::string* error);
+
+    /**
+     * @brief 搜索建议：前缀匹配，取「热搜关键词 + 用户昵称 + 视频话题」并集
+     *        去重，最多 `limit` 条。
+     * @param prefix [in] 前缀（非空；`%`/`_`/`\` 按字面量转义）。
+     * @param limit [in] 最多返回条数（1~20，调用方已夹取）。
+     * @param out [out] 追加到末尾，按「热搜 → 用户 → 话题」顺序去重。
+     * @param error [out] 失败时写错误文本。
+     * @return 成功返回 true（可能为空列表）。
+     */
+    bool SearchSuggest(const std::string& prefix, std::int64_t limit,
+                       std::vector<std::string>* out, std::string* error);
 
     // ---- C7 直播：rooms + room_viewers（只加不改既有） ----
 

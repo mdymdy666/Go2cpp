@@ -4,6 +4,10 @@
  *
  * @details 路由：
  *          - GET /api/search?q=&type=&limit=&cursor=
+ *          - GET /api/search/history?limit=      本人历史（需登录，去重按最近）
+ *          - DELETE /api/search/history?keyword= 删单条；不带 keyword 清空
+ *          - GET /api/search/hot?limit=          热搜（最近 7 天聚合）
+ *          - GET /api/search/suggest?q=&limit=   搜索建议（前缀，三源并集）
  *
  *          `q` 非空（空/全空白 → 400）；`type` ∈ user/video/live/all
  *          （缺省 all）；`limit` 缺省 20、上限 100。匹配规则：`name`/`title`
@@ -75,6 +79,45 @@ std::int64_t ViewerId(const douyin::HttpRequest& request) {
         return 0;
     }
     return info.user_id;
+}
+
+/**
+ * @brief 要求已登录：有效 Bearer token 时写 viewer，否则直接写 401。
+ * @param request [in] 原始请求。
+ * @param viewer [out] 成功时写 user_id（>0）；失败时保持 0。
+ * @param response [out] 失败时写 401 错误体。
+ * @return true=已登录，调用方可以继续；false=调用方**必须**直接返回 true
+ *         （响应已填好）。
+ */
+bool RequireViewer(const douyin::HttpRequest& request, std::int64_t* viewer,
+                   douyin::HttpResponse* response) {
+    *viewer = ViewerId(request);
+    if (*viewer > 0) {
+        return true;
+    }
+    response->status = 401;
+    response->body = douyin::ErrorBody(401, "请先登录");
+    ++g_metrics.errors;
+    return false;
+}
+
+/**
+ * @brief 解析 `limit`：缺省 default_limit，超出 [1, max_limit] 夹紧；
+ *        非数字按缺省处理。
+ */
+std::int64_t ParseClampedLimit(const douyin::HttpRequest& request,
+                               std::int64_t default_limit,
+                               std::int64_t max_limit) {
+    const std::string text = douyin::QueryParam(request, "limit");
+    if (text.empty()) {
+        return default_limit;
+    }
+    char* end = nullptr;
+    const long long value = std::strtoll(text.c_str(), &end, 10);
+    if (end == text.c_str() || value <= 0) {
+        return default_limit;
+    }
+    return value > max_limit ? max_limit : static_cast<std::int64_t>(value);
 }
 
 /// @brief 统一错误响应。
@@ -414,6 +457,111 @@ bool HandleSearch(douyin::Store& store, const douyin::HttpRequest& request,
         body += std::to_string(offset + limit);
     }
     body += "\"}";
+    // 搜索成功后记录历史：匿名不记录；记录失败只打日志，不影响搜索结果。
+    if (viewer > 0) {
+        std::string history_error;
+        if (!store.RecordSearchHistory(viewer, query, &history_error)) {
+            std::fprintf(stderr, "[%s] 记录搜索历史失败: %s\n", kServiceName,
+                         history_error.c_str());
+        }
+    }
+    response->status = 200;
+    response->body = std::move(body);
+    return true;
+}
+
+/// @brief 搜索历史：GET 列表 / DELETE 删除（keyword 空则清空）。
+bool HandleSearchHistory(douyin::Store& store,
+                         const douyin::HttpRequest& request,
+                         douyin::HttpResponse* response) {
+    std::int64_t viewer = 0;
+    if (!RequireViewer(request, &viewer, response)) {
+        return true;
+    }
+    std::string error;
+    if (request.method == "DELETE") {
+        const std::string keyword =
+            UrlDecode(douyin::QueryParam(request, "keyword"));
+        const int deleted = store.DeleteSearchHistory(viewer, keyword, &error);
+        if (deleted < 0) {
+            std::fprintf(stderr, "[%s] 删除搜索历史失败: %s\n", kServiceName,
+                         error.c_str());
+            return Fail(response, 500, "数据库错误");
+        }
+        response->status = 200;
+        response->body = "{\"ok\":true,\"deleted\":" +
+                         std::to_string(deleted) + "}";
+        return true;
+    }
+    const std::int64_t limit = ParseClampedLimit(request, 10, 50);
+    std::vector<douyin::SearchHistoryEntry> items;
+    if (!store.ListSearchHistory(viewer, limit, &items, &error)) {
+        std::fprintf(stderr, "[%s] 查询搜索历史失败: %s\n", kServiceName,
+                     error.c_str());
+        return Fail(response, 500, "数据库错误");
+    }
+    std::string body = "{\"ok\":true,\"items\":[";
+    for (std::size_t i = 0; i < items.size(); ++i) {
+        if (i != 0) {
+            body += ',';
+        }
+        body += "{\"keyword\":\"" + douyin::JsonEscape(items[i].keyword) +
+                "\",\"created_at\":" + std::to_string(items[i].created_at) +
+                "}";
+    }
+    body += "]}";
+    response->status = 200;
+    response->body = std::move(body);
+    return true;
+}
+
+/// @brief 热搜：最近 7 天搜索历史聚合，按次数降序。
+bool HandleHotSearch(douyin::Store& store, const douyin::HttpRequest& request,
+                     douyin::HttpResponse* response) {
+    const std::int64_t limit = ParseClampedLimit(request, 10, 20);
+    const std::int64_t since = NowSeconds() - 7 * 24 * 60 * 60;
+    std::string error;
+    std::vector<douyin::SearchHotKeyword> items;
+    if (!store.SearchHotKeywords(since, limit, &items, &error)) {
+        std::fprintf(stderr, "[%s] 查询热搜失败: %s\n", kServiceName,
+                     error.c_str());
+        return Fail(response, 500, "数据库错误");
+    }
+    std::string body = "{\"ok\":true,\"items\":[";
+    for (std::size_t i = 0; i < items.size(); ++i) {
+        if (i != 0) {
+            body += ',';
+        }
+        body += "{\"keyword\":\"" + douyin::JsonEscape(items[i].keyword) +
+                "\",\"count\":" + std::to_string(items[i].count) + "}";
+    }
+    body += "]}";
+    response->status = 200;
+    response->body = std::move(body);
+    return true;
+}
+
+/// @brief 搜索建议：前缀匹配，热搜 + 用户昵称 + 话题去重。
+bool HandleSuggest(douyin::Store& store, const douyin::HttpRequest& request,
+                   douyin::HttpResponse* response) {
+    const std::string query = UrlDecode(douyin::QueryParam(request, "q"));
+    const std::int64_t limit = ParseClampedLimit(request, 8, 20);
+    std::vector<std::string> items;
+    std::string error;
+    if (!query.empty() && !IsBlank(query) &&
+        !store.SearchSuggest(query, limit, &items, &error)) {
+        std::fprintf(stderr, "[%s] 查询搜索建议失败: %s\n", kServiceName,
+                     error.c_str());
+        return Fail(response, 500, "数据库错误");
+    }
+    std::string body = "{\"ok\":true,\"items\":[";
+    for (std::size_t i = 0; i < items.size(); ++i) {
+        if (i != 0) {
+            body += ',';
+        }
+        body += "\"" + douyin::JsonEscape(items[i]) + "\"";
+    }
+    body += "]}";
     response->status = 200;
     response->body = std::move(body);
     return true;
@@ -423,6 +571,9 @@ bool HandleSearch(douyin::Store& store, const douyin::HttpRequest& request,
 bool Handle(douyin::Store& store, const douyin::HttpRequest& request,
             douyin::HttpResponse* response) {
     ++g_metrics.requests;
+    // 请求边界清语句缓存：本服务有写（记录历史），避免读游标把连接钉在旧
+    // WAL 快照上（与 user/live/interaction 的既有约定一致）。
+    store.ResetStatements();
     if (request.method == "GET" && request.path == "/health") {
         response->status = 200;
         response->body = std::string("{\"ok\":true,\"service\":\"") +
@@ -440,6 +591,25 @@ bool Handle(douyin::Store& store, const douyin::HttpRequest& request,
     if (request.path == "/api/search") {
         if (request.method == "GET") {
             return HandleSearch(store, request, response);
+        }
+        return Fail(response, 405, "方法不允许");
+    }
+    // 子路径必须放在 `/api/search` 判断之后；顺序不影响（精确匹配）。
+    if (request.path == "/api/search/history") {
+        if (request.method == "GET" || request.method == "DELETE") {
+            return HandleSearchHistory(store, request, response);
+        }
+        return Fail(response, 405, "方法不允许");
+    }
+    if (request.path == "/api/search/hot") {
+        if (request.method == "GET") {
+            return HandleHotSearch(store, request, response);
+        }
+        return Fail(response, 405, "方法不允许");
+    }
+    if (request.path == "/api/search/suggest") {
+        if (request.method == "GET") {
+            return HandleSuggest(store, request, response);
         }
         return Fail(response, 405, "方法不允许");
     }

@@ -661,6 +661,60 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     font-size: 14px; outline: none;
   }
   #searchView .profile-top input:focus { border-color: rgba(37, 244, 238, .5); }
+  .search-discover { padding: 4px 16px 28px; overflow: auto; }
+  .sd-block { margin: 14px 0 4px; }
+  .sd-head {
+    display: flex; align-items: center; justify-content: space-between;
+    color: var(--muted); font-size: 13px; margin-bottom: 8px;
+  }
+  .sd-clear {
+    border: 0; background: transparent; color: var(--muted);
+    font-size: 12px; cursor: pointer; padding: 2px 4px;
+  }
+  .sd-clear:hover { color: var(--cyan); }
+  .sd-row { display: flex; align-items: center; gap: 6px; }
+  .sd-item {
+    flex: 1; min-width: 0; display: flex; align-items: center; gap: 10px;
+    border: 0; background: transparent; color: var(--text);
+    font-size: 14px; text-align: left; cursor: pointer;
+    padding: 8px 6px; border-radius: 8px;
+  }
+  .sd-item:hover, .sd-hot:hover, .sd-suggest-item:hover {
+    background: rgba(255, 255, 255, .05);
+  }
+  .sd-icon { width: 18px; text-align: center; opacity: .8; }
+  .sd-text {
+    flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .sd-del {
+    border: 0; background: transparent; color: var(--muted);
+    font-size: 12px; cursor: pointer; padding: 8px;
+  }
+  .sd-del:hover { color: var(--pink); }
+  .sd-empty { color: var(--muted); font-size: 13px; padding: 6px; }
+  .sd-hot {
+    display: flex; align-items: center; gap: 10px; width: 100%;
+    border: 0; background: transparent; color: var(--text);
+    font-size: 14px; text-align: left; cursor: pointer;
+    padding: 8px 6px; border-radius: 8px;
+  }
+  .sd-rank {
+    width: 18px; text-align: center; color: var(--muted);
+    font-size: 13px; font-weight: 700;
+  }
+  .sd-rank.top { color: #ff6b6b; }
+  .sd-count { color: var(--muted); font-size: 12px; }
+  .search-suggest {
+    position: relative; z-index: 3; background: var(--panel, #14141c);
+    border-bottom: 1px solid rgba(255, 255, 255, .07);
+    max-height: 46vh; overflow: auto;
+  }
+  .sd-suggest-item {
+    display: block; width: 100%; border: 0; background: transparent;
+    color: var(--text); text-align: left; font-size: 14px;
+    padding: 10px 18px; cursor: pointer;
+  }
   .search-tabs {
     display: flex; gap: 8px; padding: 12px 18px 0;
     max-width: 820px; margin: 0 auto;
@@ -1206,6 +1260,20 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
            autocomplete="off" spellcheck="false">
     <button class="btn-primary" id="searchSubmit" type="button">搜索</button>
   </div>
+  <div class="search-discover" id="searchDiscover" hidden>
+    <div class="sd-block">
+      <div class="sd-head">
+        <b>🕘 搜索历史</b>
+        <button class="sd-clear" id="shClear" type="button">清空</button>
+      </div>
+      <div class="sh-list" id="shList"></div>
+    </div>
+    <div class="sd-block">
+      <div class="sd-head"><b>🔥 热搜</b></div>
+      <div class="hot-list" id="hotList"></div>
+    </div>
+  </div>
+  <div class="search-suggest" id="searchSuggest" hidden></div>
   <div class="search-tabs" id="searchTabs">
     <button class="search-tab active" data-tab="user" type="button">用户</button>
     <button class="search-tab" data-tab="video" type="button">视频</button>
@@ -1373,6 +1441,14 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
   var navSearch = document.getElementById('navSearch');
   var searchTabs = document.getElementById('searchTabs');
   var searchState = { q: '', tab: 'user', data: null };
+  var searchDiscoverEl = document.getElementById('searchDiscover');
+  var searchSuggestEl = document.getElementById('searchSuggest');
+  var shList = document.getElementById('shList');
+  var hotList = document.getElementById('hotList');
+  var shClear = document.getElementById('shClear');
+  var searchHistoryCache = [];
+  var suggestTimer = null;
+  var suggestSeq = 0;
 
   var tagBody = document.getElementById('tagBody');
   var tagHead = document.getElementById('tagHead');
@@ -3841,6 +3917,174 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     }
   }
 
+  /* ---------- 搜索增强（第 11 轮）：历史 / 热搜 / 建议 ---------- */
+
+  function sdText(text, cls) {
+    var span = document.createElement('span');
+    span.className = cls || 'sd-text';
+    span.textContent = text;
+    return span;
+  }
+
+  function historyRow(item) {
+    var row = document.createElement('div');
+    row.className = 'sd-row';
+    var pick = document.createElement('button');
+    pick.type = 'button';
+    pick.className = 'sd-item';
+    pick.appendChild(sdText('🕘', 'sd-icon'));
+    pick.appendChild(sdText(item.keyword));
+    pick.addEventListener('click', function () { pickSearch(item.keyword); });
+    var del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'sd-del';
+    del.textContent = '✕';
+    del.title = '删除这条历史';
+    del.setAttribute('aria-label', '删除搜索历史 ' + item.keyword);
+    del.addEventListener('click', function (e) {
+      e.stopPropagation();
+      deleteHistory(item.keyword);
+    });
+    row.appendChild(pick);
+    row.appendChild(del);
+    return row;
+  }
+
+  function hotRow(item, index) {
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'sd-hot';
+    var rank = sdText(String(index + 1), 'sd-rank' + (index < 3 ? ' top' : ''));
+    btn.appendChild(rank);
+    btn.appendChild(sdText(item.keyword));
+    btn.appendChild(sdText((item.count || 0) + ' 次', 'sd-count'));
+    btn.addEventListener('click', function () { pickSearch(item.keyword); });
+    return btn;
+  }
+
+  function renderSearchHistory() {
+    shList.innerHTML = '';
+    if (!searchHistoryCache.length) {
+      shList.appendChild(sdText('还没有搜索记录', 'sd-empty'));
+      return;
+    }
+    for (var i = 0; i < searchHistoryCache.length; ++i) {
+      shList.appendChild(historyRow(searchHistoryCache[i]));
+    }
+  }
+
+  function loadSearchHistory() {
+    if (!state.token) {
+      searchHistoryCache = [];
+      renderSearchHistory();
+      return;
+    }
+    api('api/search/history?limit=10').then(function (data) {
+      searchHistoryCache = (data && data.items) || [];
+      renderSearchHistory();
+    }).catch(function () {});
+  }
+
+  function loadHotSearch() {
+    api('api/search/hot?limit=10').then(function (data) {
+      hotList.innerHTML = '';
+      var items = (data && data.items) || [];
+      if (!items.length) {
+        hotList.appendChild(sdText('暂无热搜，搜点什么吧', 'sd-empty'));
+        return;
+      }
+      for (var i = 0; i < items.length; ++i) {
+        hotList.appendChild(hotRow(items[i], i));
+      }
+    }).catch(function () {});
+  }
+
+  function showSearchDiscover() {
+    searchDiscoverEl.hidden = false;
+    searchTabs.hidden = true;
+    searchBody.hidden = true;
+    shClear.hidden = !state.token;
+    loadHotSearch();
+    loadSearchHistory();
+  }
+
+  function hideSearchDiscover() {
+    searchDiscoverEl.hidden = true;
+    searchTabs.hidden = false;
+    searchBody.hidden = false;
+  }
+
+  function renderSuggest(items) {
+    searchSuggestEl.innerHTML = '';
+    if (!items || !items.length) {
+      searchSuggestEl.hidden = true;
+      return;
+    }
+    for (var i = 0; i < items.length; ++i) {
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'sd-suggest-item';
+      btn.textContent = items[i];
+      btn.addEventListener('click', (function (word) {
+        return function () { pickSearch(word); };
+      })(items[i]));
+      searchSuggestEl.appendChild(btn);
+    }
+    searchSuggestEl.hidden = false;
+  }
+
+  function requestSuggest() {
+    var q = String(searchInput.value || '').trim();
+    if (suggestTimer) {
+      clearTimeout(suggestTimer);
+      suggestTimer = null;
+    }
+    if (!q) {
+      searchSuggestEl.hidden = true;
+      showSearchDiscover();
+      return;
+    }
+    var seq = ++suggestSeq;
+    suggestTimer = setTimeout(function () {
+      api('api/search/suggest?q=' + encodeURIComponent(q) + '&limit=8')
+        .then(function (data) {
+          if (seq !== suggestSeq) { return; }
+          renderSuggest((data && data.items) || []);
+        })
+        .catch(function () {});
+    }, 200);
+  }
+
+  function pickSearch(text) {
+    searchInput.value = text;
+    navSearch.value = text;
+    searchSuggestEl.hidden = true;
+    hideSearchDiscover();
+    runSearch(text, searchState.tab);
+  }
+
+  function deleteHistory(keyword) {
+    api('api/search/history?keyword=' + encodeURIComponent(keyword),
+        { method: 'DELETE' }).then(function () {
+      searchHistoryCache = searchHistoryCache.filter(function (it) {
+        return it.keyword !== keyword;
+      });
+      renderSearchHistory();
+    }).catch(function (err) {
+      toast('删除失败：' + (err.message || '网络错误'), 'err');
+    });
+  }
+
+  function clearHistory() {
+    api('api/search/history', { method: 'DELETE' }).then(function () {
+      searchHistoryCache = [];
+      renderSearchHistory();
+      toast('已清空搜索历史');
+    }).catch(function (err) {
+      toast('清空失败：' + (err.message || '网络错误'), 'err');
+    });
+  }
+
   function runSearch(q, tab) {
     q = String(q || '').trim();
     if (!q) { toast('请输入搜索词', 'err'); return; }
@@ -3849,6 +4093,8 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     searchEl.hidden = false;
     searchInput.value = q;
     navSearch.value = q;
+    hideSearchDiscover();
+    searchSuggestEl.hidden = true;
     pauseAllVideos();
     paintSearchTabs();
     searchBody.innerHTML = '';
@@ -3858,6 +4104,7 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
         if (searchState.q !== q) { return; }
         searchState.data = data;
         renderSearchResults();
+        loadSearchHistory();
       })
       .catch(function (err) {
         searchBody.innerHTML = '';
@@ -3867,6 +4114,8 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
 
   function hideSearch() {
     searchEl.hidden = true;
+    hideSearchDiscover();
+    searchSuggestEl.hidden = true;
     var active = feedEl.querySelector('.slide.active video') || state.activeVideo;
     if (active) { playOnly(active); }
   }
@@ -4753,6 +5002,19 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
   document.getElementById('searchSubmit').addEventListener('click', function () {
     runSearch(searchInput.value, searchState.tab);
   });
+  searchInput.addEventListener('focus', function () {
+    if (!String(searchInput.value || '').trim()) { showSearchDiscover(); }
+  });
+  searchInput.addEventListener('input', function () {
+    if (!String(searchInput.value || '').trim()) {
+      searchSuggestEl.hidden = true;
+      showSearchDiscover();
+      return;
+    }
+    hideSearchDiscover();
+    requestSuggest();
+  });
+  shClear.addEventListener('click', clearHistory);
   searchInput.addEventListener('keydown', function (e) {
     if (e.key !== 'Enter') { return; }
     e.preventDefault();

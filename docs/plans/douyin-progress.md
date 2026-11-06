@@ -2,10 +2,10 @@
 
 | 项 | 内容 |
 |---|---|
-| 盘点时间 | 2026-11-06（第 10 轮） |
+| 盘点时间 | 2026-11-06（第 11 轮） |
 | 盘点范围 | `app/douyin/` 全部源码（7 服务 + 网关 + 单页前端） |
 | 盘点方式 | 读 REQUIREMENTS.md、逐服务路由表、前端函数/元素清单、关键词扫描、跑既有验收 |
-| 基线 | `scripts/accept_all.sh` → 70 PASS / 0 FAIL；`scripts/accept_notifications.sh` → 92 PASS / 0 FAIL；`scripts/accept_report_block.sh` → 79 PASS / 0 FAIL；`scripts/accept_share_landing.sh` → 88 PASS / 0 FAIL；`scripts/accept_profile_tabs.sh` → **115 PASS / 0 FAIL**；`scripts/accept_player_cluster.sh` → **94 PASS / 0 FAIL**；`scripts/accept_notif_cluster.sh` → **111 PASS / 0 FAIL**；`scripts/accept_live_cluster.sh` → **128 PASS / 0 FAIL** |
+| 基线 | `scripts/accept_all.sh` → **89 PASS / 0 FAIL**（第 11 轮）；`scripts/accept_search_cluster.sh` → **71 PASS / 0 FAIL**；`scripts/accept_gzip.sh` → **30 PASS / 0 FAIL**；`scripts/accept_notifications.sh` → 92 PASS / 0 FAIL；`scripts/accept_report_block.sh` → 79 PASS / 0 FAIL；`scripts/accept_share_landing.sh` → 88 PASS / 0 FAIL；`scripts/accept_profile_tabs.sh` → **115 PASS / 0 FAIL**；`scripts/accept_player_cluster.sh` → **94 PASS / 0 FAIL**；`scripts/accept_notif_cluster.sh` → **111 PASS / 0 FAIL**；`scripts/accept_live_cluster.sh` → **128 PASS / 0 FAIL** |
 
 > 说明：本文档只记录**代码里核实过**的能力。摘要里提到但代码未命中的项，
 > 统一标「待核实」，不当作已完成。
@@ -72,6 +72,9 @@
 ### 4. 发现与话题
 
 - [x] 搜索三分类：用户 / 视频 / 话题（`searchTabs` + 三套行渲染）
+- [x] **搜索增强（第 11 轮新增）**：搜索历史（同词去重 / 单条删除 / 清空 /
+      仅本人）、热搜（最近 7 天 `GROUP BY` 聚合）、输入 200ms 防抖建议
+      （热搜词 + 用户昵称 + 话题并集去重）
 - [x] 搜索空态、分页、标签页（`openTag` / `renderTagPage`）
 - [x] 标题 `#话题` 解析（`topicHash` / `tagLink`）+ `/api/tag/list`
 - [x] 推荐流随机洗牌 + 可续页游标（`EncodeFeedCursor`）
@@ -127,7 +130,7 @@
 | @mention | 第 6 轮已实现（`interaction_service.cpp` 的 mention 解析 + 前端 @ 补全） | 已完成 |
 | 草稿 | 第 7 轮已实现（`douyin_home_page.hpp` 的 DRAFT_KEY / saveDraft / resumeDraft） | 已完成 |
 | WS Resume | `WebSocket / Sec-WebSocket / resume` 均 0 命中 | 未实现（当前是纯 HTTP + fetch） |
-| 压缩 | `gzip / deflate / compress / zstd` 均 0 命中 | 未实现（`douyin_http.hpp` 无压缩） |
+| 压缩 | ~~`gzip / deflate / compress / zstd` 均 0 命中~~ | **第 11 轮已实现**：网关 `DecorateGzip` 用基座 `go2cpp::compress` gzip |
 
 > 以上四项若要保留在「已完成」里，需要给出具体文件与验收用例；否则按未做处理。
 
@@ -698,13 +701,87 @@
 - **`json_int id` 撞礼物 id**：送礼响应里 `gift.id` 在 `message.id` 前面，
   取消息 id 必须匹配 `"message":{"id":`。
 
-## 十二、下一轮建议
+## 十二、第 11 轮交付：搜索增强（历史 / 热搜 / 建议）+ gzip
+
+### 存储（`search_history` 一张表 + 两个索引）
+
+| 项 | 内容 |
+|---|---|
+| 表 | `search_history(id, user_id, keyword, created_at)`，`UNIQUE(user_id, keyword)` |
+| 索引 | `idx_search_history_user(user_id, created_at DESC)`（我的历史）/ `idx_search_history_created(created_at DESC)`（7 天热搜） |
+| 去重 | 写入用 `INSERT OR REPLACE`：同用户同词只留一行；REPLACE 会生成更大的 id，`created_at` 只有秒级精度时靠 `ORDER BY created_at DESC, id DESC` 仍能体现「最近搜索」 |
+| 方法 | `RecordSearchHistory` / `ListSearchHistory` / `DeleteSearchHistory` / `SearchHotKeywords`（单条 `GROUP BY`）/ `SearchSuggest`（三源并集去重） |
+
+### 接口（search 29106，网关 `/api/search/**` 全方法转发）
+
+| 方法 | 路径 | 语义 |
+|---|---|---|
+| GET | `/api/search/history?limit=10` | 本人历史（**需登录**，401；去重、按最近倒序、limit 夹紧 1~50） |
+| DELETE | `/api/search/history?keyword=` | 带 keyword 删单条；不带清空；返回 `deleted`；需登录 |
+| GET | `/api/search/hot?limit=10` | 热搜（公开；最近 7 天 `GROUP BY keyword`，count 降序、同次数按最近；limit 1~20） |
+| GET | `/api/search/suggest?q=&limit=8` | 建议（公开；`LIKE 'q%'` 前缀，热搜 + 用户昵称 + 话题取并集去重；limit 1~20） |
+| GET | `/api/search` | 原有综合搜索；**成功后自动记录历史**（匿名不记，记录失败只打日志） |
+
+- 建议的话题来源复用唯一提取点 `ExtractTags`（`douyin_tag.hpp`），先用
+  `title LIKE '%q%'` 让 SQLite 过滤再在内存做前缀判定；
+- 每个请求入口 `store.ResetStatements()`（本服务新增写路径，避免 ORM 游标旧快照）。
+
+### 前端（`include/douyin_home_page.hpp`）
+
+- 搜索页新增「🕘 搜索历史」面板：单条 ✕ 删除、「清空」；匿名隐藏历史、只显示热搜；
+- 「🔥 热搜」：序号（前三红色）+ 关键词 + 搜索次数，点击直接搜；
+- 搜索框聚焦且为空时展开「历史 + 热搜」；输入时 200ms 防抖请求建议，
+  下拉点击直接搜；点搜索/清空输入后收起；
+- 搜索完成后刷新历史（服务端自动记录的权威结果），失败不影响结果渲染。
+
+### gzip 压缩（网关统一装饰器）
+
+- `config.decorate = DecorateGzip`：**所有响应**（首页/直播页本地直出、上游转发、
+  错误体）离开网关前统一判断；
+- 生效条件：`Accept-Encoding` 含 gzip（`gzip;q=0` 排除）、`body > 1 KiB`、
+  `Content-Type` 为 `text/*` / `application/json` / `application/javascript`、
+  响应未带 `Content-Encoding`、非文件体；
+- 压缩用基座 `go2cpp::compress::Gzip::Writer<StringSink>`（`Close()` 校验完整流）；
+  压缩报错或压缩后反而更大时**回退原 body**；
+- 补 `Content-Encoding: gzip` + `Vary: Accept-Encoding`；`Content-Length` 由
+  现有序列化器按新 body 重算，HEAD 与 GET 一致；已压缩的响应不二次压缩；
+- 构建脚本链接新增 `-lgo2cpp_compress`（基座该库已存在）。
+
+### 验收
+
+- `bash app/douyin/build.sh` → 8 个二进制 ok，`-Werror -Wpedantic` 零告警；
+- 新增 `scripts/accept_search_cluster.sh` → **71 PASS / 0 FAIL**（6 组：准备 /
+  历史 19 / 热搜 11 / 建议 11 / 前端 17 / 性能 4）；
+- 新增 `scripts/accept_gzip.sh` → **30 PASS / 0 FAIL**（基线 / 压缩 / 不压缩场景 /
+  HEAD / 上游路径 / TTFB）；
+- 回归 `scripts/accept_all.sh` → **89 PASS / 0 FAIL**；
+- 首页 gzip：**218669 → 61993 字节（28.4%）**；TTFB（taskset 绑核，20 次均值）
+  **0.69 ms → 3.81 ms**（本机 loopback 无链路时延，压缩成本约 3.1 ms；
+  真实网络下少传 72% 字节）；
+- 搜索接口 TTFB：热搜 0.93 ms / 历史 0.79 ms / 建议 0.82 ms（阈值 200 ms）；
+- 查询计划：热搜命中 `idx_search_history_created`（`created_at>?`）。
+
+### 踩坑记录
+
+- **秒级时间戳 + `ON CONFLICT DO UPDATE` 无法体现「最近」**：同一秒内先搜 A 再搜 B
+  再搜 A，A 的 `created_at` 不变、id 不变，列表仍把 B 排前面。改用
+  `INSERT OR REPLACE`（删旧插新、id 递增），排序键 `created_at DESC, id DESC`；
+- **验收脚本的简化 JS tokenizer 误报**：`/^https?:\/\//` 里的 `//` 被当行注释，
+  整页括号「不平衡」；复用 `accept_player_cluster.sh` 的完整 tokenizer（识别
+  正则字面量）后通过；
+- **PowerShell 双引号会解析 `$` 与反引号**：`wsl bash -lc "... $VAR ..."` 里的
+  变量被本机展开，补丁全部改为「Python 脚本落盘 → `wsl python3` 执行」；
+- **热搜 count 的测试数据编排**：清空 alice 历史后忘记补一次搜索，导致
+  「3 个用户搜同一词」实际只有 2 行——不是代码 bug，是脚本前置数据缺口。
+
+## 十三、下一轮建议
 
 1. 举报运营后台：`reports.status` 只有 pending，缺列表 / 处理接口与页面。
 2. 服务端草稿：当前草稿只在 localStorage（换设备/清缓存即丢）；可加
    `drafts` 表 + 多端同步，File 本体仍由用户重选。
-3. 「待核实」剩余两项：WS Resume / 压缩——要么补实现，要么从已完成
-   清单里移除；@mention（第 6 轮）与草稿（第 7 轮）已落地。
+3. 「待核实」剩余：WS Resume 仍未实现；压缩已于第 11 轮落地
+   （gzip + `Vary` + 回退策略）。搜索侧下一步可做：历史/热搜的个人化
+   （按关注关系加权）、搜索词高亮、联想词点击率埋点。
 4. 落地页增强：评论回复折叠、作者其它作品、播放进度记忆；
    `og:image` 已支持 `cover_url`，可再加服务端自动截帧。
 5. 播放侧下一批：单条播放进度记忆（localStorage `douyin_pos_<id>`）、

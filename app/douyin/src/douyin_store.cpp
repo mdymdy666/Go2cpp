@@ -9,6 +9,7 @@
 
 #include "douyin_store.hpp"
 
+#include "douyin_tag.hpp"
 #include "go2cpp/storage/db.hpp"
 #include "go2cpp/storage/orm.hpp"
 
@@ -423,7 +424,21 @@ constexpr const char* kSchemaSql =
     // 贡献榜按房间 GROUP BY sender_id：索引前缀 room_id 把扫描限制在本房间，
     // 避免全表聚合。
     "CREATE INDEX IF NOT EXISTS idx_gift_records_room "
-    "ON gift_records(room_id, sender_id);";
+    "ON gift_records(room_id, sender_id);"
+    // 搜索历史（第 11 轮）：UNIQUE(user_id, keyword) 是「同一用户同一词只留
+    // 最近一次」的幂等键，写入走 ON CONFLICT DO UPDATE；两条索引分别服务
+    // 「我的历史倒序」与「最近 7 天热搜聚合」。
+    "CREATE TABLE IF NOT EXISTS search_history ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  user_id INTEGER NOT NULL,"
+    "  keyword TEXT NOT NULL,"
+    "  created_at INTEGER NOT NULL,"
+    "  UNIQUE(user_id, keyword)"
+    ");"
+    "CREATE INDEX IF NOT EXISTS idx_search_history_user "
+    "ON search_history(user_id, created_at DESC);"
+    "CREATE INDEX IF NOT EXISTS idx_search_history_created "
+    "ON search_history(created_at DESC);";
 
 /// @brief 把 `Error` 写成可读文本。
 std::string DescribeError(const go2cpp::storage::Error& error) {
@@ -580,6 +595,20 @@ std::string LikePattern(const std::string& query) {
         escaped += c;
     }
     return "%" + escaped + "%";
+}
+
+/// @brief 前缀匹配模式：转义 `%`/`_`/`\` 后追加 `%`（如 `美` → `美%`）。
+std::string LikePrefixPattern(const std::string& prefix) {
+    std::string escaped;
+    escaped.reserve(prefix.size() + 1);
+    for (const char c : prefix) {
+        if (c == '\\' || c == '%' || c == '_') {
+            escaped += '\\';
+        }
+        escaped += c;
+    }
+    escaped += '%';
+    return escaped;
 }
 
 /// @brief 执行查询并把全部视频按已排好的顺序装进 `all`。
@@ -2876,6 +2905,225 @@ bool Store::SearchVideos(const std::string& query, std::int64_t limit,
     if (rows.Value().Err()) {
         if (error != nullptr) {
             *error = "遍历视频失败: " + DescribeError(rows.Value().Err());
+        }
+        return false;
+    }
+    return true;
+}
+
+// ---- 搜索增强（第 11 轮）：历史 / 热搜 / 建议 ----
+
+bool Store::RecordSearchHistory(std::int64_t user_id,
+                                const std::string& keyword,
+                                std::string* error) {
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return false;
+    }
+    const std::int64_t now = static_cast<std::int64_t>(std::time(nullptr));
+    // 用 INSERT OR REPLACE 而非 ON CONFLICT DO UPDATE：SQLite 的 REPLACE 在
+    // UNIQUE(user_id, keyword) 冲突时删除旧行再插入，新行 id 更大。created_at
+    // 只有秒级精度，同一秒内「先搜 A 再搜 B 再搜 A」用 UPDATE 无法体现最近性；
+    // 靠 id 递增后，`ORDER BY created_at DESC, id DESC` 在秒内也严格正确。
+    // 行数仍是「用户数 × 不同关键词数」，历史列表天然去重。
+    auto executed = m_db->Exec(
+        "INSERT OR REPLACE INTO search_history(user_id, keyword, created_at) "
+        "VALUES(?, ?, ?)",
+        user_id, keyword, now);
+    if (!executed) {
+        if (error != nullptr) {
+            *error = "记录搜索历史失败: " + DescribeError(executed.Err());
+        }
+        return false;
+    }
+    return true;
+}
+
+bool Store::ListSearchHistory(std::int64_t user_id, std::int64_t limit,
+                              std::vector<SearchHistoryEntry>* out,
+                              std::string* error) {
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return false;
+    }
+    auto rows = m_db->Query(
+        "SELECT keyword, created_at FROM search_history WHERE user_id = ? "
+        "ORDER BY created_at DESC, id DESC LIMIT ?",
+        user_id, limit);
+    if (!rows) {
+        if (error != nullptr) {
+            *error = "查询搜索历史失败: " + DescribeError(rows.Err());
+        }
+        return false;
+    }
+    while (rows.Value().Next()) {
+        SearchHistoryEntry item;
+        item.keyword = rows.Value().Text(0);
+        item.created_at = rows.Value().Int64(1);
+        out->push_back(std::move(item));
+    }
+    if (rows.Value().Err()) {
+        if (error != nullptr) {
+            *error = "遍历搜索历史失败: " + DescribeError(rows.Value().Err());
+        }
+        return false;
+    }
+    return true;
+}
+
+int Store::DeleteSearchHistory(std::int64_t user_id,
+                               const std::string& keyword,
+                               std::string* error) {
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return -1;
+    }
+    auto executed = keyword.empty()
+                        ? m_db->Exec(
+                              "DELETE FROM search_history WHERE user_id = ?",
+                              user_id)
+                        : m_db->Exec(
+                              "DELETE FROM search_history "
+                              "WHERE user_id = ? AND keyword = ?",
+                              user_id, keyword);
+    if (!executed) {
+        if (error != nullptr) {
+            *error = "删除搜索历史失败: " + DescribeError(executed.Err());
+        }
+        return -1;
+    }
+    return executed.Value().changes;
+}
+
+bool Store::SearchHotKeywords(std::int64_t since, std::int64_t limit,
+                              std::vector<SearchHotKeyword>* out,
+                              std::string* error) {
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return false;
+    }
+    // 单条 GROUP BY：最近 7 天窗口内按关键词聚合；同次数按最近一次搜索时间
+    // 倒序，保证结果稳定（不依赖 SQLite 的哈希分组顺序）。
+    auto rows = m_db->Query(
+        "SELECT keyword, COUNT(*) AS hits FROM search_history "
+        "WHERE created_at >= ? GROUP BY keyword "
+        "ORDER BY hits DESC, MAX(created_at) DESC LIMIT ?",
+        since, limit);
+    if (!rows) {
+        if (error != nullptr) {
+            *error = "查询热搜失败: " + DescribeError(rows.Err());
+        }
+        return false;
+    }
+    while (rows.Value().Next()) {
+        SearchHotKeyword item;
+        item.keyword = rows.Value().Text(0);
+        item.count = rows.Value().Int64(1);
+        out->push_back(std::move(item));
+    }
+    if (rows.Value().Err()) {
+        if (error != nullptr) {
+            *error = "遍历热搜失败: " + DescribeError(rows.Value().Err());
+        }
+        return false;
+    }
+    return true;
+}
+
+bool Store::SearchSuggest(const std::string& prefix, std::int64_t limit,
+                          std::vector<std::string>* out, std::string* error) {
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return false;
+    }
+    if (prefix.empty() || limit <= 0) {
+        return true;
+    }
+    const std::string pattern = LikePrefixPattern(prefix);
+    // 并集去重：三个来源共用一个小向量做线性判重（limit <= 20，无需哈希）。
+    auto add_unique = [out, limit](const std::string& text) {
+        if (text.empty() || static_cast<std::int64_t>(out->size()) >= limit) {
+            return;
+        }
+        for (const std::string& existing : *out) {
+            if (existing == text) {
+                return;
+            }
+        }
+        out->push_back(text);
+    };
+    // 来源 1：热搜（历史聚合，前缀匹配，次数降序）。
+    auto hot = m_db->Query(
+        "SELECT keyword FROM search_history WHERE keyword LIKE ? ESCAPE '\\' "
+        "GROUP BY keyword ORDER BY COUNT(*) DESC, MAX(created_at) DESC LIMIT ?",
+        pattern, limit);
+    if (!hot) {
+        if (error != nullptr) {
+            *error = "查询建议（热搜）失败: " + DescribeError(hot.Err());
+        }
+        return false;
+    }
+    while (hot.Value().Next()) {
+        add_unique(hot.Value().Text(0));
+    }
+    if (hot.Value().Err()) {
+        if (error != nullptr) {
+            *error = "遍历建议（热搜）失败: " + DescribeError(hot.Value().Err());
+        }
+        return false;
+    }
+    // 来源 2：用户昵称（前缀匹配，最近注册优先）。
+    auto users = m_db->Query(
+        "SELECT name FROM users WHERE name LIKE ? ESCAPE '\\' "
+        "ORDER BY id DESC LIMIT ?",
+        pattern, limit);
+    if (!users) {
+        if (error != nullptr) {
+            *error = "查询建议（用户）失败: " + DescribeError(users.Err());
+        }
+        return false;
+    }
+    while (users.Value().Next()) {
+        add_unique(users.Value().Text(0));
+    }
+    if (users.Value().Err()) {
+        if (error != nullptr) {
+            *error = "遍历建议（用户）失败: " + DescribeError(users.Value().Err());
+        }
+        return false;
+    }
+    // 来源 3：话题（从视频标题提取，复用唯一提取点 ExtractTags）。
+    // 先用 `%q%` 让 SQLite 过滤掉绝大多数标题，再在内存里做前缀判定。
+    const std::string contains = "%" + pattern.substr(0, pattern.size() - 1) + "%";
+    auto videos = m_db->Query(
+        "SELECT title FROM videos WHERE title LIKE ? ESCAPE '\\' LIMIT ?",
+        contains, limit * 20);
+    if (!videos) {
+        if (error != nullptr) {
+            *error = "查询建议（话题）失败: " + DescribeError(videos.Err());
+        }
+        return false;
+    }
+    while (videos.Value().Next()) {
+        for (const std::string& tag : ExtractTags(videos.Value().Text(0))) {
+            if (tag.compare(0, prefix.size(), prefix) == 0) {
+                add_unique(tag);
+            }
+        }
+    }
+    if (videos.Value().Err()) {
+        if (error != nullptr) {
+            *error = "遍历建议（话题）失败: " + DescribeError(videos.Value().Err());
         }
         return false;
     }

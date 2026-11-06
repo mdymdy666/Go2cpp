@@ -1646,3 +1646,42 @@ latest（服务重启）→ `resume_gap`，客户端走 REST 全量刷新。
   - 验收脚本裸 `wait` 会等待服务子进程，改 `wait "${PIDS[@]}"`；
   - 送礼响应里 `gift.id` 在前，取消息 id 要匹配 `"message":{"id":`。
 - **状态**：已提交（本轮 commit）。
+
+
+## 2026-11-06 第 11 轮：搜索增强（历史 / 热搜 / 建议）+ gzip
+
+- **需求**：真树 WSL `/UserData/CodexWorkSpace/Go2cpp`；一轮 2–3 个内联功能，
+  附带性能优化；验收 = 功能齐全、无明显 bug、TTFB < 200 ms。
+- **存储层**（`douyin_store.hpp` / `douyin_store.cpp`）：
+  - `search_history(id, user_id, keyword, created_at)` + `UNIQUE(user_id, keyword)`；
+    `idx_search_history_user(user_id, created_at DESC)` / `idx_search_history_created`；
+  - `RecordSearchHistory` 用 `INSERT OR REPLACE`（同词去重、新 id 反映最近）；
+    `ListSearchHistory` / `DeleteSearchHistory`（单条或清空）/
+    `SearchHotKeywords`（最近 7 天单条 `GROUP BY`）/ `SearchSuggest`（热搜 + 昵称 +
+    话题三源并集去重，话题复用 `ExtractTags`）。
+- **服务层**（`search_service.cpp`）：
+  - 新增 `GET /api/search/history`、`DELETE /api/search/history`（需 Bearer，401）、
+    `GET /api/search/hot`、`GET /api/search/suggest`；主搜索成功后自动记录历史；
+  - 每请求入口 `store.ResetStatements()`（新增写路径）。
+- **网关**（`gateway.cpp` + `build.sh`）：
+  - `config.decorate = DecorateGzip`：文本 + >1 KiB + 接受 gzip + 未压缩的响应
+    用基座 `go2cpp::compress::Gzip` 压缩，补 `Content-Encoding` / `Vary`；
+    压缩失败或未变小回退；HEAD 与 GET 长度一致；
+  - 链接新增 `-lgo2cpp_compress`。
+- **前端**（`douyin_home_page.hpp`）：
+  - 搜索页「🕘 搜索历史」（单条 ✕ / 清空）与「🔥 热搜」（序号/词/次数、点击直搜）；
+  - 输入 200ms 防抖建议下拉；聚焦空输入展示历史 + 热搜；匿名只显示热搜。
+- **验证**：
+  - `bash app/douyin/build.sh` → 8 个二进制 ok，零告警；
+  - 新增 `scripts/accept_search_cluster.sh` → **71 PASS / 0 FAIL**；
+  - 新增 `scripts/accept_gzip.sh` → **30 PASS / 0 FAIL**；
+  - 回归 `accept_all.sh` → **89 PASS / 0 FAIL**；
+  - 首页 gzip 218669 → 61993 字节（28.4%），TTFB 0.69 → 3.81 ms
+    （taskset 绑核 20 次均值，压缩成本 ~3.1 ms，链路字节 -72%）；
+  - 搜索 TTFB：热搜 0.93 / 历史 0.79 / 建议 0.82 ms。
+- **踩坑**：
+  - 秒级 `created_at` + `ON CONFLICT DO UPDATE` 无法体现同秒最近，改
+    `INSERT OR REPLACE` 用自增 id 兜底；
+  - 简化 JS tokenizer 把正则字面量里的 `//` 当注释，复用完整 tokenizer；
+  - PowerShell 双引号解析 `$`，补丁脚本一律落盘后 `wsl python3` 执行。
+- **状态**：已提交（本轮 commit）。
