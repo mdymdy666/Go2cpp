@@ -2,10 +2,10 @@
 
 | 项 | 内容 |
 |---|---|
-| 盘点时间 | 2026-11-06（第 1 轮） |
+| 盘点时间 | 2026-11-06（第 2 轮） |
 | 盘点范围 | `app/douyin/` 全部源码（7 服务 + 网关 + 单页前端） |
 | 盘点方式 | 读 REQUIREMENTS.md、逐服务路由表、前端函数/元素清单、关键词扫描、跑既有验收 |
-| 基线 | `scripts/accept_all.sh` → 70 PASS / 0 FAIL |
+| 基线 | `scripts/accept_all.sh` → 70 PASS / 0 FAIL；`scripts/accept_notifications.sh` → 92 PASS / 0 FAIL |
 
 > 说明：本文档只记录**代码里核实过**的能力。摘要里提到但代码未命中的项，
 > 统一标「待核实」，不当作已完成。
@@ -44,6 +44,9 @@
 - [x] 个人主页（`showProfile` / `renderProfile`：作品、统计、关注按钮）
 - [x] 视频链接复制、分享面板、二维码（`copyVideoLink` / `openShare` / `renderQr`）
 - [x] 评论数本地同步（`bumpCommentCount`）、点赞数本地同步
+- [x] **消息通知中心（第 2 轮新增）**：`notifications` 表 + 顶部 🔔 未读徽章 +
+      右侧通知面板；被赞（视频/评论）/被评论/被回复/被关注写通知，自己触发
+      自己不写，重复点赞不重复写；列表固定 2 条 SQL、未读数单条索引 COUNT
 
 ### 4. 发现与话题
 
@@ -72,7 +75,7 @@
 | # | 功能 | 用户价值 | 预估 | 依赖/备注 |
 |---|---|---|---|---|
 | 1 | ~~评论点赞~~ | 高 | — | **本轮已完成** |
-| 2 | 消息通知中心 | 高 | 2–3 h | 新表 notifications + 未读徽章 + 通知面板；点赞/评论/关注触发 |
+| 2 | ~~消息通知中心~~ | 高 | — | **本轮已完成** |
 | 3 | 举报 / 拉黑 | 高 | 1.5 h | 举报表 + 拉黑过滤 Feed/评论；入口放操作栏「…」 |
 | 4 | 分享落地页 `/v/:id` | 中高 | 1 h | 分享出去的链接直接定位到该视频（当前只有首页 hash 路由） |
 | 5 | 个人主页三 tab（作品/喜欢/收藏） | 中高 | 1.5 h | 需要 `/api/video/liked`；主页目前只有作品 |
@@ -80,7 +83,7 @@
 | 7 | 草稿箱 | 中 | 1 h | 前端已有 localStorage 使用；需明确草稿持久化与恢复入口 |
 | 8 | 播放器手势增强（上下滑/长按倍速） | 中 | 1 h | 现有双击点赞/拖动，缺上下切换与长按 2x |
 | 9 | 评论排序（最热/最新） | 中低 | 40 min | `ORDER BY like_count` 分支 + 前端切换 |
-| 10 | 消息未读红点 | 低 | 30 min | 依赖 #2 |
+| 10 | ~~消息未读红点~~ | 低 | — | **本轮已完成**（并入 🔔 未读徽章） |
 
 ### 待核实（摘要声称已完成，但代码关键词未命中）
 
@@ -95,7 +98,7 @@
 
 ---
 
-## 三、本轮（第 1 轮）交付：评论点赞
+## 三、第 1 轮交付：评论点赞
 
 ### 改动
 
@@ -125,10 +128,68 @@
 
 ---
 
-## 四、下一轮建议
+## 四、第 2 轮交付：消息通知中心
 
-1. 消息通知中心（#2）：与评论点赞联动——被点赞时写入 `notifications`，
-   顶部加未读徽章；可复用本轮 `ViewerId` 与批量查询模式。
-2. 顺手把「待核实」四项逐一确认：要么补实现，要么从已完成清单里移除。
-3. 前端 JS 无本地语法检查工具（无 node/qjs）；下一轮可考虑用
-   Python 做一次轻量括号/引号检查，或接入 `quickjs`。
+### 存储
+
+| 项 | 内容 |
+|---|---|
+| 表 | `notifications(id, user_id 接收者, actor_id 触发者, kind, target_type, target_id, content, created_at, read_at)` |
+| kind | `like` / `comment` / `follow` / `mention`（存储层白名单校验，脏数据拒绝） |
+| target_type | `video` / `comment` / `user` |
+| 索引 | `idx_notifications_unread(user_id, read_at, created_at)`；`idx_notifications_timeline(user_id, created_at DESC, id DESC)` |
+| 幂等 | 只有 `Like()==1`（本次新点赞）与「从未关注 → 关注」才写；重复点赞/关注不重复写 |
+| 昵称 | 不冗余存表，列表查询 `LEFT JOIN users` 一次回填 `actor_name` |
+
+### 写入点（3 类事件、4 个接口联动）
+
+| 触发 | 接口 | 接收者 | kind / target_type |
+|---|---|---|---|
+| 视频被赞 | `POST /api/like` | 视频作者（≠ 点赞者） | `like` / `video` |
+| 评论被赞 | `POST /api/comment/:id/like` | 评论作者（≠ 点赞者） | `like` / `comment` |
+| 视频被评论 | `POST /api/comment` | 视频作者 + 父评论作者（去重、均 ≠ 评论者） | `comment` / `video`、`comment` / `comment` |
+| 被关注 | `POST /api/user/:id/follow` | 被关注者 | `follow` / `user` |
+
+### 接口（interaction 29104，网关 `/api/notifications/**`）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/notifications?cursor=&limit=20` | 列表（时间倒序 keyset）+ `unread_count` + `next_cursor` |
+| POST | `/api/notifications/read` | `{"ids":[...]}` 或 `{"all":true}` → `updated` + 最新 `unread_count` |
+| GET | `/api/notifications/unread_count` | 单条 COUNT |
+
+- 鉴权：三个接口都必须 Bearer（网关 `require_auth=true` + 上游二次校验），匿名 401；
+- 越权：`UPDATE ... WHERE user_id = ?`，ids 混入别人的通知时 `updated=0`；
+- 列表 2 条 SQL（列表 JOIN + 未读 COUNT），不随页大小增长，无 N+1。
+
+### 前端
+
+- 顶部栏 🔔 按钮 + 未读徽章（`notifBtn` / `notifBadge`），登录后显示、30 s 轮询；
+- 右侧抽屉 `notifPanel`：按 kind 显示 ❤️ / 💬 / ➕ / @、文案、相对时间、摘要；
+- 点击单条 → 标已读（本地先改、失败回退）；视频类跳该视频、关注类进对方主页；
+- 「全部已读」+「加载更多」分页；Esc / 遮罩关闭。
+
+### 验收
+
+- `bash app/douyin/build.sh` → 8 个二进制全 ok，`-Werror` 零告警
+- `bash scripts/accept_notifications.sh` → **92 PASS / 0 FAIL**（10 组功能 + 性能）
+- `bash scripts/accept_all.sh` → **70 PASS / 0 FAIL**（回归）
+- 性能：`EXPLAIN QUERY PLAN` 命中上述两个索引、列表无 TEMP B-TREE；
+  TTFB 平均 0 ms / 最大 1 ms（20 次串行，本机 loopback）
+- 前端：`GET /` 200、页面 > 100 KB，含 `notifBtn` / `notifBadge` / `notifPanel` /
+  `openNotifications` / `renderNotifications` / `notif-line`
+
+### 踩坑记录
+
+- 症状：批量补丁脚本一次改同一文件多处，最后只有最后一处生效。
+- 原因：每处替换都基于「原始文本」重新读盘，未在内存里累积，写盘时互相覆盖。
+- 教训：多补丁必须用「内存文本累积 + 全部成功后单次落盘」模型，或逐处读-改-写。
+
+## 五、下一轮建议
+
+1. 举报 / 拉黑（#3）：举报表 + 拉黑过滤 Feed/评论，入口放操作栏「…」。
+2. 分享落地页 `/v/:id`（#4）：目前只有 hash 路由与 feed 内 `jumpToVideo`。
+3. 「待核实」四项：@mention / 草稿 / WS Resume / 压缩——要么补实现，要么从
+   已完成清单里移除；@mention 可直接复用通知中心的 `mention` 类型。
+4. 前端 JS 无 node/qjs：本轮用 Python 做「括号/字符串闭合 + 关键片段」检查
+   （只覆盖新增通知块），后续可接 quickjs 对整页做 `--check`。

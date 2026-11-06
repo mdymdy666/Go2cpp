@@ -7,7 +7,13 @@
  *          - DELETE /api/like              取消赞（Bearer；幂等）
  *          - POST   /api/comment           发评论（Bearer；1~500 字）
  *          - GET    /api/comment/:video_id 评论列表（倒序 + cursor 分页）
+ *          - GET    /api/notifications          通知列表（Bearer；倒序 + 游标）
+ *          - POST   /api/notifications/read     标记已读（Bearer；ids 或 all）
+ *          - GET    /api/notifications/unread_count 未读数（Bearer）
  *          - GET    /health, /metrics
+ *
+ *          通知写入点（第 2 轮）：视频被赞 / 评论被赞 / 视频被评论（含回复
+ *          父评论作者）；全部「自己触发自己」不写，重复点赞不重复写。
  *
  *          计数同步：每次点赞/取消/评论后调用 `Store::UpdateVideoCounts`
  *          （单事务内按 likes/comments 实表重算），因此 `GET /api/video/:id`
@@ -273,6 +279,125 @@ douyin::Comment PublicComment(const douyin::StoredComment& stored) {
     return comment;
 }
 
+/**
+ * @brief 把 UTF-8 文本截断到最多 `max_chars` 个码点（超出补省略号）。
+ * @param text [in] 任意 UTF-8 文本；按字节扫描，不切开多字节字符。
+ * @param max_chars [in] 允许的最大码点数；0 表示全部截掉。
+ * @return 截断后的新串；未超长时原样返回。
+ * @note 只用于通知摘要（界面单行展示），正文仍以完整内容入库。
+ */
+std::string ClampText(const std::string& text, std::size_t max_chars) {
+    std::size_t chars = 0;
+    for (std::size_t i = 0; i < text.size(); ++i) {
+        if ((static_cast<unsigned char>(text[i]) & 0xC0U) != 0x80U) {
+            if (chars == max_chars) {
+                return text.substr(0, i) + "…";
+            }
+            ++chars;
+        }
+    }
+    return text;
+}
+
+/**
+ * @brief 写一条通知（附属动作）。
+ * @param store [in,out] 已打开的存储；借用。
+ * @param user_id [in] 接收者 id（>0），由调用方保证「不是触发者本人」。
+ * @param actor_id [in] 触发者 id（>0）。
+ * @param kind [in] `like` / `comment` / `follow` / `mention`。
+ * @param target_type [in] `video` / `comment` / `user`。
+ * @param target_id [in] 目标 id（>0）。
+ * @param content [in] 已截断的摘要（可为空）。
+ * @return 无。
+ *
+ * ## 定位
+ * 服务层唯一的通知写入出口；失败只记日志，**不回滚**已完成的点赞/评论。
+ * 错了会怎样：通知丢一条（可接受），但主操作绝不能被通知拖成 500。
+ */
+void AppendNotification(douyin::Store& store, std::int64_t user_id,
+                        std::int64_t actor_id, const char* kind,
+                        const char* target_type, std::int64_t target_id,
+                        const std::string& content) {
+    std::string error;
+    if (!store.AddNotification(user_id, actor_id, kind, target_type, target_id,
+                               content, &error)) {
+        std::fprintf(stderr, "[%s] 写通知失败: %s\n", kServiceName,
+                     error.c_str());
+    }
+}
+
+/**
+ * @brief 解析 JSON 整数数组字段（如 `{"ids":[1,2,3]}`）。
+ * @param body [in] 原始请求体；不是合法 JSON 时按解析失败处理。
+ * @param key [in] 字段名（不含引号）。
+ * @param out [out] 追加解析出的非负整数；失败时内容未定义。
+ * @return 字段存在、数组合法且元素均为十进制整数时 true；否则 false。
+ */
+bool JsonIntArrayField(std::string_view body, std::string_view key,
+                       std::vector<std::int64_t>* out) {
+    const std::string needle = "\"" + std::string(key) + "\"";
+    std::size_t pos = body.find(needle);
+    if (pos == std::string_view::npos) {
+        return false;
+    }
+    pos = body.find('[', pos + needle.size());
+    if (pos == std::string_view::npos) {
+        return false;
+    }
+    ++pos;
+    while (pos < body.size()) {
+        while (pos < body.size() &&
+               (body[pos] == ' ' || body[pos] == '\t' || body[pos] == ',' ||
+                body[pos] == '\r' || body[pos] == '\n')) {
+            ++pos;
+        }
+        if (pos >= body.size()) {
+            return false;
+        }
+        if (body[pos] == ']') {
+            return true;
+        }
+        if (body[pos] < '0' || body[pos] > '9') {
+            return false;
+        }
+        std::int64_t value = 0;
+        while (pos < body.size() && body[pos] >= '0' && body[pos] <= '9') {
+            value = value * 10 + (body[pos] - '0');
+            if (value > 9007199254740991LL) {
+                return false;
+            }
+            ++pos;
+        }
+        out->push_back(value);
+    }
+    return false;
+}
+
+/**
+ * @brief 字段是否为 JSON `true`（如 `{"all":true}`）。
+ * @param body [in] 原始请求体。
+ * @param key [in] 字段名（不含引号）。
+ * @return 字段存在且值为 true 时返回 true；其余情况（含字段缺失）返回 false。
+ */
+bool JsonBoolTrue(std::string_view body, std::string_view key) {
+    const std::string needle = "\"" + std::string(key) + "\"";
+    std::size_t pos = body.find(needle);
+    if (pos == std::string_view::npos) {
+        return false;
+    }
+    pos = body.find(':', pos + needle.size());
+    if (pos == std::string_view::npos) {
+        return false;
+    }
+    ++pos;
+    while (pos < body.size() && (body[pos] == ' ' || body[pos] == '\t')) {
+        ++pos;
+    }
+    return body.compare(pos, 4, "true") == 0;
+}
+
+/// @brief 点赞（幂等）。
+
 /// @brief 点赞（幂等）。
 bool HandleLike(douyin::Store& store, const douyin::HttpRequest& request,
                 douyin::HttpResponse* response) {
@@ -298,6 +423,11 @@ bool HandleLike(douyin::Store& store, const douyin::HttpRequest& request,
     if (inserted < 0) {
         std::fprintf(stderr, "[%s] 点赞失败: %s\n", kServiceName, error.c_str());
         return Fail(response, 500, "数据库错误");
+    }
+    // 视频点赞通知：只有「本次新插入」才写（重复点赞幂等），自己赞自己不写。
+    if (inserted > 0 && video.user_id != actor) {
+        AppendNotification(store, video.user_id, actor, "like", "video",
+                           video_id, ClampText(video.title, 60));
     }
     if (!store.UpdateVideoCounts(video_id, &error)) {
         std::fprintf(stderr, "[%s] 计数同步失败: %s\n", kServiceName,
@@ -427,6 +557,22 @@ bool HandleComment(douyin::Store& store, const douyin::HttpRequest& request,
         std::fprintf(stderr, "[%s] 发评论失败: %s\n", kServiceName,
                      error.c_str());
         return Fail(response, 500, "数据库错误");
+    }
+    // 评论通知：视频作者一条；若是回复，父评论作者再一条（去重、跳过自己）。
+    const std::string summary = ClampText(content, 60);
+    if (video.user_id != actor) {
+        AppendNotification(store, video.user_id, actor, "comment", "video",
+                           video_id, summary);
+    }
+    if (parent_id != 0) {
+        douyin::StoredComment parent_author;
+        std::string parent_error;
+        if (store.FindComment(parent_id, &parent_author, &parent_error) &&
+            parent_author.user_id != actor &&
+            parent_author.user_id != video.user_id) {
+            AppendNotification(store, parent_author.user_id, actor, "comment",
+                               "comment", parent_id, summary);
+        }
     }
     if (!store.UpdateVideoCounts(video_id, &error)) {
         std::fprintf(stderr, "[%s] 计数同步失败: %s\n", kServiceName,
@@ -573,12 +719,18 @@ bool HandleCommentLike(douyin::Store& store, const douyin::HttpRequest& request,
         }
         return Fail(response, 404, "评论不存在");
     }
-    // step3: 幂等写入/删除。
+    // step3: 幂等写入/删除；只有「本次新插入」才写通知（重复点赞不重复写）。
     if (like) {
-        if (store.LikeComment(comment_id, actor, &error) < 0) {
+        const int inserted = store.LikeComment(comment_id, actor, &error);
+        if (inserted < 0) {
             std::fprintf(stderr, "[%s] 评论点赞失败: %s\n", kServiceName,
                          error.c_str());
             return Fail(response, 500, "数据库错误");
+        }
+        // step3.1: 自己赞自己不产生通知；通知失败不影响点赞结果。
+        if (inserted > 0 && comment.user_id != actor) {
+            AppendNotification(store, comment.user_id, actor, "like", "comment",
+                               comment_id, ClampText(comment.content, 60));
         }
     } else if (!store.UnlikeComment(comment_id, actor, &error)) {
         std::fprintf(stderr, "[%s] 取消评论点赞失败: %s\n", kServiceName,
@@ -597,6 +749,176 @@ bool HandleCommentLike(douyin::Store& store, const douyin::HttpRequest& request,
     response->body = std::string("{\"ok\":true,\"liked\":") +
                      (like ? "true" : "false") + ",\"like_count\":" +
                      std::to_string(one[0].like_count) + "}";
+    return true;
+}
+
+/**
+ * @brief 单条通知序列化为 JSON。
+ * @param item [in] 存储层一行（actor_name 已由 JOIN 回填）。
+ * @return 单行 JSON 对象；文本字段全部转义。
+ */
+std::string NotificationJson(const douyin::StoredNotification& item) {
+    return std::string("{\"id\":") + std::to_string(item.id) +
+           ",\"user_id\":" + std::to_string(item.user_id) +
+           ",\"actor_id\":" + std::to_string(item.actor_id) +
+           ",\"actor_name\":\"" + douyin::JsonEscape(item.actor_name) + "\"" +
+           ",\"kind\":\"" + douyin::JsonEscape(item.kind) + "\"" +
+           ",\"target_type\":\"" + douyin::JsonEscape(item.target_type) + "\"" +
+           ",\"target_id\":" + std::to_string(item.target_id) +
+           ",\"content\":\"" + douyin::JsonEscape(item.content) + "\"" +
+           ",\"created_at\":" + std::to_string(item.created_at) +
+           ",\"read_at\":" + std::to_string(item.read_at) + "}";
+}
+
+/**
+ * @brief 通知列表：`GET /api/notifications?cursor=&limit=20`。
+ *
+ * @param store [in,out] 已打开的存储；借用。
+ * @param request [in] 原始请求；必须带有效 Bearer token。
+ * @param response [out] 成功写 `{ok,items,unread_count,next_cursor}`；
+ *        失败写统一错误体。不可为 nullptr。
+ * @return 恒为 true（已处理）。
+ *
+ * ## 定位
+ * 消息中心唯一列表入口。错了会怎样：别人能看到不属于自己的通知
+ * （鉴权/过滤错），或分页重复/漏条。
+ *
+ * ## 步骤
+ * step1. 鉴权——通知是私密数据，匿名必须 401，不能像评论列表那样降级。
+ * step2. 校验游标格式；非法回 400（不是 500）。
+ * step3. 列表查询（1 条 SQL，JOIN 回填昵称）。
+ * step4. 未读数（1 条 COUNT，走索引）；两次查询固定条数，不随页大小增长。
+ */
+bool HandleNotifications(douyin::Store& store, const douyin::HttpRequest& request,
+                         douyin::HttpResponse* response) {
+    // step1: 鉴权。
+    std::int64_t viewer = 0;
+    if (!RequireToken(request, response, &viewer)) {
+        return true;
+    }
+    // step2: 游标。
+    const std::string cursor_text = douyin::QueryParam(request, "cursor");
+    std::int64_t cursor_created = 0;
+    std::int64_t cursor_id = 0;
+    if (!cursor_text.empty() &&
+        !douyin::DecodeNotificationCursor(cursor_text, &cursor_created,
+                                          &cursor_id)) {
+        return Fail(response, 400, "cursor 非法");
+    }
+    // step3: 列表。
+    const std::int64_t limit = ParseLimit(request);
+    std::vector<douyin::StoredNotification> items;
+    std::string next_cursor;
+    std::string error;
+    if (!store.ListNotifications(viewer, cursor_text, limit, &items, &next_cursor,
+                                 &error)) {
+        std::fprintf(stderr, "[%s] 查询通知失败: %s\n", kServiceName,
+                     error.c_str());
+        return Fail(response, 500, "数据库错误");
+    }
+    // step4: 未读数——固定再多一条 COUNT，不做 N+1。
+    const std::int64_t unread = store.CountUnreadNotifications(viewer, &error);
+    if (unread < 0) {
+        std::fprintf(stderr, "[%s] 统计未读失败: %s\n", kServiceName,
+                     error.c_str());
+        return Fail(response, 500, "数据库错误");
+    }
+    std::string body = "{\"ok\":true,\"items\":[";
+    for (std::size_t i = 0; i < items.size(); ++i) {
+        if (i != 0) {
+            body += ',';
+        }
+        body += NotificationJson(items[i]);
+    }
+    body += "],\"unread_count\":" + std::to_string(unread) +
+            ",\"next_cursor\":\"" + douyin::JsonEscape(next_cursor) + "\"}";
+    response->status = 200;
+    response->body = std::move(body);
+    return true;
+}
+
+/**
+ * @brief 未读数：`GET /api/notifications/unread_count`。
+ * @param store [in,out] 已打开的存储；借用。
+ * @param request [in] 原始请求；必须带有效 Bearer token。
+ * @param response [out] 成功写 `{ok,unread_count}`。不可为 nullptr。
+ * @return 恒为 true。
+ *
+ * ## 定位
+ * 顶部徽章的唯一数据源；每次轮询只跑一条索引 COUNT。
+ */
+bool HandleUnreadCount(douyin::Store& store, const douyin::HttpRequest& request,
+                       douyin::HttpResponse* response) {
+    std::int64_t viewer = 0;
+    if (!RequireToken(request, response, &viewer)) {
+        return true;
+    }
+    std::string error;
+    const std::int64_t unread = store.CountUnreadNotifications(viewer, &error);
+    if (unread < 0) {
+        std::fprintf(stderr, "[%s] 统计未读失败: %s\n", kServiceName,
+                     error.c_str());
+        return Fail(response, 500, "数据库错误");
+    }
+    response->status = 200;
+    response->body = std::string("{\"ok\":true,\"unread_count\":") +
+                     std::to_string(unread) + "}";
+    return true;
+}
+
+/**
+ * @brief 标记已读：`POST /api/notifications/read`，body `{"ids":[...]}`
+ *        或 `{"all":true}`。
+ *
+ * @param store [in,out] 已打开的存储；借用。
+ * @param request [in] 原始请求；必须带有效 Bearer token。
+ * @param response [out] 成功写 `{ok,updated,unread_count}`。不可为 nullptr。
+ * @return 恒为 true。
+ *
+ * ## 定位
+ * 未读归零的唯一入口。错了会怎样：把别人的通知标成已读（越权写），
+ * 或徽章数字与列表不一致。
+ *
+ * ## 步骤
+ * step1. 鉴权。
+ * step2. 解析 body：all=true 优先；否则必须给合法 ids 数组（空数组合法）。
+ * step3. UPDATE 带 user_id 条件，天然只能改自己的。
+ * step4. 回填最新未读数，前端直接用，不再发第二次请求。
+ */
+bool HandleNotificationsRead(douyin::Store& store,
+                             const douyin::HttpRequest& request,
+                             douyin::HttpResponse* response) {
+    // step1: 鉴权。
+    std::int64_t viewer = 0;
+    if (!RequireToken(request, response, &viewer)) {
+        return true;
+    }
+    // step2: body。
+    const bool all = JsonBoolTrue(request.body, "all");
+    std::vector<std::int64_t> ids;
+    if (!all && !JsonIntArrayField(request.body, "ids", &ids)) {
+        return Fail(response, 400, "ids 或 all 必须提供");
+    }
+    // step3: 标记。
+    std::string error;
+    const std::int64_t updated =
+        store.MarkNotificationsRead(viewer, ids, all, &error);
+    if (updated < 0) {
+        std::fprintf(stderr, "[%s] 标记通知已读失败: %s\n", kServiceName,
+                     error.c_str());
+        return Fail(response, 500, "数据库错误");
+    }
+    // step4: 未读数。
+    const std::int64_t unread = store.CountUnreadNotifications(viewer, &error);
+    if (unread < 0) {
+        std::fprintf(stderr, "[%s] 统计未读失败: %s\n", kServiceName,
+                     error.c_str());
+        return Fail(response, 500, "数据库错误");
+    }
+    response->status = 200;
+    response->body = std::string("{\"ok\":true,\"updated\":") +
+                     std::to_string(updated) + ",\"unread_count\":" +
+                     std::to_string(unread) + "}";
     return true;
 }
 
@@ -630,6 +952,25 @@ bool Handle(douyin::Store& store, const douyin::HttpRequest& request,
     if (request.path == "/api/comment") {
         if (request.method == "POST") {
             return HandleComment(store, request, response);
+        }
+        return Fail(response, 405, "方法不允许");
+    }
+    // 通知接口：精确路径匹配，必须在评论路径解析之前判断，避免被当成视频 id。
+    if (request.path == "/api/notifications") {
+        if (request.method == "GET") {
+            return HandleNotifications(store, request, response);
+        }
+        return Fail(response, 405, "方法不允许");
+    }
+    if (request.path == "/api/notifications/unread_count") {
+        if (request.method == "GET") {
+            return HandleUnreadCount(store, request, response);
+        }
+        return Fail(response, 405, "方法不允许");
+    }
+    if (request.path == "/api/notifications/read") {
+        if (request.method == "POST") {
+            return HandleNotificationsRead(store, request, response);
         }
         return Fail(response, 405, "方法不允许");
     }

@@ -246,11 +246,29 @@ bool HandleFollow(douyin::Store& store, const douyin::HttpRequest& request,
     // 写前清空 ORM 语句缓存：FindUserById 提前结束会残留读游标，
     // 多服务共享 WAL 库时会让本进程的写触发 SQLITE_BUSY_SNAPSHOT。
     store.ResetStatements();
+    // 关注通知：先查旧状态，只有「从未关注 → 关注」这一跳才写一条；
+    // 重复关注不重复提醒（Follow 本身是 INSERT OR IGNORE）。
+    bool was_following = false;
+    bool status_known = true;
+    if (follow && !store.IsFollowing(actor, target_id, &was_following, &error)) {
+        status_known = false;
+        std::fprintf(stderr, "[%s] 查询关注状态失败: %s\n", kServiceName,
+                     error.c_str());
+    }
     const bool ok = follow ? store.Follow(actor, target_id, &error)
                            : store.Unfollow(actor, target_id, &error);
     if (!ok) {
         std::fprintf(stderr, "[%s] 关注操作失败: %s\n", kServiceName, error.c_str());
         return Fail(response, 500, "数据库错误");
+    }
+    if (follow && status_known && !was_following) {
+        std::string notify_error;
+        if (!store.AddNotification(target_id, actor, "follow", "user", target_id,
+                                   std::string(), &notify_error)) {
+            // 通知是附属动作：写失败只记日志，不能把已经成功的关注改成 500。
+            std::fprintf(stderr, "[%s] 写关注通知失败: %s\n", kServiceName,
+                         notify_error.c_str());
+        }
     }
     // 响应带上目标用户的最新粉丝数，前端可直接刷新按钮旁的数字。
     std::int64_t followers = 0;

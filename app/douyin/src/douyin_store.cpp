@@ -168,6 +168,19 @@ bool DecodeCommentCursor(const std::string& cursor, std::int64_t* created_at,
     return DecodeVideoCursor(cursor, created_at, id);
 }
 
+std::string EncodeNotificationCursor(const StoredNotification& notification) {
+    if (notification.id <= 0) {
+        return std::string();
+    }
+    return std::to_string(notification.created_at) + "-" +
+           std::to_string(notification.id);
+}
+
+bool DecodeNotificationCursor(const std::string& cursor,
+                              std::int64_t* created_at, std::int64_t* id) {
+    return DecodeVideoCursor(cursor, created_at, id);
+}
+
 namespace {
 
 /// @brief 建表 + 索引脚本（幂等）。
@@ -252,7 +265,25 @@ constexpr const char* kSchemaSql =
     "  user_id INTEGER NOT NULL,"
     "  created_at INTEGER NOT NULL,"
     "  PRIMARY KEY (comment_id, user_id)"
-    ");";
+    ");"
+    // 消息通知：read_at=0 表示未读。两个索引各司其职：
+    //   unread   —— 未读计数与「只看未读」，前缀 (user_id, read_at) 精确命中；
+    //   timeline —— 通知列表按时间倒序，直接走索引顺序，避免临时排序。
+    "CREATE TABLE IF NOT EXISTS notifications ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  user_id INTEGER NOT NULL,"
+    "  actor_id INTEGER NOT NULL,"
+    "  kind TEXT NOT NULL,"
+    "  target_type TEXT NOT NULL,"
+    "  target_id INTEGER NOT NULL,"
+    "  content TEXT NOT NULL DEFAULT '',"
+    "  created_at INTEGER NOT NULL,"
+    "  read_at INTEGER NOT NULL DEFAULT 0"
+    ");"
+    "CREATE INDEX IF NOT EXISTS idx_notifications_unread "
+    "ON notifications(user_id, read_at, created_at);"
+    "CREATE INDEX IF NOT EXISTS idx_notifications_timeline "
+    "ON notifications(user_id, created_at DESC, id DESC);";
 
 /// @brief 把 `Error` 写成可读文本。
 std::string DescribeError(const go2cpp::storage::Error& error) {
@@ -1436,6 +1467,220 @@ bool Store::FillCommentLikes(std::int64_t viewer_id,
         comment.liked = viewer_id > 0 && liked.find(comment.id) != liked.end();
     }
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// 消息通知中心：notifications
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// @brief 合法通知类型；未知 kind 拒绝，避免脏数据让前端渲染成未知文案。
+bool IsValidNotificationKind(std::string_view kind) {
+    return kind == "like" || kind == "comment" || kind == "follow" ||
+           kind == "mention";
+}
+
+/// @brief 合法通知目标类型。
+bool IsValidNotificationTargetType(std::string_view type) {
+    return type == "video" || type == "comment" || type == "user";
+}
+
+}  // namespace
+
+bool Store::AddNotification(std::int64_t user_id, std::int64_t actor_id,
+                            const std::string& kind,
+                            const std::string& target_type,
+                            std::int64_t target_id,
+                            const std::string& content, std::string* error) {
+    // step1: 参数校验——脏数据写进去只能靠人工清理，宁可不写。
+    if (user_id <= 0 || actor_id <= 0 || target_id <= 0 ||
+        !IsValidNotificationKind(kind) ||
+        !IsValidNotificationTargetType(target_type)) {
+        if (error != nullptr) {
+            *error = "通知参数非法";
+        }
+        return false;
+    }
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return false;
+    }
+    // step2: 单条 INSERT；created_at 用当前 Unix 秒（与其它表一致）。
+    auto inserted = m_db->Exec(
+        "INSERT INTO notifications(user_id, actor_id, kind, target_type, "
+        "target_id, content, created_at, read_at) VALUES(?, ?, ?, ?, ?, ?, ?, 0)",
+        user_id, actor_id, kind, target_type, target_id, content,
+        static_cast<std::int64_t>(std::time(nullptr)));
+    if (!inserted) {
+        if (error != nullptr) {
+            *error = "写通知失败: " + DescribeError(inserted.Err());
+        }
+        return false;
+    }
+    return true;
+}
+
+bool Store::ListNotifications(std::int64_t user_id, const std::string& cursor,
+                              std::int64_t limit,
+                              std::vector<StoredNotification>* out,
+                              std::string* next_cursor, std::string* error) {
+    next_cursor->clear();
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return false;
+    }
+    if (limit <= 0) {
+        return true;
+    }
+    const bool has_cursor = !cursor.empty();
+    std::int64_t cursor_created = 0;
+    std::int64_t cursor_id = 0;
+    if (has_cursor &&
+        !DecodeNotificationCursor(cursor, &cursor_created, &cursor_id)) {
+        if (error != nullptr) {
+            *error = "cursor 非法";
+        }
+        return false;
+    }
+
+    // step1: 一条 JOIN 取整页 + 触发者昵称；多取一条判断是否还有下一页。
+    std::string sql =
+        "SELECT n.id, n.user_id, n.actor_id, COALESCE(u.name, ''), n.kind,"
+        " n.target_type, n.target_id, n.content, n.created_at, n.read_at"
+        " FROM notifications n LEFT JOIN users u ON u.id = n.actor_id"
+        " WHERE n.user_id = ?";
+    if (has_cursor) {
+        sql += " AND (n.created_at < ? OR (n.created_at = ? AND n.id < ?))";
+    }
+    sql += " ORDER BY n.created_at DESC, n.id DESC LIMIT ?";
+
+    auto rows = has_cursor
+                    ? m_db->Query(sql, user_id, cursor_created, cursor_created,
+                                  cursor_id, limit + 1)
+                    : m_db->Query(sql, user_id, limit + 1);
+    if (!rows) {
+        if (error != nullptr) {
+            *error = "查询通知失败: " + DescribeError(rows.Err());
+        }
+        return false;
+    }
+    std::vector<StoredNotification> page;
+    while (rows.Value().Next()) {
+        StoredNotification item;
+        item.id = rows.Value().Int64(0);
+        item.user_id = rows.Value().Int64(1);
+        item.actor_id = rows.Value().Int64(2);
+        item.actor_name = rows.Value().Text(3);
+        item.kind = rows.Value().Text(4);
+        item.target_type = rows.Value().Text(5);
+        item.target_id = rows.Value().Int64(6);
+        item.content = rows.Value().Text(7);
+        item.created_at = rows.Value().Int64(8);
+        item.read_at = rows.Value().Int64(9);
+        page.push_back(std::move(item));
+    }
+    if (rows.Value().Err()) {
+        if (error != nullptr) {
+            *error = "遍历通知失败: " + DescribeError(rows.Value().Err());
+        }
+        return false;
+    }
+    // step2: 多取的一条只用于判断「还有下一页」，不返回给调用方。
+    if (static_cast<std::int64_t>(page.size()) > limit) {
+        page.resize(static_cast<std::size_t>(limit));
+        if (!page.empty()) {
+            *next_cursor = EncodeNotificationCursor(page.back());
+        }
+    }
+    for (StoredNotification& item : page) {
+        out->push_back(std::move(item));
+    }
+    return true;
+}
+
+std::int64_t Store::CountUnreadNotifications(std::int64_t user_id,
+                                             std::string* error) {
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return -1;
+    }
+    auto rows = m_db->Query(
+        "SELECT COUNT(*) FROM notifications WHERE user_id = ? AND read_at = 0",
+        user_id);
+    if (!rows) {
+        if (error != nullptr) {
+            *error = "统计未读通知失败: " + DescribeError(rows.Err());
+        }
+        return -1;
+    }
+    if (!rows.Value().Next()) {
+        if (error != nullptr) {
+            *error = "统计未读通知失败: 空结果";
+        }
+        return -1;
+    }
+    return rows.Value().Int64(0);
+}
+
+std::int64_t Store::MarkNotificationsRead(std::int64_t user_id,
+                                          const std::vector<std::int64_t>& ids,
+                                          bool all, std::string* error) {
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return -1;
+    }
+    const std::int64_t now = static_cast<std::int64_t>(std::time(nullptr));
+    // step1: 全部已读——一条 UPDATE 命中 (user_id, read_at) 索引前缀。
+    if (all) {
+        auto updated = m_db->Exec(
+            "UPDATE notifications SET read_at = ?"
+            " WHERE user_id = ? AND read_at = 0",
+            now, user_id);
+        if (!updated) {
+            if (error != nullptr) {
+                *error = "标记通知已读失败: " + DescribeError(updated.Err());
+            }
+            return -1;
+        }
+        return updated.Value().changes;
+    }
+    // step2: 按 id 标记——只拼库内自增 id（无用户输入），最多 100 个。
+    std::string id_list;
+    id_list.reserve(ids.size() * 8);
+    std::size_t valid = 0;
+    for (const std::int64_t id : ids) {
+        if (id <= 0) {
+            continue;
+        }
+        if (valid++ != 0) {
+            id_list += ',';
+        }
+        id_list += std::to_string(id);
+    }
+    if (valid == 0) {
+        return 0;
+    }
+    // WHERE 里带 user_id：ids 混入别人的通知时天然 0 行受影响。
+    auto updated = m_db->Exec(
+        "UPDATE notifications SET read_at = ? WHERE user_id = ?"
+        " AND read_at = 0 AND id IN (" + id_list + ")",
+        now, user_id);
+    if (!updated) {
+        if (error != nullptr) {
+            *error = "标记通知已读失败: " + DescribeError(updated.Err());
+        }
+        return -1;
+    }
+    return updated.Value().changes;
 }
 
 // ---------------------------------------------------------------------------

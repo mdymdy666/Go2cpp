@@ -845,6 +845,12 @@ int main(int argc, char** argv) {
                  false, 0, "comment-read") &&
         AddRoute(gateway.get(), kWriteMask, "/api/comment/**", kInteractionPort,
                  true, 10, "comment-write") &&
+        // 通知是私密数据：读接口也必须带 Bearer（与评论/feed 的公开读不同），
+        // 网关先 401 掉匿名请求，上游只处理「已认证但可能越权」的读写。
+        AddRoute(gateway.get(), kReadMask, "/api/notifications/**",
+                 kInteractionPort, true, 0, "notification-read") &&
+        AddRoute(gateway.get(), kWriteMask, "/api/notifications/**",
+                 kInteractionPort, true, 10, "notification-write") &&
         AddRoute(gateway.get(), kReadMask, "/api/live/**", kLivePort, false, 0,
                  "live-read") &&
         AddRoute(gateway.get(), kWriteMask, "/api/live/**", kLivePort, true, 10,

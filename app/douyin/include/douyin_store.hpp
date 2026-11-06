@@ -81,6 +81,22 @@ struct StoredComment {
     bool liked{false};           ///< 当前查看者是否点过赞；匿名查看恒为 false。
 };
 
+/// @brief `notifications` 表里的一行通知（消息中心，第 2 轮新增）。
+/// @note `actor_name` 不是表列：查询时 `LEFT JOIN users` 回填，避免写入端
+///       冗余昵称、改名后不同步。
+struct StoredNotification {
+    std::int64_t id{0};          ///< 自增主键。
+    std::int64_t user_id{0};     ///< 接收者（通知归属人）。
+    std::int64_t actor_id{0};    ///< 触发者（点赞/评论/关注的人）。
+    std::string actor_name;      ///< 触发者昵称（JOIN 回填；可能为空）。
+    std::string kind;            ///< 类型：like / comment / follow / mention。
+    std::string target_type;     ///< 目标类型：video / comment / user。
+    std::int64_t target_id{0};   ///< 目标 id（配合 target_type）。
+    std::string content;         ///< 摘要（评论/标题截断；follow 为空）。
+    std::int64_t created_at{0};  ///< Unix 秒。
+    std::int64_t read_at{0};     ///< 已读 Unix 秒；0 = 未读。
+};
+
 /**
  * @brief 编码视频分页游标：`"<created_at>-<id>"`（十进制，两个非负整数）。
  * @param video 游标指向的视频（通常是本页最后一条）。
@@ -108,6 +124,23 @@ std::string EncodeCommentCursor(const StoredComment& comment);
 /// @brief 解码评论分页游标；规则同 `DecodeVideoCursor`。
 bool DecodeCommentCursor(const std::string& cursor, std::int64_t* created_at,
                          std::int64_t* id);
+
+/**
+ * @brief 编码通知分页游标：`"<created_at>-<id>"`，与评论/视频游标同构。
+ * @param notification [in] 游标指向的通知（通常是本页最后一条）。
+ * @return 形如 `1762260000-42` 的串；`id<=0` 时返回空串（表示没有更多）。
+ */
+std::string EncodeNotificationCursor(const StoredNotification& notification);
+
+/**
+ * @brief 解码通知分页游标。
+ * @param cursor [in] 非空游标串，来自 `EncodeNotificationCursor`。
+ * @param created_at [out] 输出 created_at；不可为 nullptr。
+ * @param id [out] 输出 id；不可为 nullptr。
+ * @return 格式合法且两个数均 >0 时返回 true；否则 false（调用方回 400）。
+ */
+bool DecodeNotificationCursor(const std::string& cursor,
+                              std::int64_t* created_at, std::int64_t* id);
 
 /**
  * @brief 编码推荐流随机游标：`"r<seed_hex>_<index>"`。
@@ -499,6 +532,86 @@ class Store {
     bool FillCommentLikes(std::int64_t viewer_id,
                           std::vector<StoredComment>* comments,
                           std::string* error);
+
+    // ---- 消息通知中心：notifications（第 2 轮新增，只加不改既有） ----
+
+    /**
+     * @brief 写一条通知（「该不该写」由服务层判定，存储层只负责落库）。
+     *
+     * @param user_id [in] 接收者 id；必须 > 0。
+     * @param actor_id [in] 触发者 id；必须 > 0。
+     * @param kind [in] 通知类型，只接受 `like` / `comment` / `follow` /
+     *        `mention`；其它值视为脏数据拒绝。
+     * @param target_type [in] 目标类型：`video` / `comment` / `user`。
+     * @param target_id [in] 目标 id（> 0）。
+     * @param content [in] 摘要文本（可为空）；存储层不截断，调用方负责长度。
+     * @param error [out] 失败时写错误文本；成功时保持原值。
+     * @return 成功返回 true。
+     *
+     * ## 定位
+     * 通知写入的**唯一**提交点。错了会怎样：面板出现不存在的人/视频，
+     * 或未读计数虚高。
+     *
+     * ## 并发/失败语义
+     * - 调用线程：HTTP 事件循环单线程；无需锁。
+     * - 失败语义：返回 false 时调用方**不要**回滚主操作（点赞/评论已生效），
+     *   只记日志——丢一条通知不影响数据一致性。
+     */
+    bool AddNotification(std::int64_t user_id, std::int64_t actor_id,
+                         const std::string& kind,
+                         const std::string& target_type,
+                         std::int64_t target_id, const std::string& content,
+                         std::string* error);
+
+    /**
+     * @brief 通知列表：按时间倒序 keyset 分页，一次 JOIN 回填触发者昵称。
+     *
+     * @param user_id [in] 接收者 id（只返回这个人的通知）。
+     * @param cursor [in] 空串=第一页；否则为本页最后一条的游标。
+     * @param limit [in] 期望条数；<=0 返回空页（不当成错误）。
+     * @param out [out] 追加到末尾（不清空调用方已有内容）。
+     * @param next_cursor [out] 还有下一页时写游标，否则空串。
+     * @param error [out] 失败时写错误文本。
+     * @return 成功返回 true；cursor 非法时 error 写 `cursor 非法`。
+     *
+     * ## 性能
+     * 固定 1 条 SQL（`LIMIT limit+1` 判断下一页），命中
+     * `idx_notifications_timeline(user_id, created_at DESC, id DESC)`；
+     * 昵称用 JOIN 而不是逐条查，避免 N+1。
+     */
+    bool ListNotifications(std::int64_t user_id, const std::string& cursor,
+                           std::int64_t limit,
+                           std::vector<StoredNotification>* out,
+                           std::string* next_cursor, std::string* error);
+
+    /**
+     * @brief 未读数：`SELECT COUNT(*) ... WHERE user_id=? AND read_at=0`。
+     * @param user_id [in] 接收者 id。
+     * @param error [out] 失败时写错误文本。
+     * @return 未读数（>=0）；出错返回 -1。
+     *
+     * ## 性能
+     * 单条 COUNT，命中 `idx_notifications_unread(user_id, read_at, ...)`，
+     * 不扫描全表。
+     */
+    std::int64_t CountUnreadNotifications(std::int64_t user_id,
+                                          std::string* error);
+
+    /**
+     * @brief 标记已读：按 id 列表或全部。
+     *
+     * @param user_id [in] 接收者 id；SQL 里同时作为条件，**别人的通知改不到**。
+     * @param ids [in] 要标记的通知 id；`all=true` 时忽略。
+     * @param all [in] true=把这个人的全部未读标成已读。
+     * @param error [out] 失败时写错误文本。
+     * @return 实际更新的行数（>=0）；出错返回 -1。
+     *
+     * ## 定位
+     * 未读数归零的唯一入口。错了会怎样：徽章数字与列表状态不一致。
+     */
+    std::int64_t MarkNotificationsRead(std::int64_t user_id,
+                                       const std::vector<std::int64_t>& ids,
+                                       bool all, std::string* error);
 
     // ---- C6 搜索：name/title 包含匹配（大小写不敏感） ----
 

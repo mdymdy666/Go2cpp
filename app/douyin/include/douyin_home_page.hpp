@@ -415,6 +415,66 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
   }
   .cp-form button:disabled { opacity: .5; cursor: default; }
 
+  /* ---------- 消息通知（顶部铃铛 + 右侧抽屉） ---------- */
+  .bell {
+    position: relative; padding: 6px 10px; font-size: 16px; line-height: 1;
+    color: var(--text); background: rgba(20, 20, 28, .82);
+    border: 1px solid var(--line); border-radius: 9px;
+    transition: border-color .16s;
+  }
+  .bell:hover { border-color: rgba(255, 255, 255, .24); }
+  .bell-badge {
+    position: absolute; top: -6px; right: -6px;
+    min-width: 17px; height: 17px; padding: 0 4px;
+    font-size: 10px; font-weight: 700; line-height: 17px; text-align: center;
+    color: #fff; background: var(--pink); border-radius: 999px;
+    box-shadow: 0 0 0 2px rgba(0, 0, 0, .5);
+  }
+  .notif-panel {
+    position: fixed; top: 0; right: 0; bottom: 0; z-index: 65;
+    width: min(420px, 100%);
+    display: flex; flex-direction: column;
+    background: var(--panel);
+    border-left: 1px solid var(--line);
+    box-shadow: -24px 0 60px -30px rgba(0, 0, 0, .95);
+    transform: translateX(102%);
+    transition: transform .26s cubic-bezier(.4, 0, .2, 1);
+  }
+  .notif-panel.open { transform: translateX(0); }
+  .notif-item {
+    display: flex; gap: 11px; align-items: flex-start;
+    padding: 12px 4px; border-bottom: 1px solid var(--line);
+    cursor: pointer; border-radius: 10px;
+    transition: background .15s;
+  }
+  .notif-item:hover { background: rgba(255, 255, 255, .04); }
+  .notif-item.unread .notif-line { color: #fff; font-weight: 600; }
+  .notif-item.unread::before {
+    content: ''; width: 7px; height: 7px; margin-top: 7px; flex: none;
+    border-radius: 50%; background: var(--pink);
+    box-shadow: 0 0 8px rgba(254, 44, 85, .8);
+  }
+  .notif-ico {
+    width: 30px; height: 30px; flex: none; display: grid; place-items: center;
+    font-size: 15px; background: #23232e; border-radius: 50%;
+  }
+  .notif-body { min-width: 0; flex: 1; }
+  .notif-line { font-size: 13.5px; line-height: 1.5; color: #d5d7e2; word-break: break-word; }
+  .notif-meta {
+    margin-top: 3px; font-size: 11.5px; color: var(--muted);
+    display: flex; gap: 8px; flex-wrap: wrap;
+  }
+  .notif-quote {
+    max-width: 100%; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .notif-more {
+    margin: 10px 16px calc(14px + env(safe-area-inset-bottom));
+    padding: 9px; font-size: 13px; color: var(--muted);
+    background: #23232e; border: 1px solid var(--line); border-radius: 10px;
+  }
+  .notif-more:hover { color: var(--text); }
+
   /* ---------- 顶部搜索框与搜索结果页（用户 / 视频 / 话题） ---------- */
   .nav-search { display: flex; align-items: center; gap: 6px; }
   .nav-search input {
@@ -673,6 +733,9 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     <button class="btn-primary" id="navSearchBtn" type="button">搜索</button>
   </div>
   <div class="auth">
+    <button class="bell" id="notifBtn" type="button" title="消息通知"
+            aria-label="消息通知" style="display:none">🔔<span class="bell-badge"
+            id="notifBadge" hidden>0</span></button>
     <span class="who" id="who" title="点击进入我的主页"><span class="dot"></span><b id="whoName"></b></span>
     <input class="login-only" id="email" type="email" value="admin@demo.local"
            placeholder="邮箱" autocomplete="username" spellcheck="false">
@@ -728,6 +791,19 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     <input id="cpInput" type="text" maxlength="500" placeholder="说点什么…" autocomplete="off">
     <button id="cpSend" type="submit">发送</button>
   </form>
+</aside>
+
+<aside class="notif-panel" id="notifPanel" aria-label="消息通知" aria-hidden="true">
+  <div class="cp-head">
+    <div class="cp-titles">
+      <b>消息通知</b>
+      <span id="notifSub">全部已读</span>
+    </div>
+    <button class="btn-ghost" id="notifAllRead" type="button">全部已读</button>
+    <button class="cp-close" id="notifClose" type="button" aria-label="关闭通知">✕</button>
+  </div>
+  <div class="cp-list" id="notifList"><div class="cp-empty">加载中…</div></div>
+  <button class="notif-more" id="notifMore" type="button" hidden>加载更多</button>
 </aside>
 
 <section class="profile-view" id="profileView" hidden aria-label="用户主页">
@@ -946,6 +1022,15 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     if (mineBtn) mineBtn.style.display = isIn ? '' : 'none';
     var favBtn = document.getElementById('favBtn');
     if (favBtn) favBtn.style.display = isIn ? '' : 'none';
+    var notifBtn = document.getElementById('notifBtn');
+    if (notifBtn) notifBtn.style.display = isIn ? '' : 'none';
+    if (isIn) {
+      refreshUnreadNotifications();
+    } else {
+      notifState.unread = 0;
+      paintNotifBadge();
+      closeNotifications();
+    }
     loadFavorites();
   }
 
@@ -1295,6 +1380,228 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     panelEl.setAttribute('aria-hidden', 'true');
     backdropEl.classList.remove('show');
     state.panelSlide = null;
+  }
+
+  /* ---------- 消息通知中心 ---------- */
+
+  var notifPanelEl = document.getElementById('notifPanel');
+  var notifListEl = document.getElementById('notifList');
+  var notifSubEl = document.getElementById('notifSub');
+  var notifBadgeEl = document.getElementById('notifBadge');
+  var notifMoreBtn = document.getElementById('notifMore');
+  var notifState = { items: [], cursor: '', unread: 0, loading: false };
+
+  /* 类型 → 图标；后端已限制 kind 枚举，未知识别成 @mention 兜底。 */
+  function notifIcon(kind) {
+    if (kind === 'like') return '❤️';
+    if (kind === 'comment') return '💬';
+    if (kind === 'follow') return '➕';
+    return '@';
+  }
+
+  /* 相对时间：<1 分钟「刚刚」，<1 小时「N 分钟前」，<1 天「N 小时前」，
+     7 天内「N 天前」，更早显示日期。 */
+  function fmtAgo(ts) {
+    var n = Number(ts) || 0;
+    if (!n) return '';
+    var diff = Math.max(0, Math.floor(Date.now() / 1000) - n);
+    if (diff < 60) return '刚刚';
+    if (diff < 3600) return Math.floor(diff / 60) + ' 分钟前';
+    if (diff < 86400) return Math.floor(diff / 3600) + ' 小时前';
+    if (diff < 7 * 86400) return Math.floor(diff / 86400) + ' 天前';
+    return fmtTime(n).slice(0, 10);
+  }
+
+  /* 文案：谁 + 做了什么；content 是后端截断后的摘要。 */
+  function notifLine(n) {
+    var who = n.actor_name || ('用户#' + n.actor_id);
+    if (n.kind === 'like') {
+      return who + (n.target_type === 'comment' ? ' 赞了你的评论' : ' 赞了你的视频');
+    }
+    if (n.kind === 'comment') {
+      return who + (n.target_type === 'comment' ? ' 回复了你的评论' : ' 评论了你的视频');
+    }
+    if (n.kind === 'follow') return who + ' 关注了你';
+    return who + ' 提到了你';
+  }
+
+  function paintNotifBadge() {
+    if (!notifBadgeEl) return;
+    var n = Number(notifState.unread) || 0;
+    if (n <= 0) {
+      notifBadgeEl.hidden = true;
+      notifBadgeEl.textContent = '';
+      return;
+    }
+    notifBadgeEl.hidden = false;
+    notifBadgeEl.textContent = n > 99 ? '99+' : String(n);
+  }
+
+  /* 未读徽章：登录后拉一次，之后每 30 秒轻量轮询；失败静默不打扰用户。 */
+  function refreshUnreadNotifications() {
+    if (!state.token) { notifState.unread = 0; paintNotifBadge(); return; }
+    api('api/notifications/unread_count')
+      .then(function (data) {
+        notifState.unread = Number(data.unread_count) || 0;
+        paintNotifBadge();
+      })
+      .catch(function () { /* 徽章失败保持旧值 */ });
+  }
+
+  function notifEmpty(text) {
+    notifListEl.innerHTML = '<div class="cp-empty">' + text + '</div>';
+  }
+
+  /* 单条通知：未读行加左侧粉点；点击标已读并按目标跳转。 */
+  function notifItemEl(n) {
+    var row = document.createElement('div');
+    row.className = 'notif-item' + (n.read_at ? '' : ' unread');
+    row.dataset.id = String(n.id);
+    var icon = document.createElement('span');
+    icon.className = 'notif-ico';
+    icon.textContent = notifIcon(n.kind);
+    var body = document.createElement('div');
+    body.className = 'notif-body';
+    var line = document.createElement('div');
+    line.className = 'notif-line';
+    line.textContent = notifLine(n);
+    var meta = document.createElement('div');
+    meta.className = 'notif-meta';
+    var time = document.createElement('span');
+    time.textContent = fmtAgo(n.created_at);
+    meta.appendChild(time);
+    if (n.content) {
+      var quote = document.createElement('span');
+      quote.className = 'notif-quote';
+      quote.textContent = '「' + n.content + '」';
+      meta.appendChild(quote);
+    }
+    body.appendChild(line);
+    body.appendChild(meta);
+    row.appendChild(icon);
+    row.appendChild(body);
+    row.addEventListener('click', function () { openNotification(n, row); });
+    return row;
+  }
+
+  function renderNotifications() {
+    notifListEl.innerHTML = '';
+    if (!notifState.items.length) {
+      notifEmpty(state.token ? '还没有新消息，去发点视频吧' : '登录后查看消息');
+      notifMoreBtn.hidden = true;
+      notifSubEl.textContent = '全部已读';
+      return;
+    }
+    notifState.items.forEach(function (n) {
+      notifListEl.appendChild(notifItemEl(n));
+    });
+    notifMoreBtn.hidden = !notifState.cursor;
+    notifSubEl.textContent = notifState.unread > 0
+      ? (notifState.unread + ' 条未读') : '全部已读';
+  }
+
+  /* 拉列表：reset=true 重拉第一页，否则按游标续页；固定 limit=20。 */
+  function loadNotifications(reset) {
+    if (!state.token) { notifState.items = []; renderNotifications(); return; }
+    if (notifState.loading) return;
+    if (reset) { notifState.items = []; notifState.cursor = ''; }
+    if (!reset && !notifState.cursor) return;
+    notifState.loading = true;
+    var path = 'api/notifications?limit=20';
+    if (!reset && notifState.cursor) {
+      path += '&cursor=' + encodeURIComponent(notifState.cursor);
+    }
+    api(path)
+      .then(function (data) {
+        var items = data.items || [];
+        notifState.items = reset ? items : notifState.items.concat(items);
+        notifState.cursor = data.next_cursor || '';
+        notifState.unread = Number(data.unread_count) || 0;
+        paintNotifBadge();
+        renderNotifications();
+      })
+      .catch(function (err) {
+        notifEmpty('消息加载失败：' + (err.message || '网络错误'));
+        handleAuthError(err);
+      })
+      .then(function () { notifState.loading = false; });
+  }
+
+  function openNotifications() {
+    if (!state.token) { toast('请先登录', 'err'); return; }
+    closeComments();
+    notifPanelEl.classList.add('open');
+    notifPanelEl.setAttribute('aria-hidden', 'false');
+    backdropEl.classList.add('show');
+    renderNotifications();
+    loadNotifications(true);
+  }
+
+  function closeNotifications() {
+    notifPanelEl.classList.remove('open');
+    notifPanelEl.setAttribute('aria-hidden', 'true');
+    if (!panelEl.classList.contains('open')) {
+      backdropEl.classList.remove('show');
+    }
+  }
+
+  /* 标已读：本地先改（立即反馈），接口失败再回退并提示。 */
+  function markNotificationRead(n, row) {
+    if (!state.token || n.read_at) return;
+    n.read_at = Math.floor(Date.now() / 1000);
+    if (row) row.classList.remove('unread');
+    notifState.unread = Math.max(0, notifState.unread - 1);
+    paintNotifBadge();
+    notifSubEl.textContent = notifState.unread > 0
+      ? (notifState.unread + ' 条未读') : '全部已读';
+    api('api/notifications/read', { method: 'POST', body: { ids: [n.id] } })
+      .then(function (data) {
+        notifState.unread = Number(data.unread_count) || 0;
+        paintNotifBadge();
+      })
+      .catch(function (err) {
+        n.read_at = 0;
+        if (row) row.classList.add('unread');
+        notifState.unread += 1;
+        paintNotifBadge();
+        handleAuthError(err);
+      });
+  }
+
+  /* 点击通知：先标已读，再跳目标——关注通知看关注者主页，视频类通知
+     直接定位到那条视频；评论点赞没有视频 id，只标已读。 */
+  function openNotification(n, row) {
+    markNotificationRead(n, row);
+    if (n.kind === 'follow' && n.actor_id) {
+      closeNotifications();
+      showProfile(n.actor_id);
+      return;
+    }
+    if (n.target_type === 'video' && n.target_id) {
+      closeNotifications();
+      jumpToVideo(n.target_id);
+      return;
+    }
+    if (n.kind === 'like' && n.target_type === 'comment') {
+      toast('有人赞了你的评论', 'ok');
+    }
+  }
+
+  function markAllNotificationsRead() {
+    if (!state.token || notifState.unread <= 0) return;
+    api('api/notifications/read', { method: 'POST', body: { all: true } })
+      .then(function () {
+        var now = Math.floor(Date.now() / 1000);
+        notifState.items.forEach(function (n) { n.read_at = now; });
+        notifState.unread = 0;
+        paintNotifBadge();
+        renderNotifications();
+        toast('已全部标记为已读', 'ok');
+      })
+      .catch(function (err) {
+        toast('操作失败：' + (err.message || '网络错误'), 'err');
+        handleAuthError(err);
+      });
   }
 
   function slideById(videoId) {
@@ -2651,7 +2958,10 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     if (e.key === 'Enter') login();
   });
   document.getElementById('cpClose').addEventListener('click', closeComments);
-  backdropEl.addEventListener('click', closeComments);
+  backdropEl.addEventListener('click', function () {
+    closeNotifications();
+    closeComments();
+  });
   document.getElementById('cpForm').addEventListener('submit', function (e) {
     e.preventDefault();
     sendComment();
@@ -2688,6 +2998,13 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     showProfile(state.user.id, state.user.name);
   });
   document.getElementById('favBtn').addEventListener('click', showFavorites);
+  document.getElementById('notifBtn').addEventListener('click', openNotifications);
+  document.getElementById('notifClose').addEventListener('click', closeNotifications);
+  document.getElementById('notifAllRead').addEventListener('click', markAllNotificationsRead);
+  notifMoreBtn.addEventListener('click', function () { loadNotifications(false); });
+  setInterval(function () {
+    if (state.token) refreshUnreadNotifications();
+  }, 30000);
   document.getElementById('favBack').addEventListener('click', function () {
     hideFavorites();
     var active = feedEl.querySelector('.slide.active video') || state.activeVideo;
@@ -2725,6 +3042,7 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     if (!favViewEl.hidden) { hideFavorites(); return; }
     if (!tagEl.hidden) { hideTagView(); return; }
     if (!profileEl.hidden) { hideProfile(); return; }
+    if (notifPanelEl.classList.contains('open')) { closeNotifications(); return; }
     if (panelEl.classList.contains('open')) closeComments();
   });
 
