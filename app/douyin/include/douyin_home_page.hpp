@@ -832,6 +832,107 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     .comment-panel { width: 100%; }
     .profile-card { flex-direction: column; text-align: center; }
   }
+
+  /* ---------- 发布面板：草稿 / 封面选帧 / 裁剪（第 7 轮） ---------- */
+  .pub-mask {
+    position: fixed; inset: 0; z-index: 90; background: rgba(0, 0, 0, .62);
+  }
+  .pub-panel {
+    position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%);
+    z-index: 91; width: min(600px, 94vw); max-height: 92vh; overflow-y: auto;
+    padding: 16px 18px 18px; border-radius: 16px; background: var(--panel);
+    border: 1px solid var(--line); box-shadow: 0 24px 64px rgba(0, 0, 0, .55);
+  }
+  .pub-head { display: flex; align-items: center; justify-content: space-between; }
+  .pub-head b { font-size: 17px; }
+  .pub-close {
+    padding: 2px 8px; font-size: 16px; color: var(--muted);
+    background: transparent; border-radius: 8px;
+  }
+  .pub-close:hover { color: var(--text); background: rgba(255, 255, 255, .08); }
+  .pub-hint { margin: 8px 0 12px; font-size: 12px; color: var(--muted); }
+  .pub-restore {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    margin: 10px 0; padding: 10px 12px; font-size: 13px;
+    border: 1px solid rgba(37, 244, 238, .4); border-radius: 10px;
+    background: rgba(37, 244, 238, .08);
+  }
+  .pub-restore .btn-primary, .pub-restore .btn-ghost { padding: 5px 12px; font-size: 12px; }
+  .pub-drafts { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 10px; }
+  .pub-drafts-head {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 4px; font-size: 13px; font-weight: 700;
+  }
+  .pub-drafts-head span { font-weight: 400; font-size: 12px; color: var(--muted); }
+  .pub-draft-list { display: flex; flex-direction: column; }
+  .pub-draft-row {
+    display: flex; align-items: center; gap: 8px; padding: 8px 0;
+    border-bottom: 1px dashed rgba(255, 255, 255, .07);
+  }
+  .pub-draft-row b {
+    flex: 1; min-width: 0; font-size: 13px; font-weight: 600;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .pub-draft-row time { font-size: 11px; color: var(--muted); white-space: nowrap; }
+  .pub-draft-row button { padding: 4px 9px; font-size: 12px; }
+  .pub-draft-empty { padding: 10px 0; font-size: 12px; color: var(--muted); }
+  .pub-video-wrap {
+    margin-bottom: 10px; border-radius: 12px; overflow: hidden;
+    background: #000; border: 1px solid var(--line);
+  }
+  .pub-video-wrap video {
+    display: block; width: 100%; max-height: 240px; object-fit: contain;
+    background: #000;
+  }
+  .pub-field { display: block; margin: 10px 0; font-size: 12px; color: var(--muted); }
+  .pub-field > span { display: block; margin-bottom: 4px; }
+  .pub-field input, .pub-field textarea {
+    width: 100%; padding: 8px 10px; border-radius: 9px; font: inherit;
+    font-size: 14px; color: var(--text); outline: none; resize: vertical;
+    background: rgba(255, 255, 255, .05); border: 1px solid var(--line);
+  }
+  .pub-field input:focus, .pub-field textarea:focus {
+    border-color: rgba(37, 244, 238, .55);
+    box-shadow: 0 0 0 3px rgba(37, 244, 238, .1);
+  }
+  .pub-block {
+    margin: 12px 0; padding: 10px 12px; border-radius: 12px;
+    border: 1px solid var(--line); background: rgba(255, 255, 255, .03);
+  }
+  .pub-block-head { margin-bottom: 8px; font-size: 12px; color: var(--muted); }
+  .pub-clip-label { color: var(--text); font-variant-numeric: tabular-nums; }
+  .pub-frames { display: flex; gap: 8px; flex-wrap: wrap; }
+  .pub-frame {
+    position: relative; width: 112px; padding: 0; overflow: hidden;
+    background: #000; border: 2px solid transparent; border-radius: 9px;
+  }
+  .pub-frame.on { border-color: var(--pink); }
+  .pub-frame img { display: block; width: 100%; height: 63px; object-fit: cover; }
+  .pub-frame span {
+    position: absolute; right: 4px; bottom: 3px; padding: 0 4px;
+    font-size: 10px; color: #fff; border-radius: 5px; background: rgba(0, 0, 0, .62);
+  }
+  .pub-range {
+    display: flex; align-items: center; gap: 8px; margin: 6px 0;
+    font-size: 12px; color: var(--muted);
+  }
+  .pub-range span { width: 28px; flex: none; }
+  .pub-range input { flex: 1; accent-color: var(--pink); }
+  .pub-progress { display: flex; align-items: center; gap: 10px; margin: 10px 0; }
+  .pub-progress-bar {
+    flex: 1; height: 7px; overflow: hidden; border-radius: 4px;
+    background: rgba(255, 255, 255, .12);
+  }
+  .pub-progress-bar i {
+    display: block; height: 100%; width: 0%;
+    background: linear-gradient(90deg, var(--cyan), var(--pink));
+    transition: width .12s linear;
+  }
+  .pub-progress span { width: 42px; text-align: right; font-size: 12px; color: var(--muted); }
+  .pub-actions { display: flex; gap: 8px; margin-top: 14px; }
+  .pub-actions .btn-primary { flex: 1; padding: 10px 0; font-size: 15px; }
+  .pub-actions .btn-ghost { padding: 10px 14px; font-size: 13px; }
+  .pub-actions button[disabled] { opacity: .55; cursor: not-allowed; }
 </style>
 </head>
 <body>
@@ -1000,6 +1101,73 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     <button class="search-tab" data-tab="tag" type="button">话题</button>
   </div>
   <div class="profile-body" id="searchBody"></div>
+</section>
+
+
+<!-- 发布面板（第 7 轮：草稿箱 / 封面选帧 / 裁剪 / 进度 / 重试） -->
+<div class="pub-mask" id="pubMask" hidden></div>
+<section class="pub-panel" id="pubPanel" hidden role="dialog" aria-modal="true"
+         aria-label="发布视频">
+  <div class="pub-head">
+    <b>发布视频</b>
+    <button class="pub-close" id="pubClose" type="button" aria-label="关闭">✕</button>
+  </div>
+
+  <div id="pubPick">
+    <input type="file" id="pubFile" accept="video/mp4,video/webm,video/quicktime" hidden>
+    <button class="btn-primary" id="pubPickBtn" type="button">选择视频文件</button>
+    <p class="pub-hint">支持 mp4 / webm / mov，单个 ≤ 32 MiB。选好后可抽 3 帧选封面、
+      拖动滑杆裁剪时长。</p>
+    <div class="pub-restore" id="pubRestore" hidden>
+      <span>有未发布的草稿，是否恢复？</span>
+      <button class="btn-primary" id="pubRestoreYes" type="button">恢复</button>
+      <button class="btn-ghost" id="pubRestoreNo" type="button">忽略</button>
+    </div>
+    <div class="pub-drafts">
+      <div class="pub-drafts-head">我的草稿<span id="pubDraftsCount"></span></div>
+      <div class="pub-draft-list" id="pubDraftList"></div>
+    </div>
+  </div>
+
+  <div id="pubEdit" hidden>
+    <div class="pub-video-wrap">
+      <video id="pubVideo" playsinline preload="metadata"></video>
+    </div>
+    <label class="pub-field"><span>标题</span>
+      <input id="pubTitle" maxlength="80" placeholder="给视频起个标题（必填）"></label>
+    <label class="pub-field"><span>描述</span>
+      <textarea id="pubDesc" rows="2" maxlength="300"
+                placeholder="补充一段描述（可选）"></textarea></label>
+    <label class="pub-field"><span>话题</span>
+      <input id="pubTags" maxlength="120" placeholder="#旅行 #美食（空格分隔）"></label>
+
+    <div class="pub-block">
+      <div class="pub-block-head">封面（自动抽 3 帧，点选一张）</div>
+      <div class="pub-frames" id="pubFrames"></div>
+    </div>
+
+    <div class="pub-block">
+      <div class="pub-block-head">裁剪时长
+        <span class="pub-clip-label" id="pubClipLabel">0:00 - 0:00</span></div>
+      <label class="pub-range"><span>起点</span>
+        <input type="range" id="pubClipStart" min="0" max="100" value="0"></label>
+      <label class="pub-range"><span>终点</span>
+        <input type="range" id="pubClipEnd" min="0" max="100" value="100"></label>
+      <button class="btn-ghost" id="pubClipReset" type="button">重置裁剪</button>
+    </div>
+
+    <div class="pub-progress" id="pubProgress" hidden>
+      <div class="pub-progress-bar"><i id="pubProgressFill"></i></div>
+      <span id="pubProgressText">0%</span>
+    </div>
+
+    <div class="pub-actions">
+      <button class="btn-primary" id="pubSubmit" type="button">发布</button>
+      <button class="btn-ghost" id="pubSaveDraft" type="button">存草稿</button>
+      <button class="btn-ghost" id="pubBack" type="button">返回</button>
+    </div>
+    <p class="pub-hint" id="pubFileHint"></p>
+  </div>
 </section>
 
 
@@ -2369,6 +2537,14 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     feedEl.querySelectorAll('video').forEach(function (v) {
       if (v !== video) v.pause();
     });
+    var start = Number(video.dataset.clipStart || 0);
+    var end = Number(video.dataset.clipEnd || 0);
+    if (start > 0 || end > start) {
+      if (!isFinite(video.currentTime) || video.currentTime < start ||
+          (end > start && video.currentTime >= end)) {
+        try { video.currentTime = start; } catch (e) { /* metadata 未到，忽略 */ }
+      }
+    }
     var p = video.play();
     if (p && p.catch) {
       p.catch(function () {
@@ -2499,6 +2675,12 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
   /* 封面地址：与视频同名的 .jpg（构建时用 ffmpeg 抽首帧）。
      没有对应封面时返回空串，video 退回黑底，不影响播放。 */
   function posterSrc(v) {
+    /* 用户发布时选的封面优先（videos/cover_*.jpg 或绝对地址）。 */
+    var cover = String((v && v.cover_url) || '');
+    if (/^https?:\/\//i.test(cover)) return cover;
+    if (/^\/?videos\/[A-Za-z0-9_.-]+$/.test(cover)) {
+      return BASE + cover.replace(/^\//, '');
+    }
     var src = String(videoSrc(v) || '');
     var m = /^(.+\/videos\/[A-Za-z0-9_.-]+)\.(mp4|webm|m4v)$/i.exec(src);
     if (!m) return '';
@@ -2533,19 +2715,43 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     var dragging = false;
     var pendingRatio = null;
 
-    function duration() {
+    /* 完整时长（裁剪前）；0 表示 metadata 还没到。 */
+    function fullDuration() {
       var d = video.duration;
       return isFinite(d) && d > 0 ? d : 0;
     }
 
+    /* 裁剪窗口：缺省 [0, full]；clip_end<=clip_start 时视为不裁剪。 */
+    function clipWindow() {
+      var start = Number(video.dataset.clipStart || 0);
+      var end = Number(video.dataset.clipEnd || 0);
+      var full = fullDuration();
+      if (!isFinite(start) || start < 0) start = 0;
+      if (!isFinite(end) || end <= start) end = full;
+      if (full > 0) {
+        if (start > full) start = 0;
+        if (end > full) end = full;
+      }
+      return { start: start, end: end, full: full };
+    }
+
+    /* 进度条跨度 = 裁剪后的时长。 */
+    function duration() {
+      var w = clipWindow();
+      return w.end > w.start ? w.end - w.start : 0;
+    }
+
     function paint() {
+      var w = clipWindow();
       var d = duration();
-      var pct = d > 0 ? Math.min(1, Math.max(0, video.currentTime / d)) : 0;
+      var pos = Math.min(w.end, Math.max(w.start, video.currentTime));
+      var pct = d > 0 ? Math.min(1, Math.max(0, (pos - w.start) / d)) : 0;
       fill.style.width = (pct * 100).toFixed(2) + '%';
       thumb.style.left = (pct * 100).toFixed(2) + '%';
-      time.textContent = fmtClock(video.currentTime) + ' / ' + fmtClock(d);
+      time.textContent = fmtClock(pos - w.start) + ' / ' + fmtClock(d);
       bar.setAttribute('aria-valuenow', String(Math.round(pct * 100)));
-      bar.setAttribute('aria-valuetext', fmtClock(video.currentTime) + ' / ' + fmtClock(d));
+      bar.setAttribute('aria-valuetext',
+                       fmtClock(pos - w.start) + ' / ' + fmtClock(d));
     }
 
     function ratioOf(event) {
@@ -2555,10 +2761,11 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     }
 
     function seekToRatio(ratio) {
+      var w = clipWindow();
       var d = duration();
       if (d <= 0) { pendingRatio = ratio; paintPreview(ratio); return; }
       pendingRatio = null;
-      video.currentTime = ratio * d;
+      video.currentTime = w.start + ratio * d;
       paintPreview(ratio);
     }
 
@@ -2608,8 +2815,9 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
       if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
         event.preventDefault();
         event.stopPropagation();
+        var w = clipWindow();
         var next = video.currentTime + (event.key === 'ArrowRight' ? 5 : -5);
-        video.currentTime = Math.min(d, Math.max(0, next));
+        video.currentTime = Math.min(w.end, Math.max(w.start, next));
         paint();
       }
     });
@@ -2618,7 +2826,16 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
       paint();
     });
     video.addEventListener('durationchange', paint);
-    video.addEventListener('timeupdate', function () { if (!dragging) paint(); });
+    video.addEventListener('timeupdate', function () {
+      var w = clipWindow();
+      if (w.full > 0 && w.end > w.start && video.currentTime >= w.end - 0.02) {
+        video.pause();
+        video.currentTime = w.end;
+        paint();
+        return;
+      }
+      if (!dragging) paint();
+    });
     video.addEventListener('seeked', function () { if (!dragging) paint(); });
     video.addEventListener('emptied', paint);
     paint();
@@ -2655,6 +2872,11 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     }
     video.setAttribute('playsinline', '');
     video.setAttribute('webkit-playsinline', '');
+    /* 裁剪区间（毫秒→秒）：播放端据此从 clip_start 起播、到 clip_end 停。 */
+    var clipStartSec = Number(v.clip_start_ms || 0) / 1000;
+    var clipEndSec = Number(v.clip_end_ms || 0) / 1000;
+    if (clipStartSec > 0) video.dataset.clipStart = String(clipStartSec);
+    if (clipEndSec > clipStartSec) video.dataset.clipEnd = String(clipEndSec);
 
     var shade = document.createElement('div');
     shade.className = 'shade';
@@ -3868,15 +4090,8 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
   });
 
   document.getElementById('loginBtn').addEventListener('click', login);
-  document.getElementById('uploadBtn').addEventListener('click', function () {
-    if (!state.token) { toast('请先登录', 'err'); return; }
-    uploadInput.click();
-  });
-  uploadInput.addEventListener('change', function () {
-    var file = uploadInput.files && uploadInput.files[0];
-    uploadInput.value = '';
-    if (file) uploadVideo(file);
-  });
+  /* 第 7 轮：上传入口改为发布面板（草稿 / 封面选帧 / 裁剪 / 进度 / 重试）。 */
+  document.getElementById('uploadBtn').addEventListener('click', openPublish);
   document.getElementById('logoutBtn').addEventListener('click', logout);
   document.getElementById('password').addEventListener('keydown', function (e) {
     if (e.key === 'Enter') login();
@@ -3976,6 +4191,7 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
   });
   document.addEventListener('keydown', function (e) {
     if (e.key !== 'Escape') return;
+    if (!pub.panel.hidden) { closePublish(); return; }
     if (!reportModalEl.hidden) { closeReport(); return; }
     if (!menuSheetEl.hidden) { closeMenu(); return; }
     if (blockPanelEl.classList.contains('open')) { closeBlacklist(); return; }
@@ -3985,6 +4201,646 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     if (!profileEl.hidden) { hideProfile(); return; }
     if (notifPanelEl.classList.contains('open')) { closeNotifications(); return; }
     if (panelEl.classList.contains('open')) closeComments();
+  });
+
+
+  /* ================= 发布面板 / 草稿箱 / 视频编辑（第 7 轮） =================
+     链路：选文件 → 抽 3 帧选封面 → 裁剪起止 → 标题/描述/话题 → 发布。
+     草稿存 localStorage：输入 1s 防抖自动保存；重新打开发布面板时提示恢复；
+     「我的草稿」可继续编辑或删除；发布成功自动清掉当前草稿。
+     上传用 XHR（upload.onprogress 驱动进度条）；失败保留内容，按钮变「重试」；
+     发布中禁用按钮 + Idempotency-Key，防重复提交。 */
+
+  var DRAFT_KEY = 'douyin_draft_autosave';
+  var DRAFT_LIST_KEY = 'douyin_drafts';
+  var DRAFT_DEBOUNCE_MS = 1000;
+  var PUB_MAX_BYTES = 32 * 1024 * 1024;
+  var PUB_MAX_DRAFTS = 10;
+
+  var pub = {
+    mask: document.getElementById('pubMask'),
+    panel: document.getElementById('pubPanel'),
+    pick: document.getElementById('pubPick'),
+    edit: document.getElementById('pubEdit'),
+    fileInput: document.getElementById('pubFile'),
+    pickBtn: document.getElementById('pubPickBtn'),
+    closeBtn: document.getElementById('pubClose'),
+    videoEl: document.getElementById('pubVideo'),
+    framesEl: document.getElementById('pubFrames'),
+    titleEl: document.getElementById('pubTitle'),
+    descEl: document.getElementById('pubDesc'),
+    tagsEl: document.getElementById('pubTags'),
+    clipStartEl: document.getElementById('pubClipStart'),
+    clipEndEl: document.getElementById('pubClipEnd'),
+    clipLabel: document.getElementById('pubClipLabel'),
+    clipResetEl: document.getElementById('pubClipReset'),
+    progressEl: document.getElementById('pubProgress'),
+    progressFill: document.getElementById('pubProgressFill'),
+    progressText: document.getElementById('pubProgressText'),
+    submitBtn: document.getElementById('pubSubmit'),
+    saveBtn: document.getElementById('pubSaveDraft'),
+    backBtn: document.getElementById('pubBack'),
+    fileHint: document.getElementById('pubFileHint'),
+    restoreEl: document.getElementById('pubRestore'),
+    restoreYes: document.getElementById('pubRestoreYes'),
+    restoreNo: document.getElementById('pubRestoreNo'),
+    draftListEl: document.getElementById('pubDraftList'),
+    draftCount: document.getElementById('pubDraftsCount'),
+    file: null,
+    fileName: '',
+    objectUrl: '',
+    frames: [],
+    selectedFrame: -1,
+    coverUrl: '',
+    duration: 0,
+    clipStart: 0,
+    clipEnd: 0,
+    resumeClip: null,
+    draftId: '',
+    idempotencyKey: '',
+    pendingDraft: null,
+    uploading: false,
+    lastError: '',
+    autosaveTimer: 0
+  };
+
+  function draftRead(key, fallback) {
+    try {
+      var raw = localStorage.getItem(key);
+      return raw ? JSON.parse(raw) : fallback;
+    } catch (e) {
+      return fallback;
+    }
+  }
+
+  function draftWrite(key, value) {
+    try {
+      localStorage.setItem(key, JSON.stringify(value));
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function newDraftId() {
+    return 'd' + Date.now().toString(36) + Math.floor(Math.random() * 1296).toString(36);
+  }
+
+  function readDraftList() {
+    var list = draftRead(DRAFT_LIST_KEY, []);
+    return Object.prototype.toString.call(list) === '[object Array]' ? list : [];
+  }
+
+  function writeDraftList(list) {
+    draftWrite(DRAFT_LIST_KEY, list.slice(0, PUB_MAX_DRAFTS));
+  }
+
+  function fmtDraftTime(ts) {
+    var d = new Date(Number(ts) || Date.now());
+    function p(n) { return n < 10 ? '0' + n : String(n); }
+    return (d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' +
+           p(d.getHours()) + ':' + p(d.getMinutes());
+  }
+
+  function fmtSize(bytes) {
+    if (!bytes) return '0 B';
+    if (bytes >= 1024 * 1024) return (bytes / 1024 / 1024).toFixed(1) + ' MB';
+    return Math.max(1, Math.round(bytes / 1024)) + ' KB';
+  }
+
+  function currentDraft() {
+    if (!pub.draftId) pub.draftId = newDraftId();
+    return {
+      id: pub.draftId,
+      title: (pub.titleEl.value || '').trim(),
+      desc: (pub.descEl.value || '').trim(),
+      tags: (pub.tagsEl.value || '').trim(),
+      file_name: pub.fileName || '',
+      cover_data_url: pub.selectedFrame >= 0 ? (pub.frames[pub.selectedFrame] || '') : '',
+      clip_start_ms: Math.round(pub.clipStart * 1000),
+      clip_end_ms: Math.round(pub.clipEnd * 1000),
+      updated_at: Date.now()
+    };
+  }
+
+  /* 自动保存：输入 1s 防抖；内容全空时不写，避免产生垃圾草稿。 */
+  function saveDraft(silent) {
+    if (!pub.panel || pub.panel.hidden || pub.edit.hidden) return;
+    if (!pub.titleEl.value && !pub.descEl.value && !pub.tagsEl.value &&
+        !pub.fileName) {
+      return;
+    }
+    var draft = currentDraft();
+    draftWrite(DRAFT_KEY, draft);
+    var list = readDraftList();
+    var idx = -1;
+    for (var i = 0; i < list.length; i++) {
+      if (list[i] && list[i].id === draft.id) { idx = i; break; }
+    }
+    if (idx >= 0) list[idx] = draft; else list.unshift(draft);
+    writeDraftList(list);
+    renderDraftList();
+    if (!silent) toast('草稿已保存', 'ok');
+  }
+
+  function scheduleAutosave() {
+    clearTimeout(pub.autosaveTimer);
+    pub.autosaveTimer = setTimeout(function () { saveDraft(true); }, DRAFT_DEBOUNCE_MS);
+  }
+
+  function deleteDraft(id) {
+    writeDraftList(readDraftList().filter(function (d) { return d && d.id !== id; }));
+    var auto = draftRead(DRAFT_KEY, null);
+    if (auto && auto.id === id) localStorage.removeItem(DRAFT_KEY);
+    if (pub.draftId === id) pub.draftId = '';
+    renderDraftList();
+    toast('草稿已删除');
+  }
+
+  /* 发布成功后清掉对应草稿（列表项 + 自动保存副本）。 */
+  function clearCurrentDraft() {
+    var id = pub.draftId;
+    writeDraftList(readDraftList().filter(function (d) {
+      return d && (!id || d.id !== id);
+    }));
+    if (id) {
+      var auto = draftRead(DRAFT_KEY, null);
+      if (auto && auto.id === id) localStorage.removeItem(DRAFT_KEY);
+    }
+    pub.draftId = '';
+    renderDraftList();
+  }
+
+  function renderDraftList() {
+    if (!pub.draftListEl) return;
+    var list = readDraftList();
+    pub.draftListEl.innerHTML = '';
+    if (pub.draftCount) {
+      pub.draftCount.textContent = list.length ? ' · ' + list.length + ' 条' : '';
+    }
+    if (!list.length) {
+      var empty = document.createElement('div');
+      empty.className = 'pub-draft-empty';
+      empty.textContent = '还没有草稿。编辑中的内容会自动保存。';
+      pub.draftListEl.appendChild(empty);
+      return;
+    }
+    list.forEach(function (d) {
+      var row = document.createElement('div');
+      row.className = 'pub-draft-row';
+      var name = document.createElement('b');
+      name.textContent = d.title || d.file_name || '未命名草稿';
+      var time = document.createElement('time');
+      time.textContent = fmtDraftTime(d.updated_at);
+      var edit = document.createElement('button');
+      edit.type = 'button';
+      edit.className = 'btn-ghost';
+      edit.textContent = '继续编辑';
+      edit.addEventListener('click', function () { resumeDraft(d); });
+      var del = document.createElement('button');
+      del.type = 'button';
+      del.className = 'btn-ghost';
+      del.textContent = '删除';
+      del.addEventListener('click', function () { deleteDraft(d.id); });
+      row.appendChild(name);
+      row.appendChild(time);
+      row.appendChild(edit);
+      row.appendChild(del);
+      pub.draftListEl.appendChild(row);
+    });
+  }
+
+  function updateClipLabel() {
+    var s = pub.clipStart;
+    var e = pub.clipEnd;
+    var span = e > s ? (e - s).toFixed(1) + 's' : '0s';
+    pub.clipLabel.textContent = fmtClock(s) + ' - ' + fmtClock(e) + '（' + span + '）';
+  }
+
+  function applyClipUi() {
+    var d = pub.duration || 0;
+    var max = Math.max(1, Math.round(d * 10));
+    pub.clipStartEl.max = String(max);
+    pub.clipEndEl.max = String(max);
+    if (!(pub.clipEnd > pub.clipStart)) pub.clipEnd = d;
+    if (pub.clipEnd > d && d > 0) pub.clipEnd = d;
+    if (pub.clipStart >= pub.clipEnd) pub.clipStart = 0;
+    pub.clipStartEl.value = String(Math.round(pub.clipStart * 10));
+    pub.clipEndEl.value = String(Math.round(pub.clipEnd * 10));
+    updateClipLabel();
+  }
+
+  function renderFrames() {
+    pub.framesEl.innerHTML = '';
+    if (!pub.frames.length) {
+      var empty = document.createElement('span');
+      empty.className = 'pub-hint';
+      empty.textContent = '选择视频后自动抽 3 帧';
+      pub.framesEl.appendChild(empty);
+      return;
+    }
+    pub.frames.forEach(function (src, i) {
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'pub-frame' + (i === pub.selectedFrame ? ' on' : '');
+      btn.title = '用这一帧做封面';
+      var img = document.createElement('img');
+      img.src = src;
+      img.alt = '封面候选 ' + (i + 1);
+      var tag = document.createElement('span');
+      tag.textContent = '帧 ' + (i + 1);
+      btn.appendChild(img);
+      btn.appendChild(tag);
+      btn.addEventListener('click', function () {
+        pub.selectedFrame = i;
+        pub.coverUrl = '';
+        renderFrames();
+        scheduleAutosave();
+      });
+      pub.framesEl.appendChild(btn);
+    });
+  }
+
+  /* 抽帧：0.5s / 2s / 末帧（去重后不足 3 帧也接受），320 宽 JPEG。 */
+  function captureFrames() {
+    pub.frames = [];
+    pub.selectedFrame = -1;
+    renderFrames();
+    var v = pub.videoEl;
+    var duration = pub.duration;
+    if (!(duration > 0)) return;
+    var times = [Math.min(0.5, duration * 0.25), Math.min(2, duration * 0.5),
+                 Math.max(0, duration - 0.2)];
+    var uniq = [];
+    times.forEach(function (t) {
+      for (var i = 0; i < uniq.length; i++) {
+        if (Math.abs(uniq[i] - t) < 0.2) return;
+      }
+      uniq.push(t);
+    });
+    var index = 0;
+    function next() {
+      if (index >= uniq.length) {
+        if (pub.frames.length) { pub.selectedFrame = 0; renderFrames(); }
+        return;
+      }
+      grabFrame(uniq[index++], function (url) {
+        if (url) pub.frames.push(url);
+        next();
+      });
+    }
+    next();
+  }
+
+  function grabFrame(t, done) {
+    var v = pub.videoEl;
+    var finished = false;
+    var timer = setTimeout(function () { finish(null); }, 1500);
+    function finish(url) {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      v.removeEventListener('seeked', onSeeked);
+      done(url);
+    }
+    function onSeeked() {
+      try {
+        var vw = v.videoWidth || 320;
+        var vh = v.videoHeight || 180;
+        var w = 320;
+        var h = Math.round(w * vh / vw) || 180;
+        if (h > 320) { h = 320; w = Math.round(h * vw / vh) || 320; }
+        var canvas = document.createElement('canvas');
+        canvas.width = w;
+        canvas.height = h;
+        canvas.getContext('2d').drawImage(v, 0, 0, w, h);
+        finish(canvas.toDataURL('image/jpeg', 0.7));
+      } catch (e) {
+        finish(null);
+      }
+    }
+    v.addEventListener('seeked', onSeeked);
+    try { v.currentTime = t; } catch (e) { finish(null); }
+  }
+
+  function onVideoMeta() {
+    pub.duration = isFinite(pub.videoEl.duration) ? pub.videoEl.duration : 0;
+    if (pub.duration <= 0) toast('读取视频时长失败，裁剪可能不可用', 'err');
+    if (!(pub.clipEnd > pub.clipStart) || pub.clipEnd > pub.duration) {
+      pub.clipEnd = pub.duration;
+    }
+    applyClipUi();
+    captureFrames();
+  }
+
+  function enterEdit() {
+    pub.pick.hidden = true;
+    pub.edit.hidden = false;
+  }
+
+  function resetPubForm() {
+    pub.file = null;
+    pub.fileName = '';
+    pub.frames = [];
+    pub.selectedFrame = -1;
+    pub.coverUrl = '';
+    pub.duration = 0;
+    pub.clipStart = 0;
+    pub.clipEnd = 0;
+    pub.resumeClip = null;
+    pub.draftId = '';
+    pub.idempotencyKey = '';
+    pub.lastError = '';
+    pub.titleEl.value = '';
+    pub.descEl.value = '';
+    pub.tagsEl.value = '';
+    pub.fileHint.textContent = '';
+    pub.videoEl.removeAttribute('src');
+    if (pub.objectUrl) {
+      try { URL.revokeObjectURL(pub.objectUrl); } catch (e) {}
+      pub.objectUrl = '';
+    }
+    pub.submitBtn.textContent = '发布';
+    pub.progressEl.hidden = true;
+    pub.progressFill.style.width = '0%';
+    pub.progressText.textContent = '0%';
+    renderFrames();
+  }
+
+  function openPublish() {
+    if (!state.token) { toast('请先登录', 'err'); return; }
+    if (pub.panel && !pub.panel.hidden) return;
+    pub.mask.hidden = false;
+    pub.panel.hidden = false;
+    resetPubForm();
+    renderDraftList();
+    var auto = draftRead(DRAFT_KEY, null);
+    if (auto && (auto.title || auto.desc || auto.file_name)) {
+      pub.pendingDraft = auto;
+      pub.restoreEl.hidden = false;
+    } else {
+      pub.pendingDraft = null;
+      pub.restoreEl.hidden = true;
+    }
+    pub.pick.hidden = false;
+    pub.edit.hidden = true;
+  }
+
+  function closePublish() {
+    if (pub.uploading) { toast('上传中，请稍候', 'err'); return; }
+    if (!pub.edit.hidden) saveDraft(true);
+    pub.mask.hidden = true;
+    pub.panel.hidden = true;
+    pub.restoreEl.hidden = true;
+    pub.pendingDraft = null;
+    if (pub.videoEl.pause) pub.videoEl.pause();
+  }
+
+  /* 从草稿继续编辑：File 无法序列化，提示重新选择同名文件。 */
+  function resumeDraft(d) {
+    if (!d) return;
+    pub.draftId = d.id || newDraftId();
+    pub.idempotencyKey = '';
+    pub.titleEl.value = d.title || '';
+    pub.descEl.value = d.desc || '';
+    pub.tagsEl.value = d.tags || '';
+    pub.fileName = d.file_name || '';
+    pub.file = null;
+    pub.duration = 0;
+    pub.clipStart = Math.max(0, Number(d.clip_start_ms || 0) / 1000);
+    pub.clipEnd = Math.max(0, Number(d.clip_end_ms || 0) / 1000);
+    pub.resumeClip = pub.clipEnd > pub.clipStart
+      ? { start: pub.clipStart, end: pub.clipEnd }
+      : null;
+    pub.coverUrl = '';
+    pub.frames = d.cover_data_url ? [d.cover_data_url] : [];
+    pub.selectedFrame = pub.frames.length ? 0 : -1;
+    pub.videoEl.removeAttribute('src');
+    pub.fileHint.textContent = pub.fileName
+      ? '草稿记录的视频：' + pub.fileName + '（浏览器不能保存文件本体，请重新选择同名文件）'
+      : '草稿里还没有视频文件，请先选择文件。';
+    pub.submitBtn.textContent = '发布';
+    pub.progressEl.hidden = true;
+    renderFrames();
+    updateClipLabel();
+    enterEdit();
+    toast('已恢复草稿');
+  }
+
+  function restoreAutosave() {
+    var d = pub.pendingDraft;
+    if (!d) return;
+    pub.pendingDraft = null;
+    pub.restoreEl.hidden = true;
+    resumeDraft(d);
+  }
+
+  function discardAutosave() {
+    var d = pub.pendingDraft;
+    if (d && d.id) {
+      writeDraftList(readDraftList().filter(function (x) {
+        return x && x.id !== d.id;
+      }));
+    }
+    localStorage.removeItem(DRAFT_KEY);
+    pub.pendingDraft = null;
+    pub.restoreEl.hidden = true;
+    renderDraftList();
+  }
+
+  function onFileChosen(file) {
+    if (!file) return;
+    if (file.size > PUB_MAX_BYTES) {
+      toast('视频不能超过 32 MiB', 'err');
+      return;
+    }
+    pub.file = file;
+    pub.fileName = file.name || 'video.mp4';
+    pub.coverUrl = '';
+    pub.selectedFrame = -1;
+    pub.duration = 0;
+    if (pub.resumeClip) {
+      pub.clipStart = pub.resumeClip.start;
+      pub.clipEnd = pub.resumeClip.end;
+      pub.resumeClip = null;
+    } else {
+      pub.clipStart = 0;
+      pub.clipEnd = 0;
+    }
+    pub.frames = [];
+    if (!pub.titleEl.value.trim()) {
+      pub.titleEl.value = pub.fileName.replace(/\.[^.]+$/, '');
+    }
+    pub.fileHint.textContent = '已选择：' + pub.fileName + '（' + fmtSize(file.size) + '）';
+    if (pub.objectUrl) {
+      try { URL.revokeObjectURL(pub.objectUrl); } catch (e) {}
+    }
+    pub.objectUrl = URL.createObjectURL(file);
+    pub.videoEl.src = pub.objectUrl;
+    pub.videoEl.load();
+    pub.videoEl.addEventListener('loadedmetadata', onVideoMeta, { once: true });
+    enterEdit();
+    scheduleAutosave();
+  }
+
+  function setProgress(pct, visible) {
+    var value = Math.max(0, Math.min(100, Math.round(pct)));
+    pub.progressEl.hidden = !visible;
+    pub.progressFill.style.width = value + '%';
+    pub.progressText.textContent = value + '%';
+  }
+
+  function setPublishing(on) {
+    pub.uploading = on;
+    pub.submitBtn.disabled = on;
+    pub.saveBtn.disabled = on;
+    pub.backBtn.disabled = on;
+    pub.pickBtn.disabled = on;
+    pub.submitBtn.textContent = on ? '发布中…' : (pub.lastError ? '重试' : '发布');
+    pub.mask.style.pointerEvents = on ? 'none' : '';
+  }
+
+  /* 封面：先传 data URL 拿短路径；失败降级为无封面，不阻断发布。 */
+  function uploadCover(done) {
+    if (pub.coverUrl || pub.selectedFrame < 0 || !pub.frames[pub.selectedFrame]) {
+      done(pub.coverUrl);
+      return;
+    }
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', BASE + 'api/video/cover');
+    xhr.setRequestHeader('Authorization', 'Bearer ' + state.token);
+    xhr.setRequestHeader('Content-Type', 'application/json');
+    xhr.onload = function () {
+      var data = null;
+      try { data = JSON.parse(xhr.responseText || '{}'); } catch (e) { data = null; }
+      if (xhr.status === 200 && data && data.ok && data.cover_url) {
+        pub.coverUrl = data.cover_url;
+        done(pub.coverUrl);
+      } else {
+        done('');
+      }
+    };
+    xhr.onerror = function () { done(''); };
+    xhr.send(JSON.stringify({ data_url: pub.frames[pub.selectedFrame] }));
+  }
+
+  function postVideo(title, cover, done) {
+    var xhr = new XMLHttpRequest();
+    var startMs = Math.round(pub.clipStart * 1000);
+    var endMs = Math.round(pub.clipEnd * 1000);
+    var query = '?title=' + encodeURIComponent(title) +
+      (cover ? '&cover_url=' + encodeURIComponent(cover) : '') +
+      '&clip_start_ms=' + startMs + '&clip_end_ms=' + endMs;
+    if (!pub.idempotencyKey) pub.idempotencyKey = newDraftId();
+    xhr.open('POST', BASE + 'api/video/upload' + query);
+    xhr.setRequestHeader('Authorization', 'Bearer ' + state.token);
+    xhr.setRequestHeader('Content-Type', 'video/mp4');
+    xhr.setRequestHeader('Idempotency-Key', pub.idempotencyKey);
+    xhr.upload.onprogress = function (e) {
+      if (e.lengthComputable && e.total > 0) {
+        setProgress(e.loaded / e.total * 100, true);
+      }
+    };
+    xhr.onload = function () {
+      var data = null;
+      try { data = JSON.parse(xhr.responseText || '{}'); } catch (e) { data = null; }
+      if (xhr.status === 200 && data && data.ok && data.video) {
+        done(true, data, '');
+        return;
+      }
+      done(false, null, (data && data.error) || ('HTTP ' + xhr.status));
+    };
+    xhr.onerror = function () { done(false, null, '网络错误'); };
+    xhr.send(pub.file);
+  }
+
+  function submitPublish() {
+    if (pub.uploading) return;
+    if (!state.token) { toast('请先登录', 'err'); return; }
+    if (!pub.file) { toast('请先选择视频文件', 'err'); return; }
+    var title = (pub.titleEl.value || '').trim();
+    if (!title) { toast('标题不能为空', 'err'); pub.titleEl.focus(); return; }
+    var tags = (pub.tagsEl.value || '').trim();
+    /* 后端 titles 是话题来源：把 #话题 拼进标题，feed 才能显示 chips。 */
+    var fullTitle = tags ? (title + ' ' + tags) : title;
+    pub.lastError = '';
+    pub.submitBtn.textContent = '发布中…';
+    setPublishing(true);
+    setProgress(0, true);
+    uploadCover(function (cover) {
+      postVideo(fullTitle, cover, function (ok, data, err) {
+        if (ok) {
+          setPublishing(false);
+          pub.progressEl.hidden = true;
+          clearCurrentDraft();
+          toast('发布成功 🎉', 'ok');
+          resetPubForm();
+          closePublish();
+          if (data.video) insertUploaded(data.video);
+          if (state.user && state.user.id) {
+            showProfile(state.user.id, state.user.name || '');
+          } else if (data.video) {
+            jumpToVideo(data.video.id);
+          }
+          return;
+        }
+        pub.lastError = err;
+        setPublishing(false);
+        setProgress(0, true);
+        toast('发布失败：' + err + '（内容已保留，可点重试）', 'err');
+      });
+    });
+  }
+
+  pub.pickBtn.addEventListener('click', function () { pub.fileInput.click(); });
+  pub.fileInput.addEventListener('change', function () {
+    var file = pub.fileInput.files && pub.fileInput.files[0];
+    pub.fileInput.value = '';
+    if (file) onFileChosen(file);
+  });
+  pub.closeBtn.addEventListener('click', closePublish);
+  pub.mask.addEventListener('click', closePublish);
+  pub.submitBtn.addEventListener('click', submitPublish);
+  pub.saveBtn.addEventListener('click', function () { saveDraft(false); });
+  pub.backBtn.addEventListener('click', function () {
+    saveDraft(true);
+    pub.edit.hidden = true;
+    pub.pick.hidden = false;
+    renderDraftList();
+  });
+  pub.restoreYes.addEventListener('click', restoreAutosave);
+  pub.restoreNo.addEventListener('click', discardAutosave);
+  pub.titleEl.addEventListener('input', scheduleAutosave);
+  pub.descEl.addEventListener('input', scheduleAutosave);
+  pub.tagsEl.addEventListener('input', scheduleAutosave);
+  pub.clipStartEl.addEventListener('input', function () {
+    var v = Number(pub.clipStartEl.value) / 10;
+    if (v >= pub.clipEnd - 0.1) v = Math.max(0, pub.clipEnd - 0.1);
+    pub.clipStart = v;
+    if (pub.videoEl.src) {
+      try { pub.videoEl.currentTime = v; } catch (e) { /* metadata 未到 */ }
+    }
+    updateClipLabel();
+    scheduleAutosave();
+  });
+  pub.clipEndEl.addEventListener('input', function () {
+    var v = Number(pub.clipEndEl.value) / 10;
+    if (v <= pub.clipStart + 0.1) v = pub.clipStart + 0.1;
+    pub.clipEnd = v;
+    if (pub.videoEl.src) {
+      try { pub.videoEl.currentTime = v; } catch (e) { /* metadata 未到 */ }
+    }
+    updateClipLabel();
+    scheduleAutosave();
+  });
+  pub.clipResetEl.addEventListener('click', function () {
+    pub.clipStart = 0;
+    pub.clipEnd = pub.duration || 0;
+    applyClipUi();
+    scheduleAutosave();
+  });
+  window.addEventListener('beforeunload', function () {
+    if (pub.panel && !pub.panel.hidden && !pub.edit.hidden) saveDraft(true);
   });
 
   if (state.token && state.user) {
@@ -4000,6 +4856,8 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
   })();
 })();
 </script>
+
+
 </body>
 </html>)HTML";
 

@@ -1485,3 +1485,40 @@ latest（服务重启）→ `resume_gap`，客户端走 REST 全量刷新。
   - WSL 树不能直接 write/edit：仍用「Windows `.dsh_tmp` 落盘 + `wsl cp`」。
 - **状态**：已提交（本轮 commit）。
 
+## 2026-11-06 第 7 轮：内容三件套（草稿箱 / 视频编辑 / 发布流程）
+
+- **需求**：真树 WSL `/UserData/CodexWorkSpace/Go2cpp`（非 `E:\CodexWorkspace\Go2Cpp`）；
+  一轮 2–3 个内联功能；接受标准 = 功能齐全、无明显 bug、2C4G 下 TTFB < 200 ms。
+- **后端**（`douyin_store.{hpp,cpp}`、`douyin_proto.*`、`video_service.cpp`、
+  `feed_service.cpp`、`user_service.cpp`）：
+  - `videos` 加 `cover_url` / `clip_start_ms` / `clip_end_ms`；新库建表直带、
+    旧库 `EnsureSchema` 三条 ALTER；
+  - `CreateVideo` 新增带三字段重载；`ToJson(Video)` 与 feed/user 服务的视频
+    转换统一输出三字段；
+  - 新增 `POST /api/video/cover`：jpeg/png data URL → `videos/cover_*`，
+    ≤300 KiB + 魔数校验；
+  - `POST /api/video`、`/api/video/upload`、`/api/video/upload/finish` 接收
+    `cover_url`/`clip_*`；封面白名单 + 裁剪区间校验；
+  - `/api/video/upload` 支持 `Idempotency-Key`（内存表 24h/4096），
+    回放加 `Idempotency-Replayed: true`；
+  - 分享页 `og:image` 优先 `cover_url`。
+- **前端**（`douyin_home_page.hpp`）：
+  - 发布面板（`.pub-*`）：选文件、3 帧封面、双滑杆裁剪、标题/描述/话题、
+    进度条、发布/存草稿/返回、失败「重试」、成功跳「我的主页」；
+  - 草稿：`douyin_draft_autosave` + `douyin_drafts`，1s 防抖 + beforeunload，
+    重新打开提示恢复，「我的草稿」继续编辑/删除，发布成功清理；
+  - 播放端：`dataset.clipStart/clipEnd` + `buildProgress` 裁剪窗 +
+    `timeupdate` 到终点停 + `playOnly` 回起点；`posterSrc` 优先 `cover_url`。
+- **验证**：
+  - `bash app/douyin/build.sh` → 8 个二进制 ok，`-Werror -Wpedantic` 零告警；
+  - `bash app/douyin/scripts/accept_content_cluster.sh` → **79 PASS / 0 FAIL**；
+  - `accept_all.sh` 70 PASS / 0 FAIL；profile_tabs 115、upload_resume 50、
+    social_cluster 89，全 0 FAIL；
+  - 详情 / feed / 封面接口 TTFB（20 次串行）均 **0.7 ms**；
+  - 前端 JS 用 Windows node `--check` 语法通过（WSL 无 node）。
+- **踩坑**：
+  - `\\wsl.localhost` 写入 ENOTSUP/EIO → 继续「Windows `.dsh_tmp` + `wsl cp`」；
+  - feed/user 服务各有自己的视频转换，漏改会缺字段；
+  - 幂等验收基数要取在第一次上传之后；
+  - 迁移测试只重启 video_service，不能 `stop_all`（gateway 一起死 = 全 000）。
+- **状态**：已提交（本轮 commit）。

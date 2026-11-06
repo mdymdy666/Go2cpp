@@ -67,6 +67,9 @@ struct StoredVideo {
     std::int64_t like_count{0};     ///< 点赞数。
     std::int64_t comment_count{0};  ///< 评论数。
     std::int64_t created_at{0};     ///< Unix 秒。
+    std::string cover_url;          ///< 封面（`videos/cover_*.jpg`）；空=同名 jpg。
+    std::int64_t clip_start_ms{0};  ///< 裁剪起点（毫秒，含）；0=从头播。
+    std::int64_t clip_end_ms{0};    ///< 裁剪终点（毫秒，不含）；0=到片尾。
 };
 
 /// @brief `comments` 表里的一行评论（C5）。
@@ -351,6 +354,22 @@ class Store {
      */
     std::int64_t CreateVideo(std::int64_t user_id, const std::string& title,
                              const std::string& url, std::string* error);
+
+    /**
+     * @brief 发布视频（带封面与裁剪区间，第 7 轮发布链路）。
+     * @param user_id 作者 id。
+     * @param title 标题（非空由 service 校验）。
+     * @param url 视频地址（非空由 service 校验）。
+     * @param cover_url 封面地址；空串=沿用同名 jpg 兜底。
+     * @param clip_start_ms 裁剪起点（毫秒，含）；0=从头播。
+     * @param clip_end_ms 裁剪终点（毫秒，不含）；0=到片尾。
+     * @param error [out] 失败时写错误文本。
+     * @return 新视频 id；失败返回 -1。
+     */
+    std::int64_t CreateVideo(std::int64_t user_id, const std::string& title,
+                             const std::string& url, const std::string& cover_url,
+                             std::int64_t clip_start_ms,
+                             std::int64_t clip_end_ms, std::string* error);
 
     /// @brief 按 id 查视频；未找到返回 false 且 error 为空。
     bool FindVideo(std::int64_t id, StoredVideo* out, std::string* error);

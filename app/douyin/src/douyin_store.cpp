@@ -276,6 +276,9 @@ constexpr const char* kSchemaSql =
     "  user_id INTEGER NOT NULL,"
     "  title TEXT NOT NULL,"
     "  url TEXT NOT NULL,"
+    "  cover_url TEXT NOT NULL DEFAULT '',"
+    "  clip_start_ms INTEGER NOT NULL DEFAULT 0,"
+    "  clip_end_ms INTEGER NOT NULL DEFAULT 0,"
     "  like_count INTEGER NOT NULL DEFAULT 0,"
     "  comment_count INTEGER NOT NULL DEFAULT 0,"
     "  created_at INTEGER NOT NULL"
@@ -403,7 +406,8 @@ void CopyRow(const UserRow& row, StoredUser* out) {
 
 /// @brief videos 查询的固定列顺序（与 `ReadVideoRow` 的列下标一一对应）。
 constexpr const char* kVideoColumns =
-    "id, user_id, title, url, like_count, comment_count, created_at";
+    "id, user_id, title, url, like_count, comment_count, created_at, "
+    "cover_url, clip_start_ms, clip_end_ms";
 
 /// @brief 热度排序子句：与需求公式只差全局常数，排序等价且与 now 无关。
 constexpr const char* kVideoOrder =
@@ -419,6 +423,9 @@ void ReadVideoRow(go2cpp::storage::Rows* rows, StoredVideo* out) {
     out->like_count = rows->Int64(4);
     out->comment_count = rows->Int64(5);
     out->created_at = rows->Int64(6);
+    out->cover_url = rows->Text(7);
+    out->clip_start_ms = rows->Int64(8);
+    out->clip_end_ms = rows->Int64(9);
 }
 
 /// @brief comments 查询的固定列顺序（与 `ReadCommentRow` 的下标对应）。
@@ -670,6 +677,14 @@ bool Store::EnsureSchema(std::string* error) {
     //        duplicate column，属预期）。
     (void)m_db->Exec(
         "ALTER TABLE comments ADD COLUMN pinned_at INTEGER NOT NULL DEFAULT 0");
+    // step5: 第 7 轮发布链路——videos 补封面与裁剪区间。旧库重复 ALTER 报
+    //        duplicate column，属预期；新库由建表脚本直接带列。
+    (void)m_db->Exec(
+        "ALTER TABLE videos ADD COLUMN cover_url TEXT NOT NULL DEFAULT ''");
+    (void)m_db->Exec(
+        "ALTER TABLE videos ADD COLUMN clip_start_ms INTEGER NOT NULL DEFAULT 0");
+    (void)m_db->Exec(
+        "ALTER TABLE videos ADD COLUMN clip_end_ms INTEGER NOT NULL DEFAULT 0");
     // step4: 列补齐后再建索引（放在建表脚本里会在旧库上报 no such column）。
     (void)m_db->Exec(
         "CREATE INDEX IF NOT EXISTS idx_comments_parent "
@@ -994,6 +1009,13 @@ bool Store::IsFollowing(std::int64_t follower, std::int64_t followee, bool* out,
 
 std::int64_t Store::CreateVideo(std::int64_t user_id, const std::string& title,
                                 const std::string& url, std::string* error) {
+    return CreateVideo(user_id, title, url, std::string(), 0, 0, error);
+}
+
+std::int64_t Store::CreateVideo(std::int64_t user_id, const std::string& title,
+                                const std::string& url, const std::string& cover_url,
+                                std::int64_t clip_start_ms, std::int64_t clip_end_ms,
+                                std::string* error) {
     if (!Ok()) {
         if (error != nullptr) {
             *error = "数据库尚未打开";
@@ -1001,9 +1023,11 @@ std::int64_t Store::CreateVideo(std::int64_t user_id, const std::string& title,
         return -1;
     }
     auto inserted = m_db->Exec(
-        "INSERT INTO videos(user_id, title, url, like_count, comment_count, "
-        "created_at) VALUES(?, ?, ?, 0, 0, ?)",
-        user_id, title, url, static_cast<std::int64_t>(std::time(nullptr)));
+        "INSERT INTO videos(user_id, title, url, cover_url, clip_start_ms, "
+        "clip_end_ms, like_count, comment_count, created_at) "
+        "VALUES(?, ?, ?, ?, ?, ?, 0, 0, ?)",
+        user_id, title, url, cover_url, clip_start_ms, clip_end_ms,
+        static_cast<std::int64_t>(std::time(nullptr)));
     if (!inserted) {
         if (error != nullptr) {
             *error = "插入视频失败: " + DescribeError(inserted.Err());

@@ -35,6 +35,9 @@ struct Video {
     std::int64_t like_count{0};     ///< 点赞数（interaction 服务维护）。
     std::int64_t comment_count{0};  ///< 评论数（interaction 服务维护）。
     std::int64_t created_at{0};
+    std::string cover_url;          ///< 封面（`videos/cover_*.jpg`；空=同名 jpg）。
+    std::int64_t clip_start_ms{0};  ///< 裁剪起点（毫秒，含）；0=从头播。
+    std::int64_t clip_end_ms{0};    ///< 裁剪终点（毫秒，不含）；0=到片尾。
     std::vector<std::string> tags;  ///< 话题标签（由标题提取；空 = 无话题）。
 };
 

@@ -35,6 +35,7 @@
 #include "douyin_share_page.hpp"
 #include "douyin_store.hpp"
 #include "douyin_tag.hpp"
+#include "go2cpp/encoding/base64.hpp"
 #include "go2cpp/storage/db.hpp"
 
 #include <algorithm>
@@ -47,6 +48,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <mutex>
 #include <random>
 #include <string>
 #include <string_view>
@@ -59,6 +61,18 @@ constexpr std::uint16_t kDefaultPort = 29102;
 constexpr const char* kServiceName = "video";
 constexpr std::int64_t kDefaultPageSize = 20;
 constexpr std::int64_t kMaxPageSize = 100;
+/// @brief 上传幂等缓存：Idempotency-Key → (video_id, 过期时间)。
+/// @note 只在本进程内有效（Demo 单实例）；重启丢失不影响正确性，只会让
+///       重试再多建一条视频，由前端按钮禁用兜底。
+struct UploadIdemEntry {
+    std::int64_t video_id{0};
+    std::time_t expires_at{0};
+};
+std::mutex g_upload_idem_mutex;
+std::map<std::string, UploadIdemEntry> g_upload_idem;
+constexpr std::size_t kMaxIdemEntries = 4096;
+constexpr std::int64_t kIdemTtlSeconds = 24 * 60 * 60;
+
 constexpr std::size_t kMaxTitleBytes = 256;
 constexpr std::size_t kMaxUrlBytes = 2048;
 /// @brief 上传体积上限（32 MiB，与 douyin_http 的 body 上限一致）。
@@ -424,6 +438,109 @@ bool SyncUploadProgress(douyin::Store& store, douyin::StoredUpload* session,
     return true;
 }
 
+/// @brief 解析十进制整数文本（全部字符必须是数字）；失败返回 false。
+bool ParseInt64Text(const std::string& text, std::int64_t* out) {
+    if (text.empty() || text.size() > 18) {
+        return false;
+    }
+    std::int64_t value = 0;
+    const char* const begin = text.data();
+    const char* const end = text.data() + text.size();
+    const auto result = std::from_chars(begin, end, value, 10);
+    if (result.ec != std::errc() || result.ptr != end) {
+        return false;
+    }
+    *out = value;
+    return true;
+}
+
+/// @brief 封面地址白名单：空 / http(s) / `videos/<安全文件名>.(jpg|png)`。
+bool ValidCoverUrl(const std::string& url) {
+    if (url.empty()) {
+        return true;
+    }
+    if (url.size() > 512) {
+        return false;
+    }
+    if (url.rfind("http://", 0) == 0 || url.rfind("https://", 0) == 0) {
+        return true;
+    }
+    constexpr std::string_view kPrefix = "videos/";
+    if (url.compare(0, kPrefix.size(), kPrefix) != 0) {
+        return false;
+    }
+    const std::string name = url.substr(kPrefix.size());
+    if (name.size() < 5 || name.size() > 128) {
+        return false;
+    }
+    for (const char c : name) {
+        const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                        (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.';
+        if (!ok) {
+            return false;
+        }
+    }
+    const std::string ext = name.substr(name.size() - 4);
+    return ext == ".jpg" || ext == ".png";
+}
+
+/// @brief 裁剪区间合法：0/0=不裁剪；否则 0 <= start < end <= 24h（end=0 到片尾）。
+bool ValidClip(std::int64_t start_ms, std::int64_t end_ms) {
+    constexpr std::int64_t kMaxClipMs = 24LL * 3600 * 1000;
+    if (start_ms < 0 || end_ms < 0 || start_ms > kMaxClipMs || end_ms > kMaxClipMs) {
+        return false;
+    }
+    if (end_ms == 0) {
+        return true;
+    }
+    return start_ms < end_ms;
+}
+
+/// @brief 从 query 读可选封面/裁剪（整包上传用，body 是视频字节）。
+bool ReadClipFromQuery(const douyin::HttpRequest& request, std::string* cover_url,
+                       std::int64_t* clip_start_ms, std::int64_t* clip_end_ms,
+                       douyin::HttpResponse* response) {
+    *cover_url = UrlDecode(douyin::QueryParam(request, "cover_url"));
+    const std::string start = douyin::QueryParam(request, "clip_start_ms");
+    const std::string end = douyin::QueryParam(request, "clip_end_ms");
+    *clip_start_ms = 0;
+    *clip_end_ms = 0;
+    if (!start.empty() && !ParseInt64Text(start, clip_start_ms)) {
+        Fail(response, 400, "clip_start_ms 非法");
+        return false;
+    }
+    if (!end.empty() && !ParseInt64Text(end, clip_end_ms)) {
+        Fail(response, 400, "clip_end_ms 非法");
+        return false;
+    }
+    if (!ValidCoverUrl(*cover_url) || !ValidClip(*clip_start_ms, *clip_end_ms)) {
+        Fail(response, 400, "cover_url/裁剪区间非法");
+        return false;
+    }
+    return true;
+}
+
+/// @brief 从 JSON body 读可选封面/裁剪（publish 与分片 finish 用）。
+bool ReadClipFromJson(const std::string& body, std::string* cover_url,
+                      std::int64_t* clip_start_ms, std::int64_t* clip_end_ms,
+                      douyin::HttpResponse* response) {
+    *cover_url = "";
+    *clip_start_ms = 0;
+    *clip_end_ms = 0;
+    (void)douyin::JsonStringField(body, "cover_url", cover_url);
+    if (!JsonIntField(body, "clip_start_ms", clip_start_ms)) {
+        *clip_start_ms = 0;
+    }
+    if (!JsonIntField(body, "clip_end_ms", clip_end_ms)) {
+        *clip_end_ms = 0;
+    }
+    if (!ValidCoverUrl(*cover_url) || !ValidClip(*clip_start_ms, *clip_end_ms)) {
+        Fail(response, 400, "cover_url/裁剪区间非法");
+        return false;
+    }
+    return true;
+}
+
 /// @brief 把存储行转成对外 Video。
 douyin::Video PublicVideo(const douyin::StoredVideo& stored) {
     douyin::Video video;
@@ -434,6 +551,9 @@ douyin::Video PublicVideo(const douyin::StoredVideo& stored) {
     video.like_count = stored.like_count;
     video.comment_count = stored.comment_count;
     video.created_at = stored.created_at;
+    video.cover_url = stored.cover_url;
+    video.clip_start_ms = stored.clip_start_ms;
+    video.clip_end_ms = stored.clip_end_ms;
     video.tags = douyin::ExtractTags(stored.title);
     return video;
 }
@@ -507,8 +627,17 @@ bool HandleCreate(douyin::Store& store, const douyin::HttpRequest& request,
         return Fail(response, 400, "字段过长");
     }
 
+    std::string cover_url;
+    std::int64_t clip_start_ms = 0;
+    std::int64_t clip_end_ms = 0;
+    if (!ReadClipFromJson(request.body, &cover_url, &clip_start_ms, &clip_end_ms,
+                          response)) {
+        return true;
+    }
+
     std::string error;
-    const std::int64_t id = store.CreateVideo(actor, title, url, &error);
+    const std::int64_t id = store.CreateVideo(
+        actor, title, url, cover_url, clip_start_ms, clip_end_ms, &error);
     if (id <= 0) {
         std::fprintf(stderr, "[%s] 发布视频失败: %s\n", kServiceName, error.c_str());
         return Fail(response, 500, "数据库错误");
@@ -520,6 +649,9 @@ bool HandleCreate(douyin::Store& store, const douyin::HttpRequest& request,
     stored.title = title;
     stored.url = url;
     stored.created_at = NowSeconds();
+    stored.cover_url = cover_url;
+    stored.clip_start_ms = clip_start_ms;
+    stored.clip_end_ms = clip_end_ms;
     response->status = 200;
     response->body = "{\"ok\":true,\"video\":" +
                      douyin::ToJson(PublicVideo(stored)) + "}";
@@ -562,9 +694,34 @@ bool HandleUpload(douyin::Store& store, const douyin::HttpRequest& request,
         return true;
     }
     // step2: 标题解码后再校验字符数，避免 %E4... 被当成可见字符计数。
+    // 幂等：同一 Idempotency-Key 的重试直接回放第一次的视频，不重复建行。
+    const std::string idem_key = request.Header("idempotency-key");
+    if (!idem_key.empty() && idem_key.size() <= 200) {
+        std::lock_guard<std::mutex> lock(g_upload_idem_mutex);
+        const auto it = g_upload_idem.find(idem_key);
+        if (it != g_upload_idem.end() &&
+            it->second.expires_at > std::time(nullptr)) {
+            douyin::StoredVideo replay;
+            std::string replay_error;
+            if (store.FindVideo(it->second.video_id, &replay, &replay_error)) {
+                response->status = 200;
+                response->headers["Idempotency-Replayed"] = "true";
+                response->body = "{\"ok\":true,\"video\":" +
+                                 douyin::ToJson(PublicVideo(replay)) + "}";
+                return true;
+            }
+        }
+    }
     const std::string title = UrlDecode(douyin::QueryParam(request, "title"));
     if (title.empty() || Utf8Length(title) > kMaxTitleChars) {
         return Fail(response, 400, "title 长度需为 1-80 字");
+    }
+    std::string cover_url;
+    std::int64_t clip_start_ms = 0;
+    std::int64_t clip_end_ms = 0;
+    if (!ReadClipFromQuery(request, &cover_url, &clip_start_ms, &clip_end_ms,
+                           response)) {
+        return true;
     }
     // step3: 体积与完整性检查。读取层负责按 Content-Length 读满；这里再比对一次
     // 声明长度与实际 body，防止短 body 被当成完整视频落盘（读取层换实现时的兜底）。
@@ -628,12 +785,22 @@ bool HandleUpload(douyin::Store& store, const douyin::HttpRequest& request,
     // step6: 先落盘再建记录；建记录失败要回滚文件，避免磁盘出现无主视频。
     const std::string url = "videos/" + path.filename().string();
     std::string error;
-    const std::int64_t id = store.CreateVideo(actor, title, url, &error);
+    const std::int64_t id = store.CreateVideo(
+        actor, title, url, cover_url, clip_start_ms, clip_end_ms, &error);
     if (id <= 0) {
         std::filesystem::remove(path, ec);
         std::fprintf(stderr, "[%s] 建视频记录失败: %s\n", kServiceName,
                      error.c_str());
         return Fail(response, 500, "数据库错误");
+    }
+    // 记住这个 key：同 key 的重试（网络抖动/用户连点）回放同一条视频。
+    if (!idem_key.empty() && idem_key.size() <= 200) {
+        std::lock_guard<std::mutex> lock(g_upload_idem_mutex);
+        if (g_upload_idem.size() >= kMaxIdemEntries) {
+            g_upload_idem.clear();
+        }
+        g_upload_idem[idem_key] =
+            UploadIdemEntry{id, std::time(nullptr) + kIdemTtlSeconds};
     }
     douyin::StoredVideo stored;
     stored.id = id;
@@ -641,9 +808,109 @@ bool HandleUpload(douyin::Store& store, const douyin::HttpRequest& request,
     stored.title = title;
     stored.url = url;
     stored.created_at = NowSeconds();
+    stored.cover_url = cover_url;
+    stored.clip_start_ms = clip_start_ms;
+    stored.clip_end_ms = clip_end_ms;
     response->status = 200;
     response->body = "{\"ok\":true,\"video\":" +
                      douyin::ToJson(PublicVideo(stored)) + "}";
+    return true;
+}
+
+/**
+ * @brief 上传封面：base64 data URL → `videos/cover_<uid>_<ms>.(jpg|png)`。
+ *
+ * @param store [in,out] 只用来确认存储可用；封面不落 DB，发布时按路径引用。
+ * @param request [in] JSON `{"data_url":"data:image/jpeg;base64,..."}`；
+ *        Bearer 必需。
+ * @param response [out] 成功 200 + `{"ok":true,"cover_url":"videos/..."}`；
+ *        格式/体积/base64 非法 400；鉴权 401；写盘失败 500。
+ * @return 总是 true。
+ *
+ * ## 定位
+ * 封面字节的唯一写入点：前端抽帧后先传封面拿短路径，再带 `cover_url`
+ * 发布视频，避免把几十 KB 的 data URL 塞进发布 query 或数据库行。
+ *
+ * ## 步骤
+ * step1. 鉴权；step2. 校验 data URL 前缀与体积上限；step3. base64 解码；
+ * step4. 校验 JPEG/PNG 魔数；step5. 时间戳命名落盘并返回相对路径。
+ */
+bool HandleCoverUpload(douyin::Store& store, const douyin::HttpRequest& request,
+                       douyin::HttpResponse* response) {
+    (void)store;
+    // step1: 封面必须绑定用户，便于配额与审计。
+    std::int64_t actor = 0;
+    if (!RequireToken(request, response, &actor)) {
+        return true;
+    }
+    // step2: 只接受 jpeg/png；base64 文本先限长，避免先解码再拒绝。
+    std::string data_url;
+    if (!douyin::JsonStringField(request.body, "data_url", &data_url) ||
+        data_url.empty()) {
+        return Fail(response, 400, "缺少 data_url");
+    }
+    constexpr std::string_view kJpeg = "data:image/jpeg;base64,";
+    constexpr std::string_view kPng = "data:image/png;base64,";
+    bool png = false;
+    if (data_url.rfind(kJpeg, 0) == 0) {
+        data_url.erase(0, kJpeg.size());
+    } else if (data_url.rfind(kPng, 0) == 0) {
+        png = true;
+        data_url.erase(0, kPng.size());
+    } else {
+        return Fail(response, 400, "只支持 jpeg/png data URL");
+    }
+    if (data_url.size() > 420 * 1024) {
+        return Fail(response, 400, "封面不能超过 300 KiB");
+    }
+    // step3: 解码失败一律 400，不把半截字节写盘。
+    auto decoded = go2cpp::encoding::StdEncoding.DecodeString(data_url);
+    if (!decoded || decoded.data.size() < 8 ||
+        decoded.data.size() > 300 * 1024) {
+        return Fail(response, 400, "base64 解码失败或封面超过 300 KiB");
+    }
+    const std::string& bytes = decoded.data;
+    // step4: 魔数校验，挡住「base64 里塞任意文件」。
+    const unsigned char* head =
+        reinterpret_cast<const unsigned char*>(bytes.data());
+    const bool is_jpeg = head[0] == 0xFF && head[1] == 0xD8 && head[2] == 0xFF;
+    const bool is_png = head[0] == 0x89 && head[1] == 0x50 && head[2] == 0x4E &&
+                        head[3] == 0x47;
+    if (png ? !is_png : !is_jpeg) {
+        return Fail(response, 400, "封面内容与声明格式不符");
+    }
+    // step5: 目录按需创建；时间戳命名，同毫秒重名顺延。
+    std::error_code ec;
+    const std::filesystem::path dir = std::filesystem::path(WebDir()) / "videos";
+    std::filesystem::create_directories(dir, ec);
+    if (ec) {
+        return Fail(response, 500, "存储目录不可用");
+    }
+    const std::string ext = png ? ".png" : ".jpg";
+    std::int64_t stamp = NowMilliseconds();
+    std::filesystem::path path = dir / ("cover_" + std::to_string(actor) + "_" +
+                                        std::to_string(stamp) + ext);
+    for (int i = 0; i < 1000 && std::filesystem::exists(path); ++i) {
+        ++stamp;
+        path = dir / ("cover_" + std::to_string(actor) + "_" +
+                      std::to_string(stamp) + ext);
+    }
+    {
+        std::ofstream output(path, std::ios::binary | std::ios::trunc);
+        if (!output.is_open()) {
+            return Fail(response, 500, "写入失败");
+        }
+        output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        if (!output.good()) {
+            output.close();
+            std::filesystem::remove(path, ec);
+            return Fail(response, 500, "写入失败");
+        }
+    }
+    response->status = 200;
+    response->body = "{\"ok\":true,\"cover_url\":\"videos/" +
+                     path.filename().string() + "\",\"bytes\":" +
+                     std::to_string(bytes.size()) + "}";
     return true;
 }
 
@@ -877,6 +1144,13 @@ bool HandleUploadFinish(douyin::Store& store, const douyin::HttpRequest& request
         Utf8Length(title) > kMaxTitleChars) {
         return Fail(response, 400, "title 长度需为 1-80 字");
     }
+    std::string cover_url;
+    std::int64_t clip_start_ms = 0;
+    std::int64_t clip_end_ms = 0;
+    if (!ReadClipFromJson(request.body, &cover_url, &clip_start_ms, &clip_end_ms,
+                          response)) {
+        return true;
+    }
     // step2: 归属校验 + 用磁盘真实大小校准（崩溃窗口里 DB 可能落后）。
     douyin::StoredUpload session;
     if (!LoadOwnedUpload(store, upload_id, actor, &session, response)) {
@@ -928,7 +1202,8 @@ bool HandleUploadFinish(douyin::Store& store, const douyin::HttpRequest& request
     // step6: rename 后再建记录；建记录失败把文件改回 `.part`，客户端可重试 finish。
     const std::string url = "videos/" + final_path.filename().string();
     std::string error;
-    const std::int64_t id = store.CreateVideo(actor, title, url, &error);
+    const std::int64_t id = store.CreateVideo(
+        actor, title, url, cover_url, clip_start_ms, clip_end_ms, &error);
     if (id <= 0) {
         std::error_code restore;
         std::filesystem::rename(final_path, part, restore);
@@ -947,6 +1222,9 @@ bool HandleUploadFinish(douyin::Store& store, const douyin::HttpRequest& request
     stored.title = title;
     stored.url = url;
     stored.created_at = NowSeconds();
+    stored.cover_url = cover_url;
+    stored.clip_start_ms = clip_start_ms;
+    stored.clip_end_ms = clip_end_ms;
     response->status = 200;
     response->body = "{\"ok\":true,\"video\":" +
                      douyin::ToJson(PublicVideo(stored)) + "}";
@@ -1147,7 +1425,20 @@ std::string ShareVideoUrl(const std::string& prefix, const std::string& url,
 /// @return 封面地址；文件是否真的存在由本函数用 std::filesystem 确认，
 ///         避免 OG 图 404（聊天窗口里表现为空白预览）。
 std::string SharePosterUrl(const std::string& prefix, const std::string& url,
-                           std::int64_t id) {
+                           const std::string& cover_url, std::int64_t id) {
+    // 用户选的封面优先：绝对地址直接用，`videos/x.jpg` 需文件存在才落 URL。
+    if (cover_url.rfind("http://", 0) == 0 ||
+        cover_url.rfind("https://", 0) == 0) {
+        return cover_url;
+    }
+    if (cover_url.rfind("videos/", 0) == 0) {
+        std::error_code cover_ec;
+        if (std::filesystem::exists(
+                std::filesystem::path(WebDir()) / cover_url.substr(7), cover_ec) &&
+            !cover_ec) {
+            return prefix + cover_url;
+        }
+    }
     std::string name = url;
     const std::size_t slash = name.rfind('/');
     if (slash != std::string::npos) {
@@ -1265,7 +1556,8 @@ bool HandleSharePage(douyin::Store& store, const douyin::HttpRequest& request,
     data.origin = origin;
     const std::string prefix = base_path + "/";
     data.video_url = ShareVideoUrl(prefix, stored.url, video_id);
-    data.poster_url = SharePosterUrl(prefix, stored.url, video_id);
+    data.poster_url =
+        SharePosterUrl(prefix, stored.url, stored.cover_url, video_id);
     if (viewer > 0) {
         bool following = false;
         std::string status_error;
@@ -1888,6 +2180,13 @@ bool Handle(douyin::Store& store, const douyin::HttpRequest& request,
             }
             return Fail(response, 405, "方法不允许");
         }
+    }
+
+    if (request.path == "/api/video/cover") {
+        if (request.method == "POST") {
+            return HandleCoverUpload(store, request, response);
+        }
+        return Fail(response, 405, "方法不允许");
     }
 
     if (request.path == "/api/video/upload") {

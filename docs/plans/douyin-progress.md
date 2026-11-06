@@ -72,6 +72,12 @@
 
 - [x] 分片上传 + 断点续传：`/api/video/upload/init|chunk|finish` + `upload_sessions` 表
 - [x] 上传进度 UI（`buildProgress` / `insertUploaded`）
+- [x] **草稿箱（第 7 轮新增）**：localStorage 自动保存（1s 防抖）+ 恢复提示 +
+      我的草稿列表（继续编辑 / 删除）+ 发布成功自动清理
+- [x] **视频编辑（第 7 轮新增）**：canvas 抽 3 帧选封面 + 裁剪起止；
+      `videos` 表 `cover_url`/`clip_start_ms`/`clip_end_ms`；播放端按裁剪窗播放
+- [x] **发布流程完善（第 7 轮新增）**：XHR 上传进度 + 失败重试 + 成功跳转 +
+      防重复提交；`Idempotency-Key` 服务端回放（`Idempotency-Replayed`）
 - [x] 网关 32 MiB 上传体上限前置拦截
 
 ### 6. 直播与其它
@@ -92,18 +98,20 @@
 | 3.1 | 举报列表后台（运营端） | 中 | 1 h | 目前只落库，无管理接口；见 `reports.status` |
 | 4 | ~~分享落地页 `/v/:id`~~ | 中高 | — | **本轮已完成**（独立 SSR 页 + OG 预览） |
 | 5 | ~~个人主页三 tab（作品/喜欢/收藏）~~ | 中高 | — | **本轮已完成** |
-| 6 | 评论 @mention | 中 | 2 h | 输入 @ 弹候选 + 评论渲染高亮 + 通知联动 |
-| 7 | 草稿箱 | 中 | 1 h | 前端已有 localStorage 使用；需明确草稿持久化与恢复入口 |
+| 6 | ~~评论 @mention~~ | 中 | — | **第 6 轮已完成** |
+| 7 | ~~草稿箱~~ | 中 | — | **第 7 轮已完成**（自动保存 / 恢复提示 / 我的草稿） |
 | 8 | 播放器手势增强（上下滑/长按倍速） | 中 | 1 h | 现有双击点赞/拖动，缺上下切换与长按 2x |
-| 9 | 评论排序（最热/最新） | 中低 | 40 min | `ORDER BY like_count` 分支 + 前端切换 |
-| 10 | ~~消息未读红点~~ | 低 | — | **本轮已完成**（并入 🔔 未读徽章） |
+| 9 | ~~评论排序（最热/最新）~~ | 中低 | — | **第 6 轮已完成** |
+| 10 | ~~消息未读红点~~ | 低 | — | **第 5 轮已完成**（并入 🔔 未读徽章） |
+| 11 | ~~视频编辑（封面选帧 / 时长裁剪）~~ | 中高 | — | **第 7 轮已完成**（无转码，播放端按裁剪窗播放） |
+| 12 | ~~发布流程完善（进度 / 重试 / 跳转 / 幂等）~~ | 中高 | — | **第 7 轮已完成** |
 
 ### 待核实（摘要声称已完成，但代码关键词未命中）
 
 | 项 | 扫描结果 | 结论 |
 |---|---|---|
-| @mention | `mention` 在 src/include/前端均 0 命中 | 未实现（或用了完全不同的命名） |
-| 草稿 | `draft/草稿` 0 命中；`localStorage` 前端 17 处 | 草稿箱未实现；localStorage 用于登录态/音量等 |
+| @mention | 第 6 轮已实现（`interaction_service.cpp` 的 mention 解析 + 前端 @ 补全） | 已完成 |
+| 草稿 | 第 7 轮已实现（`douyin_home_page.hpp` 的 DRAFT_KEY / saveDraft / resumeDraft） | 已完成 |
 | WS Resume | `WebSocket / Sec-WebSocket / resume` 均 0 命中 | 未实现（当前是纯 HTTP + fetch） |
 | 压缩 | `gzip / deflate / compress / zstd` 均 0 命中 | 未实现（`douyin_http.hpp` 无压缩） |
 
@@ -471,12 +479,87 @@
   `/api/video/**` 通配被 video 服务 404。修复：别名路由注册 `method_mask::kAll`，
   由 interaction 统一回 405。
 
-## 九、下一轮建议
 
-1. 主页 tab 增强：喜欢列表「可见性设置」（公开 / 仅好友 / 私密）、
-   他人主页的授权申请、收藏夹分组。
+## 九、第 7 轮交付：内容三件套（草稿箱 / 视频编辑 / 发布流程）
+
+### 草稿箱（前端 localStorage）
+
+- 键位：`douyin_draft_autosave`（当前编辑）、`douyin_drafts`（列表，最多 10 条）；
+- 标题/描述/话题/文件名/选中封面 dataURL/裁剪区间在 `input` 后 **1s 防抖**自动保存，
+  另在 `beforeunload` 与「返回 / 关闭」时同步保存一次；
+- 重新打开发布面板：本地有自动保存副本 → 顶部提示「有未发布的草稿，是否恢复？」，
+  「恢复」填充表单并进入编辑态，「忽略」删除该副本与列表项；
+- 「我的草稿」列表：标题 + 更新时间 + 「继续编辑」「删除」；
+  浏览器不能保存 File 本体，继续编辑会提示重新选择同名文件；
+- 发布成功：`clearCurrentDraft()` 删除列表项与自动保存副本（按 draftId 精确匹配）。
+
+### 视频编辑（封面 + 裁剪，无转码）
+
+- 封面：选文件后 `<video>` 定位 0.5s / 2s / 末帧，`<canvas>` 抽帧
+  `toDataURL('image/jpeg', 0.7)` 生成 3 张候选；点选一张 → 发布前先调
+  `POST /api/video/cover`（新接口）落盘为 `videos/cover_<uid>_<ms>.jpg`，
+  返回短路径作为 `cover_url`；
+- 裁剪：两条滑杆记录起止（0.1s 精度），发布时带 `clip_start_ms`/`clip_end_ms`；
+- 播放端：`buildSlide` 把区间写进 `video.dataset.clipStart/clipEnd`，
+  `buildProgress` 的填充/拖动/时间文本按裁剪窗计算，`timeupdate` 到
+  `clip_end` 暂停并停在终点，`playOnly` 起播前拉回 `clip_start`；
+- 分享页 `og:image` 优先用 `cover_url`（文件存在才用，否则回退同名 jpg/demo）。
+
+### 发布流程完善
+
+- 进度条：`XMLHttpRequest.upload.onprogress` → 百分比 + 填充条；
+- 失败重试：网络错误 / 5xx / 4xx 时按钮变「重试」，表单与选中文件全部保留，
+  重试复用同一 `Idempotency-Key`；
+- 成功：toast「发布成功 🎉」→ 关闭面板 → 新视频插到 feed 首位 →
+  跳转「我的主页」（无登录态时 `jumpToVideo`）；
+- 防重复：`pub.uploading` 标志 + 发布/保存/返回/选文件按钮同时 disabled；
+- 服务端幂等：`/api/video/upload` 识别 `Idempotency-Key`（内存表，24h TTL，
+  上限 4096 条），同 key 二次请求回放同一条视频并加
+  `Idempotency-Replayed: true`。
+
+### 后端字段与接口
+
+| 项 | 改动 |
+|---|---|
+| `videos` 表 | 新增 `cover_url TEXT NOT NULL DEFAULT ''`、`clip_start_ms INTEGER NOT NULL DEFAULT 0`、`clip_end_ms INTEGER NOT NULL DEFAULT 0`；`EnsureSchema` 三条 ALTER 兼容旧库 |
+| `StoredVideo` / `douyin::Video` | 同名三字段；`ToJson(Video)` 在 video / feed / user 三个服务的转换处统一输出 |
+| `CreateVideo` | 新增带封面/裁剪的重载，旧签名转发（0/0） |
+| `POST /api/video/cover` | **新增**：`{"data_url":"data:image/jpeg;base64,..."}` → 落盘 + 返回 `cover_url`；只收 jpeg/png，≤300 KiB，校验魔数；401/400/500 |
+| `POST /api/video`、`POST /api/video/upload`、`POST /api/video/upload/finish` | 接受可选 `cover_url`/`clip_start_ms`/`clip_end_ms`，非法 400；响应回传三字段 |
+| 校验 | 封面只允许 http(s) 或 `videos/<安全文件名>.(jpg\|png)`；裁剪 `0<=start<end<=24h`（end=0 到片尾） |
+
+### 验收
+
+- `bash app/douyin/build.sh` → 8 个二进制 ok，`-Werror -Wpedantic` 零告警
+- `bash app/douyin/scripts/accept_content_cluster.sh` → **79 PASS / 0 FAIL**（9 组）
+- `bash app/douyin/scripts/accept_all.sh` → **70 PASS / 0 FAIL**
+- 历史回归：profile_tabs 115、upload_resume 50、social_cluster 89，全部 0 FAIL
+- 性能（loopback，20 次串行）：视频详情 avg **0.7 ms**、feed avg **0.7 ms**、
+  封面接口 avg **0.7 ms**（阈值 200 ms）
+- 覆盖：封面上传（PNG/JPEG/落盘字节/401/格式/坏 base64/空 body）、发布三字段
+  往返（响应/详情/feed/mine）、非法裁剪与封面、整包上传、分片 finish、
+  同 key 幂等（同 id + Replayed + mine 数量不变）、旧库 ALTER 迁移、
+  前端实现关键字、TTFB、分享页回归
+
+### 踩坑记录
+
+- **WSL 树不能直接 write/edit**：`\\wsl.localhost` 写文件报 ENOTSUP/EIO，
+  继续用「Windows `.dsh_tmp` 落盘 + `wsl cp`」；
+- **feed/user 服务漏字段**：两个服务各有自己的视频转换函数，只改 video 服务
+  会导致 feed 里没有封面/裁剪；三处统一补齐；
+- **幂等基数取错**：验收先取「上传前」数量，第一次上传本身 +1 会误判；
+  改为「第一次上传后」取基数；
+- **迁移测试停掉全部服务**：gateway 一起被杀导致后续请求全部 000；改为只重启
+  video_service，并按 pid 文件精确删除条目。
+
+## 十、下一轮建议
+
+1. 播放器手势增强：上下滑切换（当前为滚动吸附）、长按 2x 倍速、双击点赞
+   已有；与裁剪窗配合时注意 `clip_end` 停止逻辑。
 2. 举报运营后台：`reports.status` 只有 pending，缺列表 / 处理接口与页面。
-3. 「待核实」三项：草稿 / WS Resume / 压缩——要么补实现，要么从
-   已完成清单里移除；@mention 已在第 6 轮落地（见第八节）。
-4. 落地页增强：评论回复折叠、作者其它作品、播放进度记忆；分享卡片的
-   `og:image` 可选自动截帧（当前复用同名 jpg / demo 封面）。
+3. 服务端草稿：当前草稿只在 localStorage（换设备/清缓存即丢）；可加
+   `drafts` 表 + 多端同步，File 本体仍由用户重选。
+4. 「待核实」剩余两项：WS Resume / 压缩——要么补实现，要么从已完成
+   清单里移除；@mention（第 6 轮）与草稿（第 7 轮）已落地。
+5. 落地页增强：评论回复折叠、作者其它作品、播放进度记忆；
+   `og:image` 已支持 `cover_url`，可再加服务端自动截帧。

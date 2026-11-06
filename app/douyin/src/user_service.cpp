@@ -438,6 +438,9 @@ douyin::Video PublicVideo(const douyin::StoredVideo& stored) {
     video.like_count = stored.like_count;
     video.comment_count = stored.comment_count;
     video.created_at = stored.created_at;
+    video.cover_url = stored.cover_url;
+    video.clip_start_ms = stored.clip_start_ms;
+    video.clip_end_ms = stored.clip_end_ms;
     return video;
 }
 
