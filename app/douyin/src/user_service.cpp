@@ -6,6 +6,8 @@
  *          - POST   /api/user/register         注册（重复 email → 409）
  *          - POST   /api/user/login            登录（错误 → 401）
  *          - GET    /api/user/:id              资料（不含 password_hash/salt）
+ *          - GET    /api/user/me               本人资料（Bearer）
+ *          - PATCH  /api/user/me               改昵称/简介/头像（Bearer）
  *          - POST   /api/user/:id/follow       关注（需 Bearer token，幂等）
  *          - DELETE /api/user/:id/follow       取关（需 Bearer token，幂等）
  *          - GET    /api/user/:id/following    关注列表（分页）
@@ -75,7 +77,70 @@ douyin::User PublicUser(const douyin::StoredUser& stored) {
     user.name = stored.name;
     user.email = stored.email;
     user.created_at = stored.created_at;
+    user.bio = stored.bio;
+    user.avatar_url = stored.avatar_url;
     return user;
+}
+
+/// @brief UTF-8 码点个数（续接字节 10xxxxxx 不计；非法字节各算一个）。
+std::size_t Utf8Length(std::string_view text) {
+    std::size_t count = 0;
+    for (const char ch : text) {
+        if ((static_cast<unsigned char>(ch) & 0xC0U) != 0x80U) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+/// @brief 昵称是否含禁用字符：`@` 与任意空白（含全角空格 U+3000）。
+bool NameHasForbiddenChar(const std::string& name) {
+    for (std::size_t i = 0; i < name.size(); ++i) {
+        const char c = name[i];
+        if (c == '@' || c == ' ' || c == '\t' || c == '\n' || c == '\r' ||
+            c == '\v' || c == '\f') {
+            return true;
+        }
+        // U+3000（全角空格）在 UTF-8 里是 E3 80 80。
+        if (c == '\xE3' && i + 2 < name.size() && name[i + 1] == '\x80' &&
+            name[i + 2] == '\x80') {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// @brief 头像地址白名单：http(s) 或 `videos/` 下的单段图片文件名。
+/// @note 与封面 `ValidCoverUrl`（video_service.cpp）同一套规则：只允许
+///       `[A-Za-z0-9_.-]` 组成的 `.jpg/.png` 单段名，挡住目录穿越与
+///       二次编码；两处规则必须保持同步。
+bool ValidAvatarUrl(const std::string& url) {
+    if (url.empty()) {
+        return true;
+    }
+    if (url.size() > 512) {
+        return false;
+    }
+    if (url.rfind("http://", 0) == 0 || url.rfind("https://", 0) == 0) {
+        return true;
+    }
+    constexpr std::string_view kPrefix = "videos/";
+    if (url.compare(0, kPrefix.size(), kPrefix) != 0) {
+        return false;
+    }
+    const std::string name = url.substr(kPrefix.size());
+    if (name.size() < 5 || name.size() > 128) {
+        return false;
+    }
+    for (const char c : name) {
+        const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                        (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.';
+        if (!ok) {
+            return false;
+        }
+    }
+    const std::string ext = name.substr(name.size() - 4);
+    return ext == ".jpg" || ext == ".png";
 }
 
 /// @brief 注册处理。
@@ -256,6 +321,101 @@ bool RequireToken(const douyin::HttpRequest& request, douyin::HttpResponse* resp
         return false;
     }
     *user_id = info.user_id;
+    return true;
+}
+
+/// @brief 改写本人资料：`PATCH /api/user/me`（Bearer）。
+/// @param store [in,out] 已打开的存储——只写 users 一行。
+/// @param request [in] 原始请求——读 body（name/bio/avatar_url 均可选）。
+/// @param response [out] 200 + 更新后的 user；400/401/409/500。
+/// @return 总是 true。
+///
+/// ## 步骤
+/// step1. 鉴权并读当前资料（缺失字段沿用原值，支持「只改简介」）；
+/// step2. 逐字段校验：昵称 2~20 码点、无 @/空白、全局唯一；简介 ≤80；
+///        头像走 http(s)/videos 白名单；
+/// step3. 单条 UPDATE（唯一提交点），失败 500；
+/// step4. 回读最新行返回给前端，避免前端自己拼状态。
+///
+/// ## 并发/失败语义
+/// - 调用约束：单线程事件循环内调用；昵称唯一性先查后写，极端并发下
+///   仍可能两个请求同时通过检查（演示规模可接受，DB 无唯一索引兜底）；
+/// - 不变量：返回 200 时 users 行已更新，且响应 user 与库内一致。
+bool HandleUpdateMe(douyin::Store& store, const douyin::HttpRequest& request,
+                    douyin::HttpResponse* response) {
+    std::int64_t actor = 0;
+    if (!RequireToken(request, response, &actor)) {
+        return true;
+    }
+    douyin::StoredUser current;
+    std::string error;
+    if (!store.FindUserById(actor, &current, &error)) {
+        if (!error.empty()) {
+            std::fprintf(stderr, "[%s] 查询本人失败: %s\n", kServiceName,
+                         error.c_str());
+            return Fail(response, 500, "数据库错误");
+        }
+        return Fail(response, 404, "用户不存在");
+    }
+    // step1: 三个字段都可选，未出现的沿用原值。
+    std::string name = current.name;
+    std::string bio = current.bio;
+    std::string avatar_url = current.avatar_url;
+    const bool has_name = douyin::JsonStringField(request.body, "name", &name);
+    const bool has_bio = douyin::JsonStringField(request.body, "bio", &bio);
+    const bool has_avatar =
+        douyin::JsonStringField(request.body, "avatar_url", &avatar_url);
+    if (!has_name && !has_bio && !has_avatar) {
+        return Fail(response, 400, "至少提供 name/bio/avatar_url 之一");
+    }
+    // step2: 校验。昵称按码点计数，避免中文被字节数误判。
+    if (has_name) {
+        const std::size_t chars = Utf8Length(name);
+        if (chars < 2 || chars > 20) {
+            return Fail(response, 400, "昵称需 2~20 个字");
+        }
+        if (NameHasForbiddenChar(name)) {
+            return Fail(response, 400, "昵称不能包含 @ 或空白");
+        }
+        std::string name_error;
+        const bool taken = store.NameTaken(name, actor, &name_error);
+        if (!name_error.empty()) {
+            std::fprintf(stderr, "[%s] 查询昵称冲突失败: %s\n", kServiceName,
+                         name_error.c_str());
+            return Fail(response, 500, "数据库错误");
+        }
+        if (taken) {
+            return Fail(response, 409, "昵称已被占用");
+        }
+    }
+    if (has_bio && Utf8Length(bio) > 80) {
+        return Fail(response, 400, "简介不能超过 80 个字");
+    }
+    if (has_avatar && !ValidAvatarUrl(avatar_url)) {
+        return Fail(response, 400, "头像地址不合法");
+    }
+    // step3: 写前清 ORM 读游标（FindUserById 可能留下未 finalize 的语句）。
+    store.ResetStatements();
+    const int changed =
+        store.UpdateUserProfile(actor, name, bio, avatar_url, &error);
+    if (changed < 0) {
+        std::fprintf(stderr, "[%s] 更新资料失败: %s\n", kServiceName,
+                     error.c_str());
+        return Fail(response, 500, "数据库错误");
+    }
+    if (changed == 0) {
+        return Fail(response, 404, "用户不存在");
+    }
+    // step4: 回读权威行。
+    douyin::StoredUser updated;
+    if (!store.FindUserById(actor, &updated, &error)) {
+        std::fprintf(stderr, "[%s] 回读资料失败: %s\n", kServiceName,
+                     error.c_str());
+        return Fail(response, 500, "数据库错误");
+    }
+    response->status = 200;
+    response->body = "{\"ok\":true,\"user\":" +
+                     douyin::ToJson(PublicUser(updated)) + "}";
     return true;
 }
 
@@ -818,6 +978,21 @@ bool Handle(douyin::Store& store, const douyin::HttpRequest& request,
     if (request.path == "/api/user/blocks") {
         if (request.method == "GET") {
             return HandleBlockList(store, request, response);
+        }
+        return Fail(response, 405, "方法不允许");
+    }
+
+    // 当前用户资料：`me` 不是数字 id，必须在 ParseUserPath 之前拦截。
+    if (request.path == "/api/user/me") {
+        if (request.method == "PATCH") {
+            return HandleUpdateMe(store, request, response);
+        }
+        if (request.method == "GET") {
+            std::int64_t actor = 0;
+            if (!RequireToken(request, response, &actor)) {
+                return true;
+            }
+            return HandleProfile(store, request, actor, response);
         }
         return Fail(response, 405, "方法不允许");
     }

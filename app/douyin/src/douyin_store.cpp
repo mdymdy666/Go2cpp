@@ -36,6 +36,8 @@ struct UserRow {
     std::string password_hash;
     std::string salt;
     std::int64_t created_at{0};
+    std::string bio;
+    std::string avatar_url;
 };
 
 /// @brief 判断文本是否为非空纯数字（游标校验用）。
@@ -262,6 +264,8 @@ constexpr const char* kSchemaSql =
     "  password_hash TEXT NOT NULL,"
     "  salt TEXT NOT NULL,"
     "  created_at INTEGER NOT NULL,"
+    "  bio TEXT NOT NULL DEFAULT '',"
+    "  avatar_url TEXT NOT NULL DEFAULT '',"
     // 演示用金币余额：注册即送 1000，送礼当场扣减（事务见 SendGift）。
     "  coins INTEGER NOT NULL DEFAULT 1000"
     ");"
@@ -285,7 +289,10 @@ constexpr const char* kSchemaSql =
     "  clip_end_ms INTEGER NOT NULL DEFAULT 0,"
     "  like_count INTEGER NOT NULL DEFAULT 0,"
     "  comment_count INTEGER NOT NULL DEFAULT 0,"
-    "  created_at INTEGER NOT NULL"
+    "  created_at INTEGER NOT NULL,"
+    // 软删除：NULL=未删；非 NULL 是删除时刻的 Unix 秒。所有查询都必须
+    // 带 `deleted_at IS NULL`，否则删掉的视频还能从其它入口刷出来。
+    "  deleted_at INTEGER"
     ");"
     "CREATE INDEX IF NOT EXISTS idx_videos_user ON videos(user_id, created_at DESC);"
     "CREATE INDEX IF NOT EXISTS idx_videos_created ON videos(created_at DESC);"
@@ -306,7 +313,9 @@ constexpr const char* kSchemaSql =
     "  content TEXT NOT NULL,"
     "  created_at INTEGER NOT NULL,"
     "  parent_id INTEGER NOT NULL DEFAULT 0,"
-    "  pinned_at INTEGER NOT NULL DEFAULT 0"
+    "  pinned_at INTEGER NOT NULL DEFAULT 0,"
+    // 软删除：NULL=未删；评论数按未删除行重算。
+    "  deleted_at INTEGER"
     ");"
     "CREATE INDEX IF NOT EXISTS idx_comments_video "
     "ON comments(video_id, created_at DESC);"
@@ -453,6 +462,8 @@ void CopyRow(const UserRow& row, StoredUser* out) {
     out->password_hash = row.password_hash;
     out->salt = row.salt;
     out->created_at = row.created_at;
+    out->bio = row.bio;
+    out->avatar_url = row.avatar_url;
 }
 
 /// @brief videos 查询的固定列顺序（与 `ReadVideoRow` 的列下标一一对应）。
@@ -688,7 +699,9 @@ GO2CPP_ORM_TABLE(douyin::UserRow, "users",
                  GO2CPP_ORM_COLUMN(douyin::UserRow, email).NotNull().Unique(),
                  GO2CPP_ORM_COLUMN(douyin::UserRow, password_hash).NotNull(),
                  GO2CPP_ORM_COLUMN(douyin::UserRow, salt).NotNull(),
-                 GO2CPP_ORM_COLUMN(douyin::UserRow, created_at).NotNull())
+                 GO2CPP_ORM_COLUMN(douyin::UserRow, created_at).NotNull(),
+                 GO2CPP_ORM_COLUMN(douyin::UserRow, bio).NotNull(),
+                 GO2CPP_ORM_COLUMN(douyin::UserRow, avatar_url).NotNull())
 
 namespace douyin {
 
@@ -778,6 +791,14 @@ bool Store::EnsureSchema(std::string* error) {
     //        ALTER 报 duplicate column，属预期）。
     (void)m_db->Exec(
         "ALTER TABLE users ADD COLUMN coins INTEGER NOT NULL DEFAULT 1000");
+    // 第 12 轮：资料编辑（bio/avatar_url）与软删除（deleted_at）。重复 ALTER
+    // 报 duplicate column，属预期。
+    (void)m_db->Exec(
+        "ALTER TABLE users ADD COLUMN bio TEXT NOT NULL DEFAULT ''");
+    (void)m_db->Exec(
+        "ALTER TABLE users ADD COLUMN avatar_url TEXT NOT NULL DEFAULT ''");
+    (void)m_db->Exec("ALTER TABLE videos ADD COLUMN deleted_at INTEGER");
+    (void)m_db->Exec("ALTER TABLE comments ADD COLUMN deleted_at INTEGER");
     // 礼物价目表是静态字典：固定 id + INSERT OR IGNORE，重复启动不产生副本，
     // 也不覆盖运营后来改过的价格。
     (void)m_db->Exec(
@@ -864,6 +885,59 @@ bool Store::FindUserById(std::int64_t id, StoredUser* out, std::string* error) {
     return true;
 }
 
+bool Store::NameTaken(const std::string& name, std::int64_t except_id,
+                      std::string* error) {
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return false;
+    }
+    // step1: 昵称比较用精确匹配（区分大小写），与「全局唯一」的展示语义一致；
+    //        排除自己，否则不改名只改简介也会被判定成冲突。
+    auto rows = m_db->Query(
+        "SELECT 1 FROM users WHERE name = ? AND id <> ? LIMIT 1", name,
+        except_id);
+    if (!rows) {
+        if (error != nullptr) {
+            *error = "查询昵称失败: " + DescribeError(rows.Err());
+        }
+        return false;
+    }
+    // step2: 有行 = 被占用；无行（含遍历错误）由调用方按 error 区分。
+    if (rows.Value().Next()) {
+        return true;
+    }
+    if (rows.Value().Err()) {
+        if (error != nullptr) {
+            *error = "遍历昵称失败: " + DescribeError(rows.Value().Err());
+        }
+        return false;
+    }
+    return false;
+}
+
+int Store::UpdateUserProfile(std::int64_t id, const std::string& name,
+                             const std::string& bio,
+                             const std::string& avatar_url, std::string* error) {
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return -1;
+    }
+    auto updated = m_db->Exec(
+        "UPDATE users SET name = ?, bio = ?, avatar_url = ? WHERE id = ?", name,
+        bio, avatar_url, id);
+    if (!updated) {
+        if (error != nullptr) {
+            *error = "更新资料失败: " + DescribeError(updated.Err());
+        }
+        return -1;
+    }
+    return updated.Value().changes;
+}
+
 bool Store::FindUserName(std::int64_t id, std::string* name, std::string* error) {
     if (!Ok()) {
         if (error != nullptr) {
@@ -904,8 +978,8 @@ bool Store::FindUserByName(const std::string& name, StoredUser* out,
     // 昵称不唯一：取 id 最小（最早注册）的那个，保证同一份评论文本每次
     // 解析结果一致；走 idx_users_name 精确匹配，不做 LIKE。
     auto rows = m_db->Query(
-        "SELECT id, name, email, password_hash, salt, created_at FROM users "
-        "WHERE name = ? ORDER BY id ASC LIMIT 1",
+        "SELECT id, name, email, password_hash, salt, created_at, bio, "
+        "avatar_url FROM users WHERE name = ? ORDER BY id ASC LIMIT 1",
         name);
     if (!rows) {
         if (error != nullptr) {
@@ -1138,7 +1212,8 @@ bool Store::FindVideo(std::int64_t id, StoredVideo* out, std::string* error) {
         return false;
     }
     auto found = m_db->Query(
-        std::string("SELECT ") + kVideoColumns + " FROM videos WHERE id = ?",
+        std::string("SELECT ") + kVideoColumns +
+            " FROM videos WHERE id = ? AND deleted_at IS NULL",
         id);
     if (!found) {
         if (error != nullptr) {
@@ -1184,7 +1259,7 @@ bool Store::ListByUser(std::int64_t user_id, const std::string& cursor,
 
     // 时间倒序 keyset 分页：多取一条判断是否还有下一页。
     std::string sql = std::string("SELECT ") + kVideoColumns +
-                      " FROM videos WHERE user_id = ?";
+                      " FROM videos WHERE user_id = ? AND deleted_at IS NULL";
     if (has_cursor) {
         sql += " AND (created_at < ? OR (created_at = ? AND id < ?))";
     }
@@ -1233,7 +1308,9 @@ int Store::DeleteVideo(std::int64_t id, std::int64_t user_id,
         return -1;
     }
     auto deleted = m_db->Exec(
-        "DELETE FROM videos WHERE id = ? AND user_id = ?", id, user_id);
+        "UPDATE videos SET deleted_at = ? WHERE id = ? AND user_id = ?"
+        " AND deleted_at IS NULL",
+        static_cast<std::int64_t>(std::time(nullptr)), id, user_id);
     if (!deleted) {
         if (error != nullptr) {
             *error = "删除视频失败: " + DescribeError(deleted.Err());
@@ -1271,12 +1348,12 @@ bool Store::ListFeed(const std::string& cursor, std::int64_t limit,
     // 随机推荐：池子是全库视频，**不按作者过滤**——本人视频也在池中，
     // 因此随机首屏能刷到自己（旧热度序会把 0 互动的新视频挤到末页）。
     std::vector<StoredVideo> all;
-    std::string sql =
-        std::string("SELECT ") + kVideoColumns + " FROM videos";
+    std::string sql = std::string("SELECT ") + kVideoColumns +
+                      " FROM videos WHERE deleted_at IS NULL";
     if (viewer_id > 0) {
         // 拉黑过滤：被拉黑作者的视频不进候选池，随机洗牌前就剔掉，
         // 否则分页后再过滤会出现「这一页不满 20 条」的空洞。
-        sql += " WHERE user_id NOT IN"
+        sql += " AND user_id NOT IN"
                " (SELECT blocked_id FROM blocks WHERE user_id = ?)";
         if (!LoadVideos(*m_db, sql, &all, error, viewer_id)) {
             return false;
@@ -1315,7 +1392,8 @@ bool Store::ListFollowingFeed(std::int64_t user_id, const std::string& cursor,
     std::vector<StoredVideo> all;
     // 拉黑过滤：关注流里被拉黑作者同样不出现（不必先取关，拉黑立即生效）。
     const std::string sql = std::string("SELECT ") + kVideoColumns +
-                            " FROM videos WHERE user_id IN (SELECT followee_id "
+                            " FROM videos WHERE deleted_at IS NULL"
+                            " AND user_id IN (SELECT followee_id "
                             "FROM follows WHERE follower_id = ?)"
                             " AND user_id NOT IN (SELECT blocked_id FROM blocks"
                             " WHERE user_id = ?)" +
@@ -1490,7 +1568,8 @@ bool Store::ListFavorites(std::int64_t user_id, std::int64_t limit,
     auto rows = m_db->Query(
         "SELECT v.id, v.user_id, v.title, v.url, v.like_count, v.comment_count, "
         "v.created_at FROM favorites f JOIN videos v ON v.id = f.video_id "
-        "WHERE f.user_id = ? AND v.user_id NOT IN (SELECT blocked_id FROM blocks"
+        "WHERE f.user_id = ? AND v.deleted_at IS NULL"
+        " AND v.user_id NOT IN (SELECT blocked_id FROM blocks"
         " WHERE user_id = ?) ORDER BY f.created_at DESC, v.id DESC LIMIT ?",
         user_id, user_id, limit);
     if (!rows) {
@@ -1560,15 +1639,15 @@ bool DecodeTimelineCursor(TimelineKind kind, const std::string& cursor,
 std::string TimelineFromClause(TimelineKind kind) {
     switch (kind) {
         case TimelineKind::kWorks:
-            return " FROM videos v WHERE v.user_id = ?";
+            return " FROM videos v WHERE v.deleted_at IS NULL AND v.user_id = ?";
         case TimelineKind::kLiked:
             return " FROM likes a JOIN videos v ON v.id = a.video_id"
-                   " WHERE a.user_id = ?";
+                   " WHERE v.deleted_at IS NULL AND a.user_id = ?";
         case TimelineKind::kFavorite:
             return " FROM favorites a JOIN videos v ON v.id = a.video_id"
-                   " WHERE a.user_id = ?";
+                   " WHERE v.deleted_at IS NULL AND a.user_id = ?";
     }
-    return " FROM videos v WHERE v.user_id = ?";
+    return " FROM videos v WHERE v.deleted_at IS NULL AND v.user_id = ?";
 }
 
 /// @brief 排序/游标的「发生时间」列：作品取发布时间，喜欢/收藏取动作时间。
@@ -1845,6 +1924,7 @@ bool Store::ListComments(std::int64_t video_id, const std::string& cursor,
         std::string sql = std::string("SELECT ") + kHotCommentColumns +
                           " FROM comments c"
                           " WHERE c.video_id = ? AND c.parent_id = 0"
+                          " AND c.deleted_at IS NULL"
                           " AND c.pinned_at = 0"
                           " AND (? = 0 OR c.user_id NOT IN"
                           " (SELECT blocked_id FROM blocks WHERE user_id = ?))"
@@ -1872,6 +1952,7 @@ bool Store::ListComments(std::int64_t video_id, const std::string& cursor,
     std::string sql = std::string("SELECT ") + kCommentColumns +
                       " FROM comments"
                       " WHERE video_id = ? AND parent_id = 0"
+                      " AND deleted_at IS NULL"
                       " AND pinned_at = 0"
                       " AND (? = 0 OR user_id NOT IN"
                       " (SELECT blocked_id FROM blocks WHERE user_id = ?))"
@@ -1903,7 +1984,8 @@ bool Store::ListPinnedComments(std::int64_t video_id, std::int64_t viewer_id,
     // 置顶评论不占分页 limit，第一页固定额外返回。
     constexpr std::int64_t kMaxPinned = 20;
     std::string sql = std::string("SELECT ") + kCommentColumns +
-                      " FROM comments WHERE video_id = ? AND pinned_at > 0";
+                      " FROM comments WHERE video_id = ?"
+                      " AND deleted_at IS NULL AND pinned_at > 0";
     if (viewer_id > 0) {
         sql += " AND user_id NOT IN"
                " (SELECT blocked_id FROM blocks WHERE user_id = ?)";
@@ -1945,7 +2027,8 @@ bool Store::ListReplies(std::int64_t video_id, std::int64_t parent_id,
         return true;
     }
     std::string sql = std::string("SELECT ") + kCommentColumns +
-                      " FROM comments WHERE video_id = ? AND parent_id = ?";
+                      " FROM comments WHERE video_id = ? AND parent_id = ?"
+                      " AND deleted_at IS NULL";
     if (viewer_id > 0) {
         sql += " AND user_id NOT IN"
                " (SELECT blocked_id FROM blocks WHERE user_id = ?)";
@@ -2001,7 +2084,8 @@ bool Store::FindComment(std::int64_t id, StoredComment* out,
         return false;
     }
     auto rows = m_db->Query(std::string("SELECT ") + kCommentColumns +
-                                " FROM comments WHERE id = ?",
+                                " FROM comments WHERE id = ?"
+                                " AND deleted_at IS NULL",
                             id);
     if (!rows) {
         if (error != nullptr) {
@@ -2016,16 +2100,16 @@ bool Store::FindComment(std::int64_t id, StoredComment* out,
     return true;
 }
 
-int Store::DeleteComment(std::int64_t id, std::int64_t user_id,
-                         std::string* error) {
+int Store::DeleteComment(std::int64_t id, std::string* error) {
     if (!Ok()) {
         if (error != nullptr) {
             *error = "数据库尚未打开";
         }
         return -1;
     }
-    auto deleted = m_db->Exec("DELETE FROM comments WHERE id = ? AND user_id = ?",
-                              id, user_id);
+    auto deleted = m_db->Exec(
+        "UPDATE comments SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL",
+        static_cast<std::int64_t>(std::time(nullptr)), id);
     if (!deleted) {
         if (error != nullptr) {
             *error = "删除评论失败: " + DescribeError(deleted.Err());
@@ -2079,7 +2163,8 @@ bool Store::UpdateVideoCounts(std::int64_t video_id, std::string* error) {
     auto updated = m_db->Exec(
         "UPDATE videos SET"
         " like_count = (SELECT COUNT(*) FROM likes WHERE video_id = ?),"
-        " comment_count = (SELECT COUNT(*) FROM comments WHERE video_id = ?)"
+        " comment_count = (SELECT COUNT(*) FROM comments"
+        " WHERE video_id = ? AND deleted_at IS NULL)"
         " WHERE id = ?",
         video_id, video_id, video_id);
     if (!updated) {
@@ -2831,7 +2916,8 @@ bool Store::ListAllVideos(std::vector<StoredVideo>* out, std::string* error) {
         return false;
     }
     auto rows = m_db->Query(std::string("SELECT ") + kVideoColumns +
-                            " FROM videos ORDER BY id ASC");
+                            " FROM videos WHERE deleted_at IS NULL"
+                            " ORDER BY id ASC");
     if (!rows) {
         if (error != nullptr) {
             *error = "查询视频失败: " + DescribeError(rows.Err());
@@ -2863,8 +2949,8 @@ bool Store::SearchVideos(const std::string& query, std::int64_t limit,
     }
     const std::string pattern = LikePattern(query);
     std::string sql = std::string("SELECT ") + kVideoColumns +
-                      " FROM videos WHERE lower(title) LIKE lower(?)"
-                      " ESCAPE '\\'";
+                      " FROM videos WHERE deleted_at IS NULL"
+                      " AND lower(title) LIKE lower(?) ESCAPE '\\'";
     if (viewer_id > 0) {
         sql += " AND user_id NOT IN"
                " (SELECT blocked_id FROM blocks WHERE user_id = ?)";
@@ -3106,7 +3192,8 @@ bool Store::SearchSuggest(const std::string& prefix, std::int64_t limit,
     // 先用 `%q%` 让 SQLite 过滤掉绝大多数标题，再在内存里做前缀判定。
     const std::string contains = "%" + pattern.substr(0, pattern.size() - 1) + "%";
     auto videos = m_db->Query(
-        "SELECT title FROM videos WHERE title LIKE ? ESCAPE '\\' LIMIT ?",
+        "SELECT title FROM videos WHERE deleted_at IS NULL"
+        " AND title LIKE ? ESCAPE '\\' LIMIT ?",
         contains, limit * 20);
     if (!videos) {
         if (error != nullptr) {

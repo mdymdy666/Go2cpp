@@ -1685,3 +1685,17 @@ latest（服务重启）→ `resume_gap`，客户端走 REST 全量刷新。
   - 简化 JS tokenizer 把正则字面量里的 `//` 当注释，复用完整 tokenizer；
   - PowerShell 双引号解析 `$`，补丁脚本一律落盘后 `wsl python3` 执行。
 - **状态**：已提交（本轮 commit）。
+
+## 2026-11-06 第 12 轮：资料编辑 / 软删除 / 静态缓存（douyin）
+
+- 改动：`users` 增 bio/avatar_url；`videos`/`comments` 增 deleted_at；
+  `GET|PATCH /api/user/me`；`DELETE /api/video/:id` 改软删；
+  新增 `DELETE /api/comment/:id`（评论作者或视频作者）；网关 `/settings` 页面、
+  `/covers/**` 与 `/static/**` 静态路由；HTML `no-cache`、静态资源 `max-age=86400`。
+- 关键文件：`app/douyin/src/douyin_store.cpp`、`src/user_service.cpp`、
+  `src/interaction_service.cpp`、`src/video_service.cpp`、`src/gateway.cpp`、
+  `include/douyin_home_page.hpp`、`include/douyin_settings_page.hpp`。
+- 测试：`accept_profile_edit.sh` 53 PASS / 0 FAIL；`accept_delete.sh` 45 PASS / 0 FAIL；
+  `accept_all.sh` 89 PASS / 0 FAIL；评论点赞/通知/主页 tab/搜索/分享页/gzip 回归 0 FAIL；
+  构建零告警；TTFB < 1 ms。
+- 后续：举报运营后台、草稿服务端化、WS Resume。

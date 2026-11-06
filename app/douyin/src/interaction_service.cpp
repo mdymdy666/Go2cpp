@@ -6,6 +6,7 @@
  *          - POST   /api/like              点赞（Bearer；幂等）
  *          - DELETE /api/like              取消赞（Bearer；幂等）
  *          - POST   /api/comment           发评论（Bearer；1~500 字；解析 @mention）
+ *          - DELETE /api/comment/:id       删评论（Bearer；评论作者或视频作者）
  *          - GET    /api/comment/:video_id 评论列表（sort=hot|new + cursor 分页）
  *          - GET    /api/video/:id/comments   同一接口的路径别名（第 6 轮）
  *          - POST   /api/comment/:id/pin   置顶评论（Bearer；仅视频作者）
@@ -1671,6 +1672,87 @@ bool HandleSystemNotification(douyin::Store& store,
     return true;
 }
 
+/**
+ * @brief 删除评论（软删）：`DELETE /api/comment/:id`。
+ *
+ * @param store [in,out] 已打开的存储——软删一行并重算所属视频计数。
+ * @param request [in] 原始请求——只读 Authorization。
+ * @param comment_id [in] 评论 id（>0），由 `ParseVideoPath` 解析。
+ * @param response [out] 200 + comment_count；401/403/404/500。
+ * @return 总是 true；调用方**不要**再回 404。
+ *
+ * ## 步骤
+ * step1. 鉴权，查未删除评论（已删/不存在都 404）；
+ * step2. 查视频并校验权限：评论作者或视频作者，否则 403；
+ * step3. 写 deleted_at（唯一提交点）；重复删除时 changes=0 仍按成功处理；
+ * step4. 重算 like_count/comment_count 并回读，保证前端数字立即减 1。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：单线程事件循环内调用；
+ * - 原子性：软删与计数重算不在同一事务，但计数是幂等重算，重试安全；
+ * - 不变量：返回 200 时该评论不会再出现在任何列表里，且 comment_count
+ *   等于该视频未删除评论数。
+ */
+bool HandleDeleteComment(douyin::Store& store,
+                         const douyin::HttpRequest& request,
+                         std::int64_t comment_id,
+                         douyin::HttpResponse* response) {
+    std::int64_t actor = 0;
+    if (!RequireToken(request, response, &actor)) {
+        return true;
+    }
+    douyin::StoredComment comment;
+    std::string error;
+    if (!store.FindComment(comment_id, &comment, &error)) {
+        if (!error.empty()) {
+            std::fprintf(stderr, "[%s] 查询评论失败: %s\n", kServiceName,
+                         error.c_str());
+            return Fail(response, 500, "数据库错误");
+        }
+        return Fail(response, 404, "评论不存在");
+    }
+    douyin::StoredVideo video;
+    if (!store.FindVideo(comment.video_id, &video, &error)) {
+        if (!error.empty()) {
+            std::fprintf(stderr, "[%s] 查询视频失败: %s\n", kServiceName,
+                         error.c_str());
+            return Fail(response, 500, "数据库错误");
+        }
+        return Fail(response, 404, "视频不存在");
+    }
+    if (comment.user_id != actor && video.user_id != actor) {
+        return Fail(response, 403, "只有评论作者或视频作者可以删除");
+    }
+    store.ResetStatements();
+    const int changed = store.DeleteComment(comment_id, &error);
+    if (changed < 0) {
+        std::fprintf(stderr, "[%s] 删除评论失败: %s\n", kServiceName,
+                     error.c_str());
+        return Fail(response, 500, "数据库错误");
+    }
+    // 计数重算：即使并发下已被别人删除（changed=0），也要保证计数一致。
+    if (!store.UpdateVideoCounts(comment.video_id, &error)) {
+        std::fprintf(stderr, "[%s] 评论计数同步失败: %s\n", kServiceName,
+                     error.c_str());
+        return Fail(response, 500, "数据库错误");
+    }
+    douyin::StoredVideo after;
+    if (!store.FindVideo(comment.video_id, &after, &error)) {
+        if (!error.empty()) {
+            std::fprintf(stderr, "[%s] 回读视频失败: %s\n", kServiceName,
+                         error.c_str());
+            return Fail(response, 500, "数据库错误");
+        }
+        return Fail(response, 404, "视频不存在");
+    }
+    response->status = 200;
+    response->body = "{\"ok\":true,\"deleted\":true,\"id\":" +
+                     std::to_string(comment_id) +
+                     ",\"comment_count\":" + std::to_string(after.comment_count) +
+                     "}";
+    return true;
+}
+
 /// @brief 总路由。
 bool Handle(douyin::Store& store, const douyin::HttpRequest& request,
             douyin::HttpResponse* response) {
@@ -1785,6 +1867,11 @@ bool Handle(douyin::Store& store, const douyin::HttpRequest& request,
     }
     if (request.method == "GET") {
         return HandleComments(store, request, video_id, response);
+    }
+    // DELETE 的路径形态与评论列表相同（`/api/comment/<纯数字>`），此时
+    // 数字是**评论 id**；GET 时是视频 id。
+    if (request.method == "DELETE") {
+        return HandleDeleteComment(store, request, video_id, response);
     }
     return Fail(response, 405, "方法不允许");
 }

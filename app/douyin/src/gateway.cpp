@@ -12,6 +12,8 @@
  *            搜索），不要求网关鉴权；
  *          - /health、/api/health/all 由组件内建，无需注册；
  *          - GET /videos/<name> 由本地 handler 直接返回 web/videos 下的 mp4；
+ *          - GET /settings 由本地 handler 直出资料编辑页（PATCH /api/user/me）；
+ *          - GET /static/<name>、/covers/<name> 静态资源缓存 1 天；
  *          - GET /live 由本地 handler 直出直播间单页（聊天/礼物/贡献榜，
  *            数据走 live_service 的 /api/live/*）。
  *
@@ -28,6 +30,7 @@
 #include "douyin_live_page.hpp"
 #include "douyin_shutdown.hpp"
 #include "douyin_observability.hpp"
+#include "douyin_settings_page.hpp"
 #include "go2cpp/compress/gzip.hpp"
 #include "go2cpp/app/gateway.hpp"
 #include "go2cpp/network/socket.hpp"
@@ -355,7 +358,8 @@ public:
 Result<void> ServeHome(Request& /*request*/, Response& response) {
     response.status = Status::OK;
     response.header.set("Content-Type", "text/html; charset=utf-8");
-    response.header.set("Cache-Control", "no-store");
+    // 页面 HTML 不缓存：内容每次可能不同，必须让浏览器回源验证。
+    response.header.set("Cache-Control", "no-cache");
     response.body = douyin::kHomePageHtml;
     return Result<void>::Ok();
 }
@@ -394,7 +398,7 @@ public:
 Result<void> ServeLivePage(Request& /*request*/, Response& response) {
     response.status = Status::OK;
     response.header.set("Content-Type", "text/html; charset=utf-8");
-    response.header.set("Cache-Control", "no-store");
+    response.header.set("Cache-Control", "no-cache");
     response.body = douyin::kLivePageHtml;
     return Result<void>::Ok();
 }
@@ -667,6 +671,11 @@ const char* ContentTypeForStatic(std::string_view name) {
     if (ends_with(".jpg") || ends_with(".jpeg")) return "image/jpeg";
     if (ends_with(".png")) return "image/png";
     if (ends_with(".webp")) return "image/webp";
+    if (ends_with(".txt")) return "text/plain; charset=utf-8";
+    if (ends_with(".css")) return "text/css; charset=utf-8";
+    if (ends_with(".js")) return "application/javascript; charset=utf-8";
+    if (ends_with(".svg")) return "image/svg+xml";
+    if (ends_with(".ico")) return "image/x-icon";
     return "video/mp4";
 }
 
@@ -871,7 +880,7 @@ Result<void> ServeVideo(Request& request, Response& response) {
         response.header.set("Content-Type", "text/plain; charset=utf-8");
         response.header.set("Content-Range", "bytes */" + std::to_string(total));
         response.header.set("Accept-Ranges", "bytes");
-        response.header.set("Cache-Control", "public, max-age=3600");
+        response.header.set("Cache-Control", "public, max-age=86400");
         response.body = "416 range not satisfiable\n";
         return Result<void>::Ok();
     }
@@ -902,7 +911,8 @@ Result<void> ServeVideo(Request& request, Response& response) {
     response.header.set("Content-Type", ContentTypeForStatic(name));
     response.header.set("Accept-Ranges", "bytes");
     response.header.set("Content-Length", std::to_string(content.size()));
-    response.header.set("Cache-Control", "public, max-age=3600");
+    // 视频/封面内容按 id 命名、发布后不变：允许浏览器与 CDN 缓存一天。
+    response.header.set("Cache-Control", "public, max-age=86400");
     if (range.valid) {
         response.header.set("Content-Range",
                             "bytes " + std::to_string(range.first) + "-" +
@@ -911,6 +921,151 @@ Result<void> ServeVideo(Request& request, Response& response) {
     }
     response.body = std::move(content);
     return Result<void>::Ok();
+}
+
+/// @brief 设置页匹配器：只接管 GET/HEAD 的 `/settings` 与 `/settings.html`。
+class SettingsMatcher final : public Matcher {
+public:
+    /// @brief 命中设置页路径；本路由无参数，不写入 params。
+    bool Match(const Request& request, PathParams* /*params*/) const override {
+        if (request.method != Method::Get && request.method != Method::Head) {
+            return false;
+        }
+        const std::string_view path = request.path_view();
+        return path == "/settings" || path == "/settings.html";
+    }
+};
+
+/// @brief 设置页 handler：本地填写 HTML，不产生上游请求；HTML 不缓存。
+Result<void> ServeSettings(Request& /*request*/, Response& response) {
+    response.status = Status::OK;
+    response.header.set("Content-Type", "text/html; charset=utf-8");
+    response.header.set("Cache-Control", "no-cache");
+    response.body = douyin::kSettingsPageHtml;
+    return Result<void>::Ok();
+}
+
+/// @brief 注册设置页路由；失败时打印并返回 false。
+bool AddSettingsRoute(Gateway* gateway) {
+    const auto result = gateway->AddRoute(
+        std::make_shared<SettingsMatcher>(), std::make_shared<Handler>(&ServeSettings));
+    if (!result.ok()) {
+        std::fprintf(stderr, "[%s] 注册设置页路由失败：%s\n", kServiceName,
+                     result.error().c_str());
+        return false;
+    }
+    return true;
+}
+
+/// @brief 站点静态资源目录：`/static/<name>` 与 `/covers/<name>`。
+/// @note 封面与视频同目录（`web/videos/<name>`），`/covers/` 只是一个语义化
+///       别名；两者都不命中 `/api/**`，用自定义 Matcher 注册避免被兜底吞掉。
+struct SiteStaticPath {
+    std::string_view dir;   ///< `static` 或 `videos`。
+    std::string_view name;  ///< 单段安全文件名。
+};
+
+/// @brief 解析 `/static/<name>` 与 `/covers/<name>`；非法返回 false。
+bool ExtractSiteStatic(std::string_view path, SiteStaticPath* out) {
+    constexpr std::string_view kStaticPrefix = "/static/";
+    constexpr std::string_view kCoversPrefix = "/covers/";
+    std::string_view dir;
+    std::string_view rest;
+    if (path.size() > kStaticPrefix.size() &&
+        path.compare(0, kStaticPrefix.size(), kStaticPrefix) == 0) {
+        dir = "static";
+        rest = path.substr(kStaticPrefix.size());
+    } else if (path.size() > kCoversPrefix.size() &&
+               path.compare(0, kCoversPrefix.size(), kCoversPrefix) == 0) {
+        dir = "videos";
+        rest = path.substr(kCoversPrefix.size());
+    } else {
+        return false;
+    }
+    if (!IsSafeVideoName(rest)) {
+        return false;
+    }
+    out->dir = dir;
+    out->name = rest;
+    return true;
+}
+
+/// @brief 静态资源匹配器：只接管 GET/HEAD 的 `/static/*` 与 `/covers/*`。
+class SiteStaticMatcher final : public Matcher {
+public:
+    /// @brief 命中且文件名安全时返回 true。
+    bool Match(const Request& request, PathParams* /*params*/) const override {
+        if (request.method != Method::Get && request.method != Method::Head) {
+            return false;
+        }
+        SiteStaticPath parsed;
+        return ExtractSiteStatic(request.path_view(), &parsed);
+    }
+};
+
+/// @brief 静态资源 handler：读整个文件（≤2 MiB），Cache-Control 一天。
+/// @note 静态资源不发 Range（体积小，不需要）；404 不缓存，避免把
+///       「文件暂时缺失」固化到浏览器。
+Result<void> ServeSiteStatic(Request& request, Response& response) {
+    constexpr std::uint64_t kMaxSiteStaticBytes = 2ULL * 1024 * 1024;
+    SiteStaticPath parsed;
+    if (!ExtractSiteStatic(request.path_view(), &parsed)) {
+        response.status = Status::NotFound;
+        response.header.set("Content-Type", "text/plain; charset=utf-8");
+        response.header.set("Cache-Control", "no-store");
+        response.body = "404 not found\n";
+        return Result<void>::Ok();
+    }
+    const std::string path = std::string(kWebDir) + "/" + std::string(parsed.dir) +
+                             "/" + std::string(parsed.name);
+    std::ifstream input(path, std::ios::binary | std::ios::ate);
+    if (!input.is_open()) {
+        response.status = Status::NotFound;
+        response.header.set("Content-Type", "text/plain; charset=utf-8");
+        response.header.set("Cache-Control", "no-store");
+        response.body = "404 not found\n";
+        return Result<void>::Ok();
+    }
+    const std::streamoff file_size = input.tellg();
+    if (file_size < 0 ||
+        static_cast<std::uint64_t>(file_size) > kMaxSiteStaticBytes) {
+        response.status = Status::InternalError;
+        response.header.set("Content-Type", "text/plain; charset=utf-8");
+        response.header.set("Cache-Control", "no-store");
+        response.body = "500 static unreadable\n";
+        return Result<void>::Ok();
+    }
+    std::string content(static_cast<std::size_t>(file_size), '\0');
+    input.seekg(0, std::ios::beg);
+    if (!content.empty()) {
+        input.read(content.data(), static_cast<std::streamsize>(content.size()));
+        if (input.gcount() != static_cast<std::streamsize>(content.size())) {
+            response.status = Status::InternalError;
+            response.header.set("Content-Type", "text/plain; charset=utf-8");
+            response.header.set("Cache-Control", "no-store");
+            response.body = "500 static unreadable\n";
+            return Result<void>::Ok();
+        }
+    }
+    response.status = Status::OK;
+    response.header.set("Content-Type", ContentTypeForStatic(parsed.name));
+    response.header.set("Content-Length", std::to_string(content.size()));
+    response.header.set("Cache-Control", "public, max-age=86400");
+    response.body = std::move(content);
+    return Result<void>::Ok();
+}
+
+/// @brief 注册 `/static/**` 与 `/covers/**` 静态路由。
+bool AddSiteStaticRoute(Gateway* gateway) {
+    const auto result = gateway->AddRoute(
+        std::make_shared<SiteStaticMatcher>(),
+        std::make_shared<Handler>(&ServeSiteStatic));
+    if (!result.ok()) {
+        std::fprintf(stderr, "[%s] 注册站点静态路由失败：%s\n", kServiceName,
+                     result.error().c_str());
+        return false;
+    }
+    return true;
 }
 
 /// @brief 注册静态视频路由（自定义 Matcher + 本地 Handler）；失败时打印并返回 false。
@@ -1041,8 +1196,8 @@ int main(int argc, char** argv) {
     }
 
     if (!AddHomeRoute(gateway.get()) || !AddLiveRoute(gateway.get()) ||
-        !AddVideoRoute(gateway.get()) ||
-        !AddHealthRoutes(gateway.get())) {
+        !AddSettingsRoute(gateway.get()) || !AddVideoRoute(gateway.get()) ||
+        !AddSiteStaticRoute(gateway.get()) || !AddHealthRoutes(gateway.get())) {
         return 1;
     }
 

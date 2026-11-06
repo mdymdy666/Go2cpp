@@ -24,6 +24,8 @@ struct User {
     std::string name;
     std::string email;
     std::int64_t created_at{0};
+    std::string bio;         ///< 简介（≤80 字，可空）。
+    std::string avatar_url;  ///< 头像 URL；空 = 前端用昵称首字母。
 };
 
 /// @brief 视频（发布 / 详情）。

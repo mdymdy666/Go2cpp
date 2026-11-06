@@ -117,7 +117,9 @@ std::string Key(const char* name) { return std::string("\"") + name + "\":"; }
 std::string ToJson(const User& value) {
     return std::string("{\"id\":") + std::to_string(value.id) + "," + Key("name") + "\"" +
            EscapeJson(value.name) + "\"," + Key("email") + "\"" + EscapeJson(value.email) + "\"," +
-           Key("created_at") + std::to_string(value.created_at) + "}";
+           Key("created_at") + std::to_string(value.created_at) + "," +
+           Key("bio") + "\"" + EscapeJson(value.bio) + "\"," +
+           Key("avatar_url") + "\"" + EscapeJson(value.avatar_url) + "\"}";
 }
 
 std::string ToJson(const Video& value) {

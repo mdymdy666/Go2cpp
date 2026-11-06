@@ -123,6 +123,17 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
   .who { display: none; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
   .who .dot { width: 7px; height: 7px; border-radius: 50%; background: #3ddc97; box-shadow: 0 0 8px #3ddc97; }
   .who b { color: var(--text); font-weight: 600; }
+  /* 顶栏头像：显示首字母或用户头像，点击进入资料编辑页。 */
+  .who-avatar {
+    display: none; width: 34px; height: 34px; padding: 0;
+    border-radius: 50%; border: 2px solid rgba(255, 255, 255, .18);
+    background: linear-gradient(135deg, var(--cyan), var(--pink));
+    color: #08080d; font-size: 15px; font-weight: 800; cursor: pointer;
+    overflow: hidden; flex: 0 0 auto; line-height: 1;
+  }
+  .who-avatar:hover { border-color: rgba(255, 255, 255, .45); }
+  .who-avatar img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .signed-in .who-avatar { display: grid; place-items: center; }
   .signed-in .who { display: flex; }
   .signed-in .login-only { display: none; }
 
@@ -1095,6 +1106,8 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
             id="notifBadge" hidden>0</span></button>
     <button class="btn-ghost" id="blacklistBtn" type="button" title="黑名单管理"
             style="display:none">🚫 黑名单</button>
+    <button class="who-avatar" id="whoAvatar" type="button" title="编辑资料"
+            aria-label="编辑资料">?</button>
     <span class="who" id="who" title="点击进入我的主页"><span class="dot"></span><b id="whoName"></b></span>
     <input class="login-only" id="email" type="email" value="admin@demo.local"
            placeholder="邮箱" autocomplete="username" spellcheck="false">
@@ -1537,6 +1550,27 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     });
   }
 
+  /* 顶栏头像：有 avatar_url 用图片，否则用昵称首字母。用 DOM 属性写 src
+     （不走 innerHTML），避免用户资料里的字符注入标记。 */
+  function paintWhoAvatar() {
+    var el = document.getElementById('whoAvatar');
+    if (!el) return;
+    var user = state.user || {};
+    var url = user.avatar_url || '';
+    var src = '';
+    if (/^https?:\/\//i.test(url)) src = url;
+    else if (url.indexOf('videos/') === 0) src = BASE + url;
+    el.innerHTML = '';
+    if (src) {
+      var img = document.createElement('img');
+      img.alt = (user.name || '我') + ' 的头像';
+      img.src = src;
+      el.appendChild(img);
+    } else {
+      el.textContent = initial(user.name || user.email || '?');
+    }
+  }
+
   function setSignedIn(user) {
     var topbar = document.getElementById('topbar');
     var whoName = document.getElementById('whoName');
@@ -1554,6 +1588,7 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     if (notifBtn) notifBtn.style.display = isIn ? '' : 'none';
     var blacklistBtn = document.getElementById('blacklistBtn');
     if (blacklistBtn) blacklistBtn.style.display = isIn ? '' : 'none';
+    paintWhoAvatar();
     if (isIn) {
       refreshUnreadNotifications();
     } else {
@@ -4470,13 +4505,21 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     });
   }
 
-  /* 视频操作栏「⋯」：举报视频 / 拉黑作者。 */
+  /* 视频操作栏「⋯」：作者删除 / 举报视频 / 拉黑作者。 */
   function openVideoMenu(v, name) {
     var uid = String(v.user_id || '');
-    var items = [{
+    var items = [];
+    if (state.user && uid === String(state.user.id)) {
+      items.push({
+        label: '删除视频',
+        danger: true,
+        fn: function () { deleteVideo(v); }
+      });
+    }
+    items.push({
       label: '举报视频',
       fn: function () { openReport('video', v.id, v.title || ('视频 #' + v.id)); }
-    }];
+    });
     if (uid && (!state.user || String(state.user.id) !== uid)) {
       items.push({
         label: '拉黑作者 @' + (name || ('用户 #' + uid)),
@@ -4487,14 +4530,25 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     openMenu('视频操作', items);
   }
 
-  /* 评论「⋯」：举报评论 / 拉黑评论作者。 */
+  /* 评论「⋯」：删除（评论作者或视频作者）/ 举报评论 / 拉黑评论作者。 */
   function openCommentMenu(c) {
     var uid = String(c.user_id || '');
     var slide = state.panelSlide;
-    var items = [{
+    var items = [];
+    var mine = state.user && String(state.user.id) === uid;
+    var owner = state.user && state.panelOwnerId &&
+                String(state.user.id) === String(state.panelOwnerId);
+    if (mine || owner) {
+      items.push({
+        label: '删除评论',
+        danger: true,
+        fn: function () { deleteComment(c); }
+      });
+    }
+    items.push({
       label: '举报评论',
       fn: function () { openReport('comment', c.id, '评论'); }
-    }];
+    });
     if (uid && (!state.user || String(state.user.id) !== uid)) {
       items.push({
         label: '拉黑 @用户 #' + uid,
@@ -4509,6 +4563,63 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
       });
     }
     openMenu('评论操作', items);
+  }
+
+  /* 删除视频（仅作者）：二次确认 → DELETE → 从 feed 移除该条 */
+  function deleteVideo(v) {
+    if (!state.token) { toast('请先登录', 'err'); return; }
+    var label = v.title ? ('《' + v.title + '》') : ('视频 #' + v.id);
+    if (!window.confirm('确定删除' + label + '？删除后将从推荐/主页/搜索中消失。')) {
+      return;
+    }
+    api('api/video/' + v.id, { method: 'DELETE' }).then(function () {
+      var slides = feedEl.querySelectorAll('.slide');
+      var target = null;
+      for (var i = 0; i < slides.length; i++) {
+        var item = state.items[Number(slides[i].dataset.index)] || {};
+        if (String((item.video || {}).id) === String(v.id)) {
+          target = slides[i];
+          break;
+        }
+      }
+      if (target) {
+        var player = target.querySelector('video');
+        if (player) player.pause();
+        target.remove();
+      }
+      if (state.activeVideo && !state.activeVideo.isConnected) state.activeVideo = null;
+      toast('视频已删除', 'ok');
+    }).catch(function (err) {
+      if (!handleAuthError(err)) {
+        toast('删除失败：' + (err.message || '网络错误'), 'err');
+      }
+    });
+  }
+
+  /* 删除评论（评论作者或视频作者）：二次确认 → DELETE → 刷新列表与计数 */
+  function deleteComment(c) {
+    if (!state.token) { toast('请先登录', 'err'); return; }
+    if (!window.confirm('确定删除这条评论？')) return;
+    api('api/comment/' + c.id, { method: 'DELETE' }).then(function (data) {
+      var count = data && data.comment_count;
+      var slide = state.panelSlide;
+      if (slide && count !== undefined) {
+        var item = state.items[Number(slide.dataset.index)] || {};
+        if (item.video) item.video.comment_count = count;
+        var btn = slide.querySelector('.cmt-num');
+        if (btn) {
+          btn.textContent = fmt(count);
+          btn.dataset.n = String(count);
+        }
+        cpCount.textContent = fmt(count) + ' 条评论';
+      }
+      toast('评论已删除', 'ok');
+      loadComments();
+    }).catch(function (err) {
+      if (!handleAuthError(err)) {
+        toast('删除失败：' + (err.message || '网络错误'), 'err');
+      }
+    });
   }
 
   /* ---------- 用户主页三 tab：作品 / 喜欢 / 收藏 ---------- */
@@ -4949,6 +5060,10 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
 
   document.getElementById('blacklistBtn').addEventListener('click', openBlacklist);
   document.getElementById('blockClose').addEventListener('click', closeBlacklist);
+  document.getElementById('whoAvatar').addEventListener('click', function () {
+    if (!state.token) { toast('请先登录', 'err'); return; }
+    location.href = BASE + 'settings';
+  });
   document.getElementById('menuClose').addEventListener('click', closeMenu);
   document.getElementById('menuCancel').addEventListener('click', closeMenu);
   document.getElementById('reportClose').addEventListener('click', closeReport);

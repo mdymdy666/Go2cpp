@@ -1735,53 +1735,24 @@ bool HandleFavorites(douyin::Store& store, const douyin::HttpRequest& request,
     return true;
 }
 
-/// @brief 删除上传视频对应的本地文件；url 不是 `videos/<单段文件名>` 时跳过。
-/// @param url [in] DB 里存的相对 url；外部 http(s) 地址不归本服务管理，不删。
-/// @note 失败只记日志：DB 记录已删除，文件残留不应把成功的删除改成 500。
-void RemoveUploadedVideoFile(const std::string& url) {
-    constexpr std::string_view kPrefix = "videos/";
-    if (url.size() <= kPrefix.size() || url.compare(0, kPrefix.size(), kPrefix) != 0) {
-        std::fprintf(stderr, "[%s] 非本地上传路径，跳过文件删除: %s\n", kServiceName,
-                     url.c_str());
-        return;
-    }
-    const std::string name = url.substr(kPrefix.size());
-    // 只允许单段文件名，挡掉 `..`、绝对路径与子目录，防止越界删除。
-    if (name == "." || name == ".." || name.find('/') != std::string::npos ||
-        name.find('\\') != std::string::npos) {
-        std::fprintf(stderr, "[%s] 非法上传文件名，跳过文件删除: %s\n", kServiceName,
-                     url.c_str());
-        return;
-    }
-    const std::filesystem::path path =
-        std::filesystem::path(WebDir()) / "videos" / name;
-    std::error_code ec;
-    const bool removed = std::filesystem::remove(path, ec);
-    if (ec) {
-        std::fprintf(stderr, "[%s] 删除上传文件失败: %s（%s）\n", kServiceName,
-                     path.c_str(), ec.message().c_str());
-    } else if (!removed) {
-        std::fprintf(stderr, "[%s] 上传文件不存在，跳过: %s\n", kServiceName,
-                     path.c_str());
-    }
-}
-
 /**
- * @brief 删除视频记录，并清理该记录对应的本地上传文件。
+ * @brief 软删除视频：`DELETE /api/video/:id`（仅作者）。
  *
- * @param store [in,out] 已打开的存储——成功时删除 videos 行。
+ * @param store [in,out] 已打开的存储——写 videos.deleted_at。
  * @param request [in] HTTP 请求——借用；只读 Authorization。
- * @param id [in] 视频 id；数据库按 id + user_id 删除。
+ * @param id [in] 视频 id；数据库按 id + user_id 软删。
  * @param response [out] 出站响应——401/403/404/500，成功 200。
  * @return 总是 true；调用方**不要**再回 404。
  *
  * ## 步骤
- * step1. 鉴权并解析用户；step2. 查记录、校验作者；
- * step3. 删 DB 行（唯一提交点）；step4. 删本地文件，失败只记日志。
+ * step1. 鉴权；step2. 查未删除记录并校验作者（非作者 403）；
+ * step3. 写 deleted_at（唯一提交点，重复删除返回 0 → 404，幂等）；
+ * step4. 返回 200。
  *
  * ## 并发/失败语义
  * - 调用约束：单线程事件循环内调用；
- * - 不变量：返回 200 时 videos 行已不存在；文件删除失败不回滚 DB。
+ * - 不变量：返回 200 时该视频对所有读接口不可见（详情/feed/主页/搜索 404）；
+ * - 文件保留：软删除不删 mp4/封面，便于恢复与分享链接短时兜底。
  */
 bool HandleDelete(douyin::Store& store, const douyin::HttpRequest& request,
                   std::int64_t id, douyin::HttpResponse* response) {
@@ -1811,8 +1782,8 @@ bool HandleDelete(douyin::Store& store, const douyin::HttpRequest& request,
     if (changed == 0) {
         return Fail(response, 404, "视频不存在");
     }
-    // 先删 DB 再删文件：顺序反了会出现「文件没了但记录还在」。
-    RemoveUploadedVideoFile(stored.url);
+    // 软删除保留 mp4 与封面文件：撤下内容不等于立刻销毁资产，
+    // 恢复/审计都还需要；物理清理交给离线任务。
     response->status = 200;
     response->body = "{\"ok\":true,\"deleted\":true,\"id\":" +
                      std::to_string(id) + "}";

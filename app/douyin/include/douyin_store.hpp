@@ -44,11 +44,13 @@ namespace douyin {
 /// @brief 数据库里的一行用户（含密码散列与盐，只供内部使用）。
 struct StoredUser {
     std::int64_t id{0};           ///< 自增主键。
-    std::string name;             ///< 昵称。
+    std::string name;             ///< 昵称（全局唯一，2~20 字）。
     std::string email;            ///< 唯一邮箱。
     std::string password_hash;    ///< SHA-256(salt + password) 的 hex。
     std::string salt;             ///< 每用户随机 16B 的 hex。
     std::int64_t created_at{0};   ///< Unix 秒。
+    std::string bio;              ///< 简介（≤80 字，可空）。
+    std::string avatar_url;       ///< 头像 http(s) 或 `videos/` 安全路径；空=首字母头像。
 };
 
 /// @brief `CreateUser` 的结果：成功 / email 冲突 / 其它错误。
@@ -445,11 +447,14 @@ class Store {
     bool ListAllVideos(std::vector<StoredVideo>* out, std::string* error);
 
     /**
-     * @brief 删除视频，仅作者本人可删。
+     * @brief 软删除视频，仅作者本人可删（写 `deleted_at`，不删行）。
      * @param id 视频 id。
      * @param user_id 请求者 id（同时作为 SQL 条件）。
      * @param error 失败时写错误文本。
-     * @return 受影响行数（0 = 不存在或非作者）；出错返回 -1。
+     * @return 受影响行数（0 = 不存在/非作者/已删除）；出错返回 -1。
+     * @note 软删除后所有查询（详情/feed/主页/搜索/话题）都按
+     *       `deleted_at IS NULL` 过滤，因此对上层表现为 404；重复删除返回 0，
+     *       由 service 幂等处理（已删也回 200 或 404，见实现）。
      */
     int DeleteVideo(std::int64_t id, std::int64_t user_id, std::string* error);
 
@@ -673,11 +678,42 @@ class Store {
                      std::int64_t limit, std::vector<StoredComment>* out,
                      std::string* error, std::int64_t viewer_id = 0);
 
-    /// @brief 按 id 查评论；未找到返回 false 且 error 为空。
+    /// @brief 按 id 查**未删除**的评论；未找到或已删返回 false 且 error 为空。
     bool FindComment(std::int64_t id, StoredComment* out, std::string* error);
 
-    /// @brief 删除评论（仅作者）；返回受影响行数，出错 -1。
-    int DeleteComment(std::int64_t id, std::int64_t user_id, std::string* error);
+    /**
+     * @brief 昵称是否已被别人占用（全局唯一校验）。
+     * @param name [in] 待校验昵称（调用方已做长度/字符校验）。
+     * @param except_id [in] 排除的用户 id（改名时传自己，0=不排除）。
+     * @param error [out] 失败时写错误文本；成功保持原值。
+     * @return true=已占用；false=可用或查询失败（失败时 error 非空，调用方回 500）。
+     */
+    bool NameTaken(const std::string& name, std::int64_t except_id,
+                   std::string* error);
+
+    /**
+     * @brief 更新本人资料（昵称/简介/头像）。
+     * @param id [in] 用户 id（>0）。
+     * @param name [in] 新昵称；调用方已完成长度/字符/唯一性校验。
+     * @param bio [in] 新简介（可空）。
+     * @param avatar_url [in] 新头像（可空）。
+     * @param error [out] 失败时写错误文本。
+     * @return 受影响行数（1=成功，0=用户不存在）；出错 -1。
+     */
+    int UpdateUserProfile(std::int64_t id, const std::string& name,
+                          const std::string& bio,
+                          const std::string& avatar_url, std::string* error);
+
+    /**
+     * @brief 软删除一条评论（写 `deleted_at`；权限由 service 校验）。
+     * @param id [in] 评论 id（>0）。
+     * @param error [out] 失败时写错误文本；成功时保持原值。
+     * @return 受影响行数：1=本次删除成功；0=评论不存在或已删除（幂等）；
+     *         出错返回 -1（调用方回 500）。
+     * @note 只改 `deleted_at`，不删行——评论数由 UpdateVideoCounts 按未删除行
+     *       重算，保证 `comment_count` 与列表一致；重复删除返回 0 而不是错误。
+     */
+    int DeleteComment(std::int64_t id, std::string* error);
 
     /**
      * @brief 置顶/取消置顶一条评论（幂等）。

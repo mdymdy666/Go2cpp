@@ -2,10 +2,10 @@
 
 | 项 | 内容 |
 |---|---|
-| 盘点时间 | 2026-11-06（第 11 轮） |
+| 盘点时间 | 2026-11-06（第 12 轮） |
 | 盘点范围 | `app/douyin/` 全部源码（7 服务 + 网关 + 单页前端） |
 | 盘点方式 | 读 REQUIREMENTS.md、逐服务路由表、前端函数/元素清单、关键词扫描、跑既有验收 |
-| 基线 | `scripts/accept_all.sh` → **89 PASS / 0 FAIL**（第 11 轮）；`scripts/accept_search_cluster.sh` → **71 PASS / 0 FAIL**；`scripts/accept_gzip.sh` → **30 PASS / 0 FAIL**；`scripts/accept_notifications.sh` → 92 PASS / 0 FAIL；`scripts/accept_report_block.sh` → 79 PASS / 0 FAIL；`scripts/accept_share_landing.sh` → 88 PASS / 0 FAIL；`scripts/accept_profile_tabs.sh` → **115 PASS / 0 FAIL**；`scripts/accept_player_cluster.sh` → **94 PASS / 0 FAIL**；`scripts/accept_notif_cluster.sh` → **111 PASS / 0 FAIL**；`scripts/accept_live_cluster.sh` → **128 PASS / 0 FAIL** |
+| 基线 | `scripts/accept_all.sh` → **89 PASS / 0 FAIL**（第 12 轮回归）；`scripts/accept_profile_edit.sh` → **53 PASS / 0 FAIL**；`scripts/accept_delete.sh` → **45 PASS / 0 FAIL**；`scripts/accept_search_cluster.sh` → **71 PASS / 0 FAIL**；`scripts/accept_gzip.sh` → **30 PASS / 0 FAIL**；`scripts/accept_notifications.sh` → 92 PASS / 0 FAIL；`scripts/accept_report_block.sh` → 79 PASS / 0 FAIL；`scripts/accept_share_landing.sh` → 88 PASS / 0 FAIL；`scripts/accept_profile_tabs.sh` → **115 PASS / 0 FAIL**；`scripts/accept_player_cluster.sh` → **94 PASS / 0 FAIL**；`scripts/accept_notif_cluster.sh` → **111 PASS / 0 FAIL**；`scripts/accept_live_cluster.sh` → **128 PASS / 0 FAIL** |
 
 > 说明：本文档只记录**代码里核实过**的能力。摘要里提到但代码未命中的项，
 > 统一标「待核实」，不当作已完成。
@@ -774,7 +774,84 @@
 - **热搜 count 的测试数据编排**：清空 alice 历史后忘记补一次搜索，导致
   「3 个用户搜同一词」实际只有 2 行——不是代码 bug，是脚本前置数据缺口。
 
-## 十三、下一轮建议
+## 十三、第 12 轮交付：资料编辑 / 视频与评论软删除 / 静态缓存
+
+### 存储（旧库 ALTER 兼容）
+
+| 变更 | 内容 |
+|---|---|
+| `users.bio` / `users.avatar_url` | `TEXT NOT NULL DEFAULT ''`；ORM 映射同步，`CreateUser` 默认空 |
+| `videos.deleted_at` / `comments.deleted_at` | `INTEGER`，NULL=未删，非 NULL=删除时刻 |
+| 读路径统一过滤 | videos：`FindVideo` / `ListByUser` / `ListFeed` / `ListFollowingFeed` / `ListAllVideos` / `SearchVideos` / `ListFavorites` / `QueryTimeline`（作品/喜欢/收藏）/ `SearchSuggest` 话题源；comments：`ListComments`（new+hot）/ `ListPinnedComments` / `ListReplies` / `FindComment` / `UpdateVideoCounts` |
+| 新方法 | `NameTaken(name, except_id)`（排除自己，改名幂等）；`UpdateUserProfile(id, name, bio, avatar_url)` |
+| 删除语义 | `DeleteVideo` / `DeleteComment` 从 DELETE 改为 `UPDATE ... SET deleted_at`；`changes=0` 表示不存在/已删（service 回 404），不产生副作用 |
+
+### 接口
+
+| 方法 | 路径 | 语义 |
+|---|---|---|
+| GET | `/api/user/me` | 本人资料（Bearer；401）；设置页首屏数据源 |
+| PATCH | `/api/user/me` | 部分更新 name/bio/avatar_url；昵称 2~20 码点、不能含 `@`/空白、全局唯一（重复 409）；简介 ≤80；头像 http(s) 或 `videos/` 下 `.jpg/.png` 单段白名单；成功回读权威 user |
+| DELETE | `/api/video/:id` | 仅作者（403）；软删后详情/feed/主页/搜索/话题/分享页全部 404；**保留 mp4/封面文件** |
+| DELETE | `/api/comment/:id` | 评论作者**或视频作者**（403）；软删后列表不返回，`UpdateVideoCounts` 按未删行重算 comment_count；重复删除 404 |
+
+- 昵称唯一性用「先查后写」（`idx_users_name` 精确匹配）；极端并发下两请求可能同时通过，
+  演示规模可接受；真正强一致需唯一索引兜底（旧库可能有重名，留待数据清洗后再加）。
+- 通知/评论昵称不冗余存储：通知列表 `LEFT JOIN users` 回填 `actor_name`，改名后自动生效
+  （验收里 bob 改名后 alice 的通知立刻变成 bob_new）。
+
+### 前端
+
+- 新增 `include/douyin_settings_page.hpp`，网关直出 `GET /settings`：
+  昵称/简介/头像三字段 + 实时字数与逐项校验 + 头像预览 + 409 提示；
+  保存成功后把最新 user 写回 localStorage 再回首页（顶栏立即刷新）。
+- 首页顶栏新增头像按钮 `#whoAvatar`：有 `avatar_url` 显示图片，否则昵称首字母；
+  点击进入 `/settings`。
+- 视频「⋯」菜单：作者本人多一项「删除视频」（`window.confirm` 二次确认 → DELETE → 从 feed 移除）。
+- 评论「⋯」菜单：评论作者或视频作者多一项「删除评论」（二次确认 → DELETE →
+  刷新列表、`comment_count` 与 `cpCount` 同步）。
+
+### 静态缓存头
+
+| 资源 | 头 |
+|---|---|
+| `/`、`/live`、`/settings`（HTML） | `Cache-Control: no-cache`（每次回源验证） |
+| `/v/:id` 分享落地页（HTML） | `Cache-Control: no-store`（沿用第 5 轮语义，比 no-cache 更严格） |
+| `/videos/**`、`/covers/**`、`/static/**` | `Cache-Control: public, max-age=86400` |
+| 静态 404 / 416 | `no-store`（不把「暂时缺失」固化到浏览器） |
+
+- 新增 `/covers/<name>` 别名（封面与视频同在 `web/videos/`）与 `/static/<name>`
+  （`web/static/`，含 `robots.txt`）；单段文件名白名单沿用 `IsSafeVideoName`。
+
+### 验收
+
+- 新增 `scripts/accept_profile_edit.sh` → **53 PASS / 0 FAIL**（改名字段/重名/非法字符/
+  简介 80/81 边界/头像白名单/未登录/通知昵称同步/设置页/缓存头/TTFB）；
+- 新增 `scripts/accept_delete.sh` → **45 PASS / 0 FAIL**（评论删除权限/计数一致/视频删除权限/
+  软删后 6 个读入口不可见/DB 行保留/重复删除不改 deleted_at/已删内容不可互动）；
+- 回归 `scripts/accept_all.sh` → **89 PASS / 0 FAIL**；相关回归（评论点赞/通知/主页 tab/
+  搜索/分享页/gzip）全部 0 FAIL；
+- 构建 `bash app/douyin/build.sh` → 8 个二进制 ok，`-Werror -Wpedantic` 零告警；
+- 缓存头 `curl -I`：首页/设置页 `no-cache`，`/videos/1.mp4`、`/covers/1.jpg`、
+  `/static/robots.txt` 均 `public, max-age=86400`（`/static` 的 Content-Type 为
+  `text/plain; charset=utf-8`）；
+- TTFB（5 次均值，阈值 200 ms）：`/` 0.8 ms、`/settings` 0.4 ms、`/api/feed` 0.9 ms、
+  `/api/user/me` 0.7 ms —— 无退化。
+
+### 踩坑记录
+
+- **软删必须全链路过滤**：只改 `FindVideo` 时 feed/主页/搜索仍会漏出已删视频；
+  逐个 SQL 补 `deleted_at IS NULL` 后，用「6 个入口都查一遍」的验收兜底；
+- **comment_count 用重算而不是 `-1`**：并发/重复删除/删除二级回复时自减会漂移，
+  `UpdateVideoCounts` 按未删行 COUNT 一次，天然幂等；
+- **软删不要顺手删文件**：旧实现删 DB 后删 mp4，改软删后必须移除文件清理，
+  否则「删除」变「销毁」，恢复与分享兜底全失效；
+- **头像白名单与封面白名单要同一套**：两处各写一份迟早漂移，本轮的
+  `ValidAvatarUrl` 是 `ValidCoverUrl` 的同规则副本，注释里互相指向；
+- **PATCH 空 body**：`JsonStringField` 只判断字段是否存在，三个字段都缺时必须回 400，
+  否则会静默写回原值让前端以为保存成功。
+
+## 十四、下一轮建议
 
 1. 举报运营后台：`reports.status` 只有 pending，缺列表 / 处理接口与页面。
 2. 服务端草稿：当前草稿只在 localStorage（换设备/清缓存即丢）；可加
