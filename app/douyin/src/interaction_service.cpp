@@ -44,6 +44,7 @@
 #include <cstdlib>
 #include <ctime>
 #include <filesystem>
+#include <map>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -1008,14 +1009,30 @@ bool HandleComments(douyin::Store& store, const douyin::HttpRequest& request,
                      error.c_str());
     }
 
+    // 评论者昵称：页面原先一律显示「用户 #id」，同一屏里作者有昵称、
+    // 评论者没有，用户根本认不出是谁。按 user_id 去重查询（一页最多 20+50 人）。
+    std::map<std::int64_t, std::string> author_names;
+    auto author_of = [&](std::int64_t user_id) -> const std::string& {
+        auto it = author_names.find(user_id);
+        if (it == author_names.end()) {
+            std::string name;
+            if (!store.FindUserName(user_id, &name, &error)) {
+                name.clear();
+            }
+            it = author_names.emplace(user_id, std::move(name)).first;
+        }
+        return it->second;
+    };
+
     std::string body = "{\"ok\":true,\"sort\":\"" + sort +
                        "\",\"items\":[";
     for (std::size_t i = 0; i < comments.size(); ++i) {
         if (i != 0) {
             body += ',';
         }
-        body += "{\"comment\":" +
-                douyin::ToJson(PublicComment(comments[i]));
+        douyin::Comment top = PublicComment(comments[i]);
+        top.author_name = author_of(top.user_id);
+        body += "{\"comment\":" + douyin::ToJson(top);
         body += ",\"replies\":[";
         const std::size_t end = i < spans.size() ? spans[i].second : 0;
         std::size_t j = i < spans.size() ? spans[i].first : 0;
@@ -1025,7 +1042,9 @@ bool HandleComments(douyin::Store& store, const douyin::HttpRequest& request,
                 body += ',';
             }
             first = false;
-            body += douyin::ToJson(PublicComment(all_replies[j]));
+            douyin::Comment reply = PublicComment(all_replies[j]);
+            reply.author_name = author_of(reply.user_id);
+            body += douyin::ToJson(reply);
         }
         body += "]}";
     }

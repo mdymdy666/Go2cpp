@@ -45,6 +45,15 @@ ADMIN=$(curl -s --max-time 5 -X POST "$GW/api/user/register" -H 'Content-Type: a
 say "  admin token: ${ADMIN:0:10}…"
 
 say "5) 发布 20 条真实内容视频（demo1-5 轮换 + 真实标题）"
+# 文件存在性门禁：轮换发布之前先确认 5 个 demo 素材都在。
+# 2026-11-06 事故：demo2/demo3.mp4 缺失，seed 照样写进 8 条 URL，
+# 首页打开就是「视频加载失败」，而所有 curl 验收只看 JSON、全部 PASS。
+for _n in 1 2 3 4 5; do
+  if [[ ! -f "web/videos/demo$_n.mp4" ]]; then
+    say "  [FAIL] web/videos/demo$_n.mp4 不存在：继续发布会写入死链，中止"
+    exit 1
+  fi
+done
 TITLES=(
   "周末去爬山，云海绝了" "手工木雕小狐狸，花了三天" "凌晨四点的面包房"
   "猫猫第一次见雪，反应太可爱" "老式收音机修复全过程" "街角咖啡店的一天"

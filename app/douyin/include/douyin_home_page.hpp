@@ -1923,7 +1923,8 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     var who = document.createElement('div');
     who.className = 'cp-who';
     var uid = document.createElement('b');
-    uid.textContent = '用户 #' + (c.user_id === undefined ? '—' : c.user_id);
+    /* 优先用后端回填的昵称；查不到才退回「用户 #id」。 */
+    uid.textContent = c.author_name || ('用户 #' + (c.user_id === undefined ? '—' : c.user_id));
     who.appendChild(uid);
     if (Number(c.pinned_at) > 0) {
       var pinTag = document.createElement('span');
@@ -3816,8 +3817,12 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
       onSlideEnded(slide, false);
     });
     video.addEventListener('error', function () {
+      /* 用户文案：不再暴露「检查 /videos 静态路由」这种开发者提示；
+         同一条视频只提示一次，避免来回滑时反复弹。 */
       slide.classList.remove('playing');
-      toast('视频加载失败，检查 /videos 静态路由', 'err');
+      if (slide.dataset.errToast === '1') return;
+      slide.dataset.errToast = '1';
+      toast('这条视频暂时无法播放，滑到下一条看看', 'err');
     });
 
     /* 单击 / 双击 / 长按 / 上下滑 / 左右滑统一交给 bindPlayerGestures。 */

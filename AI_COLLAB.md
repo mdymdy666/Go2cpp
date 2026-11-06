@@ -1710,3 +1710,31 @@ latest（服务重启）→ `resume_gap`，客户端走 REST 全量刷新。
 - 前端主页关注/粉丝统计可点开列表抽屉，行内关注/取关。
 - `follows` 表补 `follower_id` / `followee_id` 的时间复合索引。
 - 验收 `app/douyin/scripts/accept_follow_lists.sh`：92 PASS / 0 FAIL。
+
+## 2026-11-06 第 14 轮（douyin 用户视角全链路审查）
+
+- 触发：用户截图指出首页 feed「视频加载失败，检查 /videos 静态路由」，
+  而此前 20+ 个 `accept_*.sh` 全 PASS——curl 层验收从不校验「文件是否真实存在」。
+- 根因：`.gitignore` 忽略 `web/videos/*.mp4` 且**没有任何脚本负责
+  `orig → demo*.mp4` 转码**，demo2/demo3 从未生成；`seed_cloud.sh` 按
+  `i%5` 轮换写入 8 条死链，此前用软删掩盖。
+- 修复（8 个用户可见 bug）：
+  1) 新增 `scripts/gen_demo_videos.sh`（缺则从 orig 转码，`--force` 可重建），
+     接入 `run_all.sh` 启动前；补齐文件后解除 8 条软删，22 条视频全部可见；
+  2) 新增 `scripts/check_media_links.sh`：逐条校验 `url`/`cover_url` 落盘存在；
+  3) `seed_cloud.sh` 发布前加 5 个素材存在性门禁；
+  4) admin 白名单改按邮箱从 DB 解析（原缺省 `user_id=1`，导致
+     admin@douyin.local 403、首个普通用户越权）；
+  5) 分享页评论昵称（SSR + JS 追加）——`ShareComment.author_name`；
+  6) 首页/分享页评论区昵称——`Comment.author_name` + interaction 去重回填；
+  7) `og:image:width/height` 改读 JPEG 真实像素（原写死 720×1280，实际 480×270）；
+  8) 播放失败 toast 改用户文案并去重；demo3 转码跳过 3 秒淡入黑屏、封面重抽。
+- 关键文件：`include/douyin_share_page.hpp`、`include/douyin_home_page.hpp`、
+  `include/douyin_proto.hpp`、`src/video_service.cpp`、`src/interaction_service.cpp`、
+  `src/douyin_proto.cpp`、`scripts/run_all.sh`、`scripts/seed_cloud.sh`、
+  `scripts/gen_demo_videos.sh`、`scripts/check_media_links.sh`。
+- 测试：14 项用户旅程逐项取证（首页/登录/点赞/评论/搜索/主页/设置/消息/直播/
+  创作/举报/分享/静态/gzip）全绿；`check_media_links.sh` 0 缺失；构建零告警。
+- 报告：`app/douyin/docs/user-journey-audit.md`。
+- 后续（未修）：直播 0 房间、私信 0 会话、举报 0 条（缺演示数据）；
+  点赞状态只存 localStorage，feed 不回传 `liked`；`app/douyin\r/` 垃圾目录待清。

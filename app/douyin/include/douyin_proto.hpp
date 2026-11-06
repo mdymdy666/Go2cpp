@@ -60,6 +60,7 @@ struct Comment {
     std::int64_t like_count{0}; ///< 评论点赞数（interaction 服务维护）。
     bool liked{false};          ///< 当前查看者是否已赞；匿名恒 false。
     std::int64_t pinned_at{0};  ///< 置顶时间（Unix 秒）；0=未置顶。
+    std::string author_name;    ///< 评论者昵称；空表示查不到，前端退回「用户 #id」。
 };
 
 /// @brief 点赞（video_id + user_id 唯一）。

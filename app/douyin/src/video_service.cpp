@@ -1558,6 +1558,14 @@ bool HandleSharePage(douyin::Store& store, const douyin::HttpRequest& request,
     data.video_url = ShareVideoUrl(prefix, stored.url, video_id);
     data.poster_url =
         SharePosterUrl(prefix, stored.url, stored.cover_url, video_id);
+    // OG 图片尺寸取封面真实像素（读 JPEG SOF 段）；读不到就留 0，
+    // 页面不输出 width/height——输出错误尺寸比不输出更糟。
+    if (data.poster_url.rfind(prefix + "videos/", 0) == 0) {
+        const std::string rel =
+            data.poster_url.substr(prefix.size() + std::string("videos/").size());
+        douyin::ReadJpegSize(WebDir() + "/videos/" + rel, &data.poster_width,
+                             &data.poster_height);
+    }
     if (viewer > 0) {
         bool following = false;
         std::string status_error;
@@ -1590,10 +1598,24 @@ bool HandleSharePage(douyin::Store& store, const douyin::HttpRequest& request,
                          kServiceName, error.c_str());
         }
         data.comments.reserve(comments.size());
+        // 评论者昵称：原先只显示「用户 #id」，同页里作者有昵称、评论者没有，
+        // 用户分不清谁是谁。按 user_id 去重查询，一页最多 20 次。
+        std::map<std::int64_t, std::string> comment_names;
+        for (const auto& comment : comments) {
+            if (comment_names.find(comment.user_id) != comment_names.end()) {
+                continue;
+            }
+            std::string name;
+            if (!store.FindUserName(comment.user_id, &name, &error)) {
+                name.clear();
+            }
+            comment_names[comment.user_id] = std::move(name);
+        }
         for (const auto& comment : comments) {
             douyin::ShareComment item;
             item.id = comment.id;
             item.user_id = comment.user_id;
+            item.author_name = comment_names[comment.user_id];
             item.content = comment.content;
             item.created_at = comment.created_at;
             item.like_count = comment.like_count;

@@ -27,6 +27,7 @@
 
 #include <cstdint>
 #include <ctime>
+#include <fstream>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -36,7 +37,8 @@ namespace douyin {
 /// @brief 落地页上的一条顶层评论（已是可直接渲染的文本，未转义）。
 struct ShareComment {
     std::int64_t id{0};            ///< 评论 id（点赞请求用）。
-    std::int64_t user_id{0};       ///< 评论者 id（页面显示「用户 #id」）。
+    std::int64_t user_id{0};       ///< 评论者 id（昵称缺失时显示「用户 #id」）。
+    std::string author_name;       ///< 评论者昵称；空时退回「用户 #id」。
     std::string content;           ///< 正文（1~500 字，渲染前转义）。
     std::int64_t created_at{0};    ///< Unix 秒；显示「N 分钟前」。
     std::int64_t like_count{0};    ///< 点赞数。
@@ -52,6 +54,8 @@ struct SharePageData {
     std::string author_name;       ///< 作者昵称（空时退回「用户 #id」）。
     std::string video_url;         ///< 已带站点前缀的播放地址（含 `/videos/...`）。
     std::string poster_url;        ///< 封面地址；空表示没有封面。
+    int poster_width{0};           ///< 封面像素宽；0 表示未知，OG 不输出尺寸。
+    int poster_height{0};          ///< 封面像素高；0 表示未知，OG 不输出尺寸。
     std::int64_t like_count{0};    ///< 点赞数（DB 同步维护）。
     std::int64_t comment_count{0}; ///< 评论数。
     std::int64_t created_at{0};    ///< 发布时间（Unix 秒）。
@@ -179,12 +183,106 @@ inline std::string AbsoluteUrl(std::string_view origin, std::string_view path) {
     return std::string(origin) + std::string(path);
 }
 
+
+/// @brief 读 JPEG 文件头里的真实像素尺寸（SOF0~SOF15 段）。
+///
+/// @param path [in] 本地文件路径（UTF-8，绝对或相对进程 CWD）；借用。
+/// @param out_width [out] 成功时写入像素宽（>0）；失败时置 0。
+/// @param out_height [out] 成功时写入像素高（>0）；失败时置 0。
+/// @return true 表示两个 out 参数都写入了有效尺寸；false 表示文件打不开、
+///         不是 JPEG 或找不到 SOF 段——调用方**必须**按「尺寸未知」处理
+///         （不要输出 `og:image:width`），不能拿 0 当真实值。
+///
+/// ## 定位
+/// 分享页 OG 尺寸的唯一来源。错了会怎样：微信/微博按错误的宽高裁切
+/// 分享卡片，横屏封面被拉成竖屏（曾写死 720x1280）。
+///
+/// ## 并发/失败语义
+/// - 纯函数，只读文件，无共享状态，多线程可并发调用；
+/// - 任何异常读法都返回 false，不抛异常（EOF 一律走 false 分支）。
+inline bool ReadJpegSize(const std::string& path, int* out_width,
+                         int* out_height) {
+    if (out_width == nullptr || out_height == nullptr) {
+        return false;
+    }
+    *out_width = 0;
+    *out_height = 0;
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        return false;
+    }
+    unsigned char soi[2] = {0, 0};
+    in.read(reinterpret_cast<char*>(soi), 2);
+    if (in.gcount() != 2 || soi[0] != 0xFF || soi[1] != 0xD8) {
+        return false;
+    }
+    // 逐个 marker 前移；遇到 SOF 段读宽高，遇到无关段按其长度跳过。
+    while (in) {
+        const int marker_lead = in.get();
+        if (marker_lead != 0xFF) {
+            continue;
+        }
+        int marker = in.get();
+        if (marker == EOF) {
+            return false;
+        }
+        while (marker == 0xFF) {
+            marker = in.get();
+            if (marker == EOF) {
+                return false;
+            }
+        }
+        // 不带长度的独立 marker（SOI/EOI/RSTn/TEM）直接跳过。
+        if (marker == 0xD8 || marker == 0xD9 || marker == 0x01 ||
+            (marker >= 0xD0 && marker <= 0xD7)) {
+            continue;
+        }
+        const int len_hi = in.get();
+        const int len_lo = in.get();
+        if (len_hi == EOF || len_lo == EOF) {
+            return false;
+        }
+        const int segment_len = (len_hi << 8) | len_lo;
+        if (segment_len < 2) {
+            return false;
+        }
+        const bool is_sof = (marker >= 0xC0 && marker <= 0xC3) ||
+                            (marker >= 0xC5 && marker <= 0xC7) ||
+                            (marker >= 0xC9 && marker <= 0xCB) ||
+                            (marker >= 0xCD && marker <= 0xCF);
+        if (is_sof) {
+            in.get();  // 精度字节，固定 8，忽略。
+            const int h_hi = in.get();
+            const int h_lo = in.get();
+            const int w_hi = in.get();
+            const int w_lo = in.get();
+            if (h_hi == EOF || h_lo == EOF || w_hi == EOF || w_lo == EOF) {
+                return false;
+            }
+            const int height = (h_hi << 8) | h_lo;
+            const int width = (w_hi << 8) | w_lo;
+            if (width <= 0 || height <= 0) {
+                return false;
+            }
+            *out_width = width;
+            *out_height = height;
+            return true;
+        }
+        in.seekg(segment_len - 2, std::ios::cur);
+    }
+    return false;
+}
+
 /// @brief 渲染一条 SSR 评论行（`article.cmt`）。
 inline std::string RenderCommentRow(const ShareComment& comment,
                                     std::int64_t now) {
+    // 优先显示昵称：原先一律「用户 #id」，同页里作者有昵称、评论者没有。
     const std::string who =
-        comment.user_id > 0 ? ("用户 #" + std::to_string(comment.user_id))
-                            : std::string("匿名用户");
+        !comment.author_name.empty()
+            ? comment.author_name
+            : (comment.user_id > 0
+                   ? ("用户 #" + std::to_string(comment.user_id))
+                   : std::string("匿名用户"));
     std::string html;
     html.reserve(512);
     html += "<article class=\"cmt\" data-cid=\"" +
@@ -284,8 +382,14 @@ inline std::string BuildSharePage(const SharePageData& data) {
     if (!cover_url.empty()) {
         html += "<meta property=\"og:image\" content=\"" +
                 EscapeHtml(cover_url) + "\">\n";
-        html += "<meta property=\"og:image:width\" content=\"720\">\n";
-        html += "<meta property=\"og:image:height\" content=\"1280\">\n";
+        // 尺寸取封面真实像素：写死 720x1280 会让微信/微博按竖屏比例
+        // 裁切横屏封面，分享卡片里的画面被拉变形。
+        if (data.poster_width > 0 && data.poster_height > 0) {
+            html += "<meta property=\"og:image:width\" content=\"" +
+                    std::to_string(data.poster_width) + "\">\n";
+            html += "<meta property=\"og:image:height\" content=\"" +
+                    std::to_string(data.poster_height) + "\">\n";
+        }
     }
     html += "<meta property=\"og:video\" content=\"" + EscapeHtml(play_url) +
             "\">\n";
@@ -516,7 +620,7 @@ footer{padding:22px 16px 0;text-align:center;font-size:12px;color:var(--muted)}
     var head = document.createElement('div');
     head.className = 'chead';
     var who = document.createElement('b');
-    who.textContent = '用户 #' + (c.user_id || '—');
+    who.textContent = c.author_name || ('用户 #' + (c.user_id || '—'));
     var when = document.createElement('time');
     when.textContent = '刚刚';
     head.appendChild(who);
