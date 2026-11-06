@@ -213,10 +213,9 @@ bool HandleFollowingFeed(douyin::Store& store, const douyin::HttpRequest& reques
     if (!RequireToken(request, response, &actor)) {
         return true;
     }
-    std::string cursor;
-    if (!ReadCursor(request, &cursor)) {
-        return Fail(response, 400, "cursor 非法");
-    }
+    // 关注流游标是「发布时间-视频 id」（时间序），与推荐流的随机种子
+    // 游标不同构，不能走 ReadCursor；格式由存储层校验。
+    const std::string cursor = douyin::QueryParam(request, "cursor");
     const std::int64_t limit = ParseLimit(request);
 
     std::vector<douyin::StoredVideo> videos;
@@ -224,6 +223,9 @@ bool HandleFollowingFeed(douyin::Store& store, const douyin::HttpRequest& reques
     std::string error;
     if (!store.ListFollowingFeed(actor, cursor, limit, &videos, &next_cursor,
                                  &error)) {
+        if (error.rfind("cursor 非法", 0) == 0) {
+            return Fail(response, 400, "cursor 非法");
+        }
         std::fprintf(stderr, "[%s] 查询关注流失败: %s\n", kServiceName,
                      error.c_str());
         return Fail(response, 500, "数据库错误");

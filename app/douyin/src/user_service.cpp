@@ -502,10 +502,11 @@ bool HandleFollow(douyin::Store& store, const douyin::HttpRequest& request,
     return true;
 }
 
-/// @brief 关注 / 粉丝列表（分页）。
+/// @brief 关注 / 粉丝列表（keyset 分页，固定 2 条 SQL）。
 bool HandleFollowList(douyin::Store& store, const douyin::HttpRequest& request,
                       std::int64_t id, bool following,
                       douyin::HttpResponse* response) {
+    // step1: 用户必须存在（与资料页一致，404 不做存在性泄露以外的处理）。
     douyin::StoredUser target;
     std::string error;
     const bool found = store.FindUserById(id, &target, &error);
@@ -517,13 +518,10 @@ bool HandleFollowList(douyin::Store& store, const douyin::HttpRequest& request,
         return Fail(response, 404, "用户不存在");
     }
 
+    // step2: limit 夹到 [1,100]，缺省 20；cursor 交给存储层校验格式。
     std::int64_t limit = kDefaultPageSize;
-    std::int64_t offset = 0;
     if (const std::string text = douyin::QueryParam(request, "limit"); !text.empty()) {
         limit = std::atoll(text.c_str());
-    }
-    if (const std::string text = douyin::QueryParam(request, "offset"); !text.empty()) {
-        offset = std::atoll(text.c_str());
     }
     if (limit <= 0) {
         limit = kDefaultPageSize;
@@ -531,33 +529,38 @@ bool HandleFollowList(douyin::Store& store, const douyin::HttpRequest& request,
     if (limit > kMaxPageSize) {
         limit = kMaxPageSize;
     }
-    if (offset < 0) {
-        offset = 0;
-    }
 
-    std::vector<std::int64_t> ids;
-    const bool ok = following ? store.Following(id, &ids, &error)
-                              : store.Followers(id, &ids, &error);
-    if (!ok) {
-        std::fprintf(stderr, "[%s] 查询列表失败: %s\n", kServiceName, error.c_str());
+    // step3: 列表固定 2 条 SQL（列表 + 查看者已关注集合），不按行回查。
+    std::vector<douyin::FollowListEntry> items;
+    std::string next_cursor;
+    if (!store.ListFollows(id, following, ViewerId(request),
+                           douyin::QueryParam(request, "cursor"), limit, &items,
+                           &next_cursor, &error)) {
+        if (error.rfind("cursor 非法", 0) == 0) {
+            return Fail(response, 400, "cursor 非法");
+        }
+        std::fprintf(stderr, "[%s] 查询关注列表失败: %s\n", kServiceName,
+                     error.c_str());
         return Fail(response, 500, "数据库错误");
     }
 
-    std::vector<std::int64_t> page;
-    const std::int64_t total = static_cast<std::int64_t>(ids.size());
-    for (std::int64_t i = offset; i < total && static_cast<std::int64_t>(page.size()) < limit;
-         ++i) {
-        page.push_back(ids[static_cast<std::size_t>(i)]);
-    }
-
-    std::string body = "{\"ok\":true,\"ids\":[";
-    for (std::size_t i = 0; i < page.size(); ++i) {
+    // step4: 逐条序列化；空列表返回 200 + items:[]，前端据此显示空状态。
+    std::string body = std::string("{\"ok\":true,\"kind\":\"") +
+                       (following ? "following" : "followers") +
+                       "\",\"user_id\":" + std::to_string(id) +
+                       ",\"next_cursor\":\"" + douyin::JsonEscape(next_cursor) +
+                       "\",\"items\":[";
+    for (std::size_t i = 0; i < items.size(); ++i) {
         if (i != 0) {
             body += ',';
         }
-        body += std::to_string(page[i]);
+        body += "{\"id\":" + std::to_string(items[i].id) + ",\"name\":\"" +
+                douyin::JsonEscape(items[i].name) + "\",\"avatar_url\":\"" +
+                douyin::JsonEscape(items[i].avatar_url) + "\",\"bio\":\"" +
+                douyin::JsonEscape(items[i].bio) + "\",\"followed_by_me\":" +
+                (items[i].followed_by_me ? "true" : "false") + "}";
     }
-    body += "],\"total\":" + std::to_string(total) + "}";
+    body += "]}";
     response->status = 200;
     response->body = std::move(body);
     return true;

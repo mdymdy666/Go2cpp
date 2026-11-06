@@ -1699,3 +1699,14 @@ latest（服务重启）→ `resume_gap`，客户端走 REST 全量刷新。
   `accept_all.sh` 89 PASS / 0 FAIL；评论点赞/通知/主页 tab/搜索/分享页/gzip 回归 0 FAIL；
   构建零告警；TTFB < 1 ms。
 - 后续：举报运营后台、草稿服务端化、WS Resume。
+
+
+## 2026-11-06 第 13 轮（douyin 社交完整度）
+
+- 新增 `GET /api/user/:id/following|followers`（keyset 分页 + 双向拉黑 +
+  固定 2 条 SQL，不 N+1）。
+- 修复 `GET /api/feed/following`：排序改发布时间倒序，游标改时间游标
+  （原实现第二页必 400）。
+- 前端主页关注/粉丝统计可点开列表抽屉，行内关注/取关。
+- `follows` 表补 `follower_id` / `followee_id` 的时间复合索引。
+- 验收 `app/douyin/scripts/accept_follow_lists.sh`：92 PASS / 0 FAIL。

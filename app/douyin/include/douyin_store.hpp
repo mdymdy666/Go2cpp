@@ -53,6 +53,16 @@ struct StoredUser {
     std::string avatar_url;       ///< 头像 http(s) 或 `videos/` 安全路径；空=首字母头像。
 };
 
+/// @brief 关注/粉丝列表的一行：用户资料 + 关注时间 + 查看者是否已关注。
+struct FollowListEntry {
+    std::int64_t id{0};            ///< 用户 id。
+    std::string name;              ///< 昵称。
+    std::string avatar_url;        ///< 头像；空=前端首字母头像。
+    std::string bio;               ///< 简介（可空）。
+    std::int64_t followed_at{0};   ///< 这条关注关系的 Unix 秒（列表排序键）。
+    bool followed_by_me{false};    ///< 查看者（可能匿名）是否已关注该用户。
+};
+
 /// @brief `CreateUser` 的结果：成功 / email 冲突 / 其它错误。
 enum class CreateUserResult {
     kOk = 0,      ///< 插入成功。
@@ -388,6 +398,29 @@ class Store {
      */
     bool IsFollowing(std::int64_t follower, std::int64_t followee, bool* out,
                      std::string* error);
+
+    /**
+     * @brief 关注 / 粉丝列表（keyset 分页，固定 2 条 SQL）。
+     *
+     * @param owner_id [in] 列表主人 id（>0）；关注列表=他关注的人，粉丝列表=关注他的人。
+     * @param following [in] true=following，false=followers。
+     * @param viewer_id [in] 查看者 id；0 表示匿名（`followed_by_me` 全 false）。
+     * @param cursor [in] 空=第一页；否则是上一页最后一条的 `<关注时间>-<用户 id>`。
+     * @param limit [in] 页大小（>0）；调用方已夹到 [1,100]。
+     * @param out [out] 追加一页条目；成功时按关注时间倒序。
+     * @param next_cursor [out] 下一页游标；空串表示没有更多。
+     * @param error [out] 失败时写文本；`cursor 非法` 由 service 转 400。
+     * @return 成功返回 true。
+     *
+     * ## 性能
+     * - 第 1 条 SQL 取列表（JOIN users + 双向拉黑过滤），keyset 走
+     *   `idx_follows_follower_time` / `idx_follows_followee_time`；
+     * - 第 2 条 SQL 一次取查看者关注集合，内存打标记，**不按行回查**（无 N+1）。
+     */
+    bool ListFollows(std::int64_t owner_id, bool following,
+                     std::int64_t viewer_id, const std::string& cursor,
+                     std::int64_t limit, std::vector<FollowListEntry>* out,
+                     std::string* next_cursor, std::string* error);
 
     /**
      * @brief 发布视频。

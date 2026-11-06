@@ -87,6 +87,8 @@ TAG="$ROOT/src/douyin_tag.cpp"
 AUTH="$ROOT/src/douyin_auth.cpp"
 
 EXTRA_LDLIBS=(-lgo2cpp_storage -lgo2cpp_encoding -lsqlite3)
+# 创作者中心（第 13 轮）：只读统计服务，与其它服务共用同一份 SQLite 库。
+build_one creator_service     "$ROOT/src/creator_service.cpp"     "$STORE" "$AUTH" "$PROTO" "$TAG"
 build_one user_service        "$ROOT/src/user_service.cpp"        "$STORE" "$AUTH" "$PROTO" "$TAG"
 build_one video_service       "$ROOT/src/video_service.cpp"       "$STORE" "$AUTH" "$PROTO" "$TAG"
 build_one feed_service        "$ROOT/src/feed_service.cpp"        "$STORE" "$AUTH" "$PROTO" "$TAG"
@@ -95,6 +97,8 @@ build_one interaction_service "$ROOT/src/interaction_service.cpp" "$STORE" "$AUT
 build_one live_service        "$ROOT/src/live_service.cpp"        "$STORE" "$AUTH" "$PROTO" "$TAG"
 EXTRA_LDLIBS=(-lgo2cpp_storage -lgo2cpp_encoding -lsqlite3)
 build_one search_service      "$ROOT/src/search_service.cpp"      "$STORE" "$AUTH" "$PROTO" "$TAG"
+EXTRA_LDLIBS=(-lgo2cpp_storage -lgo2cpp_encoding -lsqlite3)
+build_one dm_service          "$ROOT/src/dm_service.cpp"          "$AUTH"
 EXTRA_LDLIBS=(-lgo2cpp_encoding)
 # C8 网关：通用 Gateway 组件在 src/app/gateway.cpp，尚未打进 libgo2cpp_app.a，
 # 这里把它作为独立编译单元一起编；AUTH 提供 douyin::VerifyToken 做 Bearer 校验。
@@ -103,6 +107,10 @@ EXTRA_LDLIBS=(-lgo2cpp_encoding)
 build_one gateway             "$ROOT/src/gateway.cpp" "$ROOT/src/douyin_observability.cpp" \
   "$AUTH" "$GO2CPP/src/app/gateway.cpp" \
   -Wno-comment
+
+# C10 运营端：举报处理 + 后台页面（29107，复用同一个 SQLite 库）。
+EXTRA_LDLIBS=(-lgo2cpp_storage -lgo2cpp_encoding -lsqlite3)
+build_one admin_service       "$ROOT/src/admin_service.cpp"       "$STORE" "$AUTH" "$PROTO" "$TAG"
 
 # C9 压测工具：纯 POSIX socket，不依赖 Go2Cpp 库。
 printf '  CC %-20s ' loadgen
@@ -113,4 +121,4 @@ else
   exit 1
 fi
 
-echo "[build] 完成：$ROOT/build/{gateway,loadgen,user_service,video_service,feed_service,interaction_service,live_service,search_service}"
+echo "[build] 完成：$ROOT/build/{gateway,loadgen,user_service,video_service,feed_service,interaction_service,live_service,search_service,dm_service,creator_service,admin_service}"

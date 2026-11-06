@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <unordered_map>
+#include <unordered_set>
 #include <chrono>
 #include <cstdlib>
 #include <ctime>
@@ -279,6 +280,10 @@ constexpr const char* kSchemaSql =
     "  PRIMARY KEY (follower_id, followee_id)"
     ");"
     "CREATE INDEX IF NOT EXISTS idx_follows_followee ON follows(followee_id);"
+    // 关注/粉丝列表按关注时间倒序 keyset 分页：两个方向各一条复合索引，
+    // 避免每页都全表扫 follows 再排序（2 核小机上的主要成本）。
+    "CREATE INDEX IF NOT EXISTS idx_follows_follower_time ON follows(follower_id, created_at DESC);"
+    "CREATE INDEX IF NOT EXISTS idx_follows_followee_time ON follows(followee_id, created_at DESC);"
     "CREATE TABLE IF NOT EXISTS videos ("
     "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
     "  user_id INTEGER NOT NULL,"
@@ -1174,6 +1179,104 @@ bool Store::IsFollowing(std::int64_t follower, std::int64_t followee, bool* out,
     return true;
 }
 
+bool Store::ListFollows(std::int64_t owner_id, bool following,
+                        std::int64_t viewer_id, const std::string& cursor,
+                        std::int64_t limit, std::vector<FollowListEntry>* out,
+                        std::string* next_cursor, std::string* error) {
+    next_cursor->clear();
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return false;
+    }
+    if (limit <= 0) {
+        return true;
+    }
+    // step1: 游标与视频游标同构（`<关注时间>-<用户 id>`）；非法直接报错，不能
+    //        静默返回空页——客户端会把「游标错」误当成「没有更多」。
+    const bool has_cursor = !cursor.empty();
+    std::int64_t cursor_time = 0;
+    std::int64_t cursor_id = 0;
+    if (has_cursor && !DecodeVideoCursor(cursor, &cursor_time, &cursor_id)) {
+        if (error != nullptr) {
+            *error = "cursor 非法";
+        }
+        return false;
+    }
+    // step2: 第 1 条 SQL：列表。JOIN users 一次取齐资料；拉黑双向过滤
+    //        （我拉黑的、拉黑我的）都放在同一句，分页因此没有空洞。
+    const char* owner_col = following ? "f.follower_id" : "f.followee_id";
+    const char* peer_col = following ? "f.followee_id" : "f.follower_id";
+    std::string sql =
+        std::string("SELECT u.id, u.name, u.avatar_url, u.bio, f.created_at"
+                    " FROM follows f JOIN users u ON u.id = ") +
+        peer_col + " WHERE " + owner_col + " = ?" +
+        " AND u.id NOT IN (SELECT blocked_id FROM blocks WHERE user_id = ?)" +
+        " AND u.id NOT IN (SELECT user_id FROM blocks WHERE blocked_id = ?)";
+    if (has_cursor) {
+        sql += " AND (f.created_at < ? OR (f.created_at = ? AND u.id < ?))";
+    }
+    sql += " ORDER BY f.created_at DESC, u.id DESC LIMIT ?";
+    auto rows = has_cursor
+                    ? m_db->Query(sql, owner_id, viewer_id, viewer_id,
+                                  cursor_time, cursor_time, cursor_id, limit + 1)
+                    : m_db->Query(sql, owner_id, viewer_id, viewer_id, limit + 1);
+    if (!rows) {
+        if (error != nullptr) {
+            *error = "查询关注列表失败: " + DescribeError(rows.Err());
+        }
+        return false;
+    }
+    while (rows.Value().Next()) {
+        FollowListEntry entry;
+        entry.id = rows.Value().Int64(0);
+        entry.name = rows.Value().Text(1);
+        entry.avatar_url = rows.Value().Text(2);
+        entry.bio = rows.Value().Text(3);
+        entry.followed_at = rows.Value().Int64(4);
+        out->push_back(std::move(entry));
+    }
+    if (rows.Value().Err()) {
+        if (error != nullptr) {
+            *error = "遍历关注列表失败: " + DescribeError(rows.Value().Err());
+        }
+        return false;
+    }
+    // step3: 多取一条判断是否还有下一页；游标用本页最后一条的（时间, id）。
+    if (static_cast<std::int64_t>(out->size()) > limit) {
+        out->resize(static_cast<std::size_t>(limit));
+        *next_cursor = std::to_string(out->back().followed_at) + "-" +
+                       std::to_string(out->back().id);
+    }
+    // step4: 第 2 条 SQL：一次取查看者关注集合，内存打 followed_by_me。
+    //        无查看者（匿名）或空页时跳过，省一次查询；仍然没有 N+1。
+    if (viewer_id > 0 && !out->empty()) {
+        auto mine = m_db->Query(
+            "SELECT followee_id FROM follows WHERE follower_id = ?", viewer_id);
+        if (!mine) {
+            if (error != nullptr) {
+                *error = "查询关注状态失败: " + DescribeError(mine.Err());
+            }
+            return false;
+        }
+        std::unordered_set<std::int64_t> followed;
+        while (mine.Value().Next()) {
+            followed.insert(mine.Value().Int64(0));
+        }
+        if (mine.Value().Err()) {
+            if (error != nullptr) {
+                *error = "遍历关注状态失败: " + DescribeError(mine.Value().Err());
+            }
+            return false;
+        }
+        for (FollowListEntry& entry : *out) {
+            entry.followed_by_me = followed.count(entry.id) > 0;
+        }
+    }
+    return true;
+}
+
 std::int64_t Store::CreateVideo(std::int64_t user_id, const std::string& title,
                                 const std::string& url, std::string* error) {
     return CreateVideo(user_id, title, url, std::string(), 0, 0, error);
@@ -1389,6 +1492,18 @@ bool Store::ListFollowingFeed(std::int64_t user_id, const std::string& cursor,
         }
         return false;
     }
+    // 游标与视频游标同构（`<发布时间>-<视频 id>`）；非法直接报错，不静默
+    // 返回空页，否则客户端会把「游标错」当成「没有更多」。
+    if (!cursor.empty()) {
+        std::int64_t cursor_created = 0;
+        std::int64_t cursor_id = 0;
+        if (!DecodeVideoCursor(cursor, &cursor_created, &cursor_id)) {
+            if (error != nullptr) {
+                *error = "cursor 非法";
+            }
+            return false;
+        }
+    }
     std::vector<StoredVideo> all;
     // 拉黑过滤：关注流里被拉黑作者同样不出现（不必先取关，拉黑立即生效）。
     const std::string sql = std::string("SELECT ") + kVideoColumns +
@@ -1396,8 +1511,10 @@ bool Store::ListFollowingFeed(std::int64_t user_id, const std::string& cursor,
                             " AND user_id IN (SELECT followee_id "
                             "FROM follows WHERE follower_id = ?)"
                             " AND user_id NOT IN (SELECT blocked_id FROM blocks"
-                            " WHERE user_id = ?)" +
-                            kVideoOrder;
+                            " WHERE user_id = ?)"
+                            // 关注流按发布时间倒序（与抖音一致），不是热度序；
+                            // 热点排序会让新作品沉底，用户感知是「关注了刷不到」。
+                            " ORDER BY created_at DESC, id DESC";
     if (!LoadVideos(*m_db, sql, &all, error, user_id, user_id)) {
         return false;
     }

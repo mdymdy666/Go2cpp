@@ -53,6 +53,9 @@ FEED_PORT="${DOUYIN_FEED_PORT:-29103}"
 INTERACTION_PORT="${DOUYIN_INTERACTION_PORT:-29104}"
 LIVE_PORT="${DOUYIN_LIVE_PORT:-29105}"
 SEARCH_PORT="${DOUYIN_SEARCH_PORT:-29106}"
+DM_PORT="${DOUYIN_DM_PORT:-29109}"
+CREATOR_PORT="${DOUYIN_CREATOR_PORT:-29108}"
+ADMIN_PORT="${DOUYIN_ADMIN_PORT:-29107}"
 GW="http://127.0.0.1:$GW_PORT"
 
 mkdir -p "$LOG_DIR" "$ROOT/data" "$TMP"
@@ -183,26 +186,29 @@ start_service() { # name port
 
 rm -f "$DB" "$DB-wal" "$DB-shm" "$LOG_DIR/accept_all_"*.log
 
-echo "[0/9] 启动 7 个进程（6 业务 + gateway）"
+echo "[0/10] 启动 10 个进程（9 业务 + gateway）"
 start_service user_service "$USER_PORT"
 start_service video_service "$VIDEO_PORT"
 start_service feed_service "$FEED_PORT"
 start_service interaction_service "$INTERACTION_PORT"
 start_service live_service "$LIVE_PORT"
 start_service search_service "$SEARCH_PORT"
+start_service dm_service "$DM_PORT"
+start_service creator_service "$CREATOR_PORT"
+start_service admin_service "$ADMIN_PORT"
 start_service gateway "$GW_PORT"
 
-echo "[1/9] 网关自身健康 + 聚合健康"
+echo "[1/10] 网关自身健康 + 聚合健康"
 code=$(get "/health")
 check "GET /health" 200 "$code"
 expect_body " /health 含 service=gateway" '"service":"gateway"'
 code=$(get "/api/health/all")
 check "GET /api/health/all" 200 "$code"
 expect_body "聚合顶层 ok=true" '^{"ok":true,"services":{'
-expect_eq "聚合 6 个上游均 ok=true" 6 \
-  "$(grep -o '"127\.0\.0\.1:2910[1-6]":{"ok":true' "$TMP/body" | wc -l)"
+expect_eq "聚合 9 个上游均 ok=true" 9 \
+  "$(grep -o '"127\.0\.0\.1:[0-9]*":{"ok":true' "$TMP/body" | wc -l)"
 
-echo "[2/9] 注册 alice / bob（经网关 → user）"
+echo "[2/10] 注册 alice / bob（经网关 → user）"
 code=$(post "/api/user/register" \
   '{"name":"alice","email":"alice@example.com","password":"secret123"}')
 check "注册 alice（经网关）" 200 "$code"
@@ -224,7 +230,7 @@ fi
 expect_eq "alice uid 与 bob uid 不同" yes \
   "$([[ "$UID_A" != "$UID_B" ]] && echo yes || echo no)"
 
-echo "[3/9] alice 发 3 条视频（经网关 → video）"
+echo "[3/10] alice 发 3 条视频（经网关 → video）"
 V1=""; V2=""; V3=""
 for i in 1 2 3; do
   code=$(post "/api/video" \
@@ -247,7 +253,7 @@ expect_body "视频详情含 author=alice" '"author":"alice"'
 expect_body "视频详情含 title=v1" '"title":"v1"'
 expect_eq "视频详情初始 like_count" 0 "$(json_int like_count)"
 
-echo "[4/9] feed 分页（经网关 → feed）"
+echo "[4/10] feed 分页（经网关 → feed）"
 code=$(get "/api/feed?limit=20")
 check "GET /api/feed?limit=20" 200 "$code"
 expect_body "feed 含 next_cursor" '"next_cursor"'
@@ -286,7 +292,7 @@ for _ in $(seq 1 5); do
 done
 expect_eq "随机推荐：5 次首屏出现不同顺序" 1 "$ORDER_DIFF"
 
-echo "[5/9] 点赞两次幂等（经网关 → interaction）"
+echo "[5/10] 点赞两次幂等（经网关 → interaction）"
 code=$(post "/api/like" "{\"video_id\":$V1}" "$TOKEN_B")
 check "bob 首次点赞" 200 "$code"
 expect_body "首次点赞 inserted=true" '"inserted":true'
@@ -299,7 +305,7 @@ code=$(get "/api/video/$V1")
 check "视频详情（点赞后）" 200 "$code"
 expect_eq "详情 like_count 同步" 1 "$(json_int like_count)"
 
-echo "[6/9] 评论 2 条 + 列表（经网关 → interaction）"
+echo "[6/10] 评论 2 条 + 列表（经网关 → interaction）"
 code=$(post "/api/comment" "{\"video_id\":$V1,\"content\":\"第一条评论\"}" "$TOKEN_B")
 check "bob 发评论 1" 200 "$code"
 expect_body "评论 1 返回内容" '第一条评论'
@@ -313,7 +319,7 @@ code=$(get "/api/video/$V1")
 check "视频详情（评论后）" 200 "$code"
 expect_eq "详情 comment_count" 2 "$(json_int comment_count)"
 
-echo "[7/9] 搜索（经网关 → search）"
+echo "[7/10] 搜索（经网关 → search）"
 code=$(get "/api/search?q=alice&type=user")
 check "搜索用户 q=alice" 200 "$code"
 expect_body "搜索命中 alice" 'alice'
@@ -322,7 +328,7 @@ code=$(get "/api/search?q=v1&type=video")
 check "搜索视频 q=v1" 200 "$code"
 expect_body "搜索类型 type=video" '"type":"video"'
 
-echo "[8/9] 直播：建播 / 开播 / 进房（经网关 → live）"
+echo "[8/10] 直播：建播 / 开播 / 进房（经网关 → live）"
 code=$(post "/api/live/room" '{"title":"alice 的直播间"}' "$TOKEN_A")
 check "alice 创建直播间" 200 "$code"
 expect_body "创建后 status=0" '"status":0'
@@ -371,7 +377,31 @@ expect_body "直播页聊天区" 'id="chatList"'
 expect_body "直播页礼物面板" 'id="giftPanel"'
 expect_body "直播页贡献榜" 'id="rankingPanel"'
 
-echo "[9/9] 网关专项：鉴权 / 未知路径 / 6 条路由全 200"
+echo "[9/10] 私信：发送 / 会话 / 增量 / 未读 / 已读（经网关 → dm）"
+code=$(post "/api/dm/send" "{\"to_user_id\":$UID_B,\"content\":\"你好 bob\"}" "$TOKEN_A")
+check "alice 给 bob 发私信" 200 "$code"
+expect_body "发送返回 conversation_id" '"conversation_id":'
+CONV=$(sed -n 's/.*"conversation_id":\([0-9]*\).*/\1/p' "$TMP/body" | head -1)
+code=$(post "/api/dm/send" "{\"to_user_id\":$UID_A,\"content\":\"你好 alice\"}" "$TOKEN_B")
+check "bob 回复 alice" 200 "$code"
+code=$(get "/api/dm/conversations" "$TOKEN_A")
+check "alice 会话列表" 200 "$code"
+expect_body "会话含对方昵称 bob" '"peer_name":"bob"'
+expect_eq "alice 未读数" 1 "$(sed -n 's/.*"unread":\([0-9]*\).*/\1/p' "$TMP/body" | head -1)"
+code=$(get "/api/dm/$CONV/messages?after=0" "$TOKEN_A")
+check "增量拉取（after=0）" 200 "$code"
+expect_eq "首屏消息条数" 2 "$(grep -o '"sender_id":' "$TMP/body" | wc -l)"
+LAST=$(sed -n 's/.*"last_id":\([0-9]*\).*/\1/p' "$TMP/body" | head -1)
+code=$(get "/api/dm/$CONV/messages?after=$LAST" "$TOKEN_A")
+check "增量拉取（after=last）" 200 "$code"
+expect_eq "增量新消息 0" 0 "$(grep -o '"sender_id":' "$TMP/body" | wc -l)"
+code=$(post "/api/dm/$CONV/read" '{}' "$TOKEN_A")
+check "alice 标记已读" 200 "$code"
+code=$(get "/api/dm/conversations" "$TOKEN_A")
+expect_eq "已读后未读 0" 0 "$(sed -n 's/.*"unread":\([0-9]*\).*/\1/p' "$TMP/body" | head -1)"
+code=$(post "/api/dm/send" "{\"to_user_id\":$UID_B,\"content\":\"x\"}" "")
+check "无 token 发私信" 401 "$code"
+echo "[10/10] 网关专项：鉴权 / 未知路径 / 7 条路由全 200"
 code=$(post "/api/like" "{\"video_id\":$V1}")
 check "无 token POST /api/like" 401 "$code"
 expect_body "401 body 含 code=401" '"code":401'
@@ -405,8 +435,24 @@ code=$(get "/api/live/rooms")
 check "路由 live   /api/live/rooms" 200 "$code"
 code=$(get "/api/search?q=alice")
 check "路由 search /api/search" 200 "$code"
+code=$(get "/api/dm/conversations" "$TOKEN_A")
+check "路由 dm     /api/dm/conversations" 200 "$code"
 
 if [[ "$BENCH" -eq 1 ]]; then
+echo "[creator] 创作者中心：概览 / 趋势 / TOP5 / 页面"
+code=$(get "/api/creator/overview" "$TOKEN_A")
+check "GET /api/creator/overview" 200 "$code"
+expect_body "overview 含 total_likes" '"total_likes":'
+code=$(get "/api/creator/trend?days=7" "$TOKEN_A")
+check "GET /api/creator/trend?days=7" 200 "$code"
+code=$(get "/api/creator/top-videos?limit=5" "$TOKEN_A")
+check "GET /api/creator/top-videos?limit=5" 200 "$code"
+code=$(get "/creator")
+check "GET /creator 页面" 200 "$code"
+expect_body "页面含趋势柱状图" 'id="trendChart"'
+code=$(get "/api/creator/overview?user_id=$UID_A" "$TOKEN_B")
+check "bob 查 alice 的数据（越权）" 403 "$code"
+
   echo "[bench] 压测网关：GET /api/feed?limit=20 与 GET /api/video/$V1"
   LOADGEN="$BIN_DIR/loadgen"
   if [[ ! -x "$LOADGEN" ]]; then

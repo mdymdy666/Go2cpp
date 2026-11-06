@@ -15,7 +15,11 @@
  *          - GET /settings 由本地 handler 直出资料编辑页（PATCH /api/user/me）；
  *          - GET /static/<name>、/covers/<name> 静态资源缓存 1 天；
  *          - GET /live 由本地 handler 直出直播间单页（聊天/礼物/贡献榜，
- *            数据走 live_service 的 /api/live/*）。
+ *            数据走 live_service 的 /api/live/*）；
+ *          - GET /messages 由本地 handler 直出私信单页（会话/聊天/轮询，
+ *            数据走 dm_service 的 /api/dm/*）。
+ *          - GET /creator 由 creator 服务直出创作者中心页（4 卡片 + 趋势 + TOP5，
+ *            数据走 /api/creator/*，只读本人）。
  *
  * @note 路由按「业务前缀」组织；读/写语义不同的前缀按方法掩码拆成两条
  *       RouteSpec（同一上游），避免把公开读误挡在 401 之后。
@@ -26,6 +30,7 @@
  */
 
 #include "douyin_auth.hpp"
+#include "douyin_dm_page.hpp"
 #include "douyin_home_page.hpp"
 #include "douyin_live_page.hpp"
 #include "douyin_shutdown.hpp"
@@ -97,6 +102,12 @@ const std::uint16_t kInteractionPort =
 const std::uint16_t kLivePort = PortFromEnv("DOUYIN_LIVE_PORT", 29105);
 /// @brief search 服务端口（可用 DOUYIN_SEARCH_PORT 覆盖）。
 const std::uint16_t kSearchPort = PortFromEnv("DOUYIN_SEARCH_PORT", 29106);
+/// @brief admin 服务端口（可用 DOUYIN_ADMIN_PORT 覆盖）。
+const std::uint16_t kAdminPort = PortFromEnv("DOUYIN_ADMIN_PORT", 29107);
+/// @brief dm 服务端口（可用 DOUYIN_DM_PORT 覆盖）。
+const std::uint16_t kDmPort = PortFromEnv("DOUYIN_DM_PORT", 29109);
+/// @brief creator 服务端口（可用 DOUYIN_CREATOR_PORT 覆盖）。
+const std::uint16_t kCreatorPort = PortFromEnv("DOUYIN_CREATOR_PORT", 29108);
 /// @brief 服务名（日志用）。
 constexpr const char* kServiceName = "gateway";
 /// @brief 静态资源根目录：build.sh 用 -DDOUYIN_WEB_DIR 注入绝对路径，
@@ -416,6 +427,58 @@ bool AddLiveRoute(Gateway* gateway) {
     return true;
 }
 
+/**
+ * @brief 私信页匹配器：只接管 GET / HEAD 的 `/messages` 与 `/messages.html`。
+ *
+ * ## 定位
+ * 与 LivePageMatcher 一样注册为自定义 Matcher，优先级高于通配路由，
+ * 保证 `/messages` 不会被 `/api/**` 或 404 兜底吞掉。会话/用户 id 走
+ * query（`/messages?conversation=3`、`/messages?peer=7`），页面脚本解析。
+ *
+ * ## 并发/失败语义
+ * - 无状态，worker 线程并发调用安全；
+ * - 只匹配 GET/HEAD；其它方法返回 false，由后续路由回 404。
+ */
+class DmPageMatcher final : public Matcher {
+public:
+    /// @brief 命中私信页路径；本路由无参数，不写入 params。
+    /// @param request [in] 入站请求——借用，调用期间有效。
+    /// @param params [out] 不写入。
+    /// @return true 表示由 ServeDmPage 接管。
+    bool Match(const Request& request, PathParams* /*params*/) const override {
+        if (request.method != Method::Get && request.method != Method::Head) {
+            return false;
+        }
+        const std::string_view path = request.path_view();
+        return path == "/messages" || path == "/messages.html";
+    }
+};
+
+/// @brief 私信页 handler：本地填写 HTML，不产生上游请求。
+/// @param request [in] 入站请求——借用；页面与请求内容无关，未使用。
+/// @param response [out] 出站响应——成功时整体覆盖为 200 + HTML。
+/// @return 总是 Ok。
+Result<void> ServeDmPage(Request& /*request*/, Response& response) {
+    response.status = Status::OK;
+    response.header.set("Content-Type", "text/html; charset=utf-8");
+    response.header.set("Cache-Control", "no-cache");
+    response.body = douyin::kDmPageHtml;
+    return Result<void>::Ok();
+}
+
+/// @brief 注册私信页路由；失败时打印并返回 false。
+bool AddDmRoute(Gateway* gateway) {
+    const auto result = gateway->AddRoute(
+        std::make_shared<DmPageMatcher>(),
+        std::make_shared<Handler>(&ServeDmPage));
+    if (!result.ok()) {
+        std::fprintf(stderr, "[%s] 注册私信页路由失败：%s\n", kServiceName,
+                     result.error().c_str());
+        return false;
+    }
+    return true;
+}
+
 /// @brief 健康探针路由的匹配器：只命中 `/health/live` 与 `/health/ready`。
 class HealthMatcher final : public Matcher {
 public:
@@ -462,6 +525,8 @@ Result<void> ServeHealth(Request& request, Response& response) {
         {"user", kUserPort},         {"video", kVideoPort},
         {"feed", kFeedPort},         {"interaction", kInteractionPort},
         {"live", kLivePort},         {"search", kSearchPort},
+        {"dm", kDmPort},
+        {"creator", kCreatorPort},
     };
     std::string reason;
     if (douyin::ShutdownRequested()) {
@@ -1196,6 +1261,7 @@ int main(int argc, char** argv) {
     }
 
     if (!AddHomeRoute(gateway.get()) || !AddLiveRoute(gateway.get()) ||
+        !AddDmRoute(gateway.get()) ||
         !AddSettingsRoute(gateway.get()) || !AddVideoRoute(gateway.get()) ||
         !AddSiteStaticRoute(gateway.get()) || !AddHealthRoutes(gateway.get())) {
         return 1;
@@ -1242,12 +1308,28 @@ int main(int argc, char** argv) {
                  kInteractionPort, true, 0, "notification-read") &&
         AddRoute(gateway.get(), kWriteMask, "/api/notifications/**",
                  kInteractionPort, true, 10, "notification-write") &&
+        // 私信是私密数据：读写都要 Bearer，网关先 401 掉匿名请求；
+        // 上游再做「是否会话成员」的 403 判定与拉黑过滤。
+        AddRoute(gateway.get(), method_mask::kAll, "/api/dm/**", kDmPort, true,
+                 0, "dm") &&
         AddRoute(gateway.get(), kReadMask, "/api/live/**", kLivePort, false, 0,
                  "live-read") &&
         AddRoute(gateway.get(), kWriteMask, "/api/live/**", kLivePort, true, 10,
                  "live-write") &&
         AddRoute(gateway.get(), method_mask::kAll, "/api/search/**", kSearchPort,
                  false, 0, "search") &&
+        // 创作者中心：统计接口是私密数据，网关先 401 掉匿名请求；
+        // `/creator` 页面是无鉴权静态壳，token 由浏览器 localStorage 带给 API。
+        AddRoute(gateway.get(), kReadMask, "/api/creator/**", kCreatorPort, true,
+                 0, "creator") &&
+        AddRoute(gateway.get(), kReadMask, "/creator", kCreatorPort, false, 0,
+                 "creator-page") &&
+        // 运营端：网关只要求登录，admin 身份由 admin 服务内校验（非 admin 403）。
+        AddRoute(gateway.get(), method_mask::kAll, "/api/admin/**", kAdminPort,
+                 true, 10, "admin") &&
+        // 举报后台页面：浏览器直接打开；页面内 JS 自己带 Bearer token 调接口。
+        AddRoute(gateway.get(), kReadMask, "/admin", kAdminPort, false, 0,
+                 "admin-page") &&
         // 分享落地页 `/v/<id>`：独立 HTML（不是首页 SPA），由 video 服务渲染。
         // 与静态视频路由 `/videos/**` 前缀不同，互不干扰。
         AddRoute(gateway.get(), kReadMask, "/v/**", kVideoPort, false, 0,
@@ -1258,11 +1340,12 @@ int main(int argc, char** argv) {
 
     std::printf(
         "[%s] 监听 0.0.0.0:%u，上游 user=%u video=%u feed=%u interaction=%u "
-        "live=%u search=%u\n",
+        "live=%u search=%u dm=%u admin=%u creator=%u\n",
         kServiceName, static_cast<unsigned>(port), static_cast<unsigned>(kUserPort),
         static_cast<unsigned>(kVideoPort), static_cast<unsigned>(kFeedPort),
         static_cast<unsigned>(kInteractionPort), static_cast<unsigned>(kLivePort),
-        static_cast<unsigned>(kSearchPort));
+        static_cast<unsigned>(kSearchPort), static_cast<unsigned>(kDmPort),
+        static_cast<unsigned>(kAdminPort), static_cast<unsigned>(kCreatorPort));
     std::fflush(stdout);
 
     // 信号只置位；5 s 看门狗负责超时强制退出码 1。

@@ -863,3 +863,20 @@
    `og:image` 已支持 `cover_url`，可再加服务端自动截帧。
 5. 播放侧下一批：单条播放进度记忆（localStorage `douyin_pos_<id>`）、
    关注流分页 / 下拉刷新、字幕开关与倍速音调补偿。
+
+
+## 十五、第 13 轮：关注 / 粉丝列表 + 关注动态（社交完整度）
+
+- **接口**：`GET /api/user/:id/following|followers?cursor=&limit=20` —— items
+  含 `id/name/avatar_url/bio/followed_by_me`；关注时间倒序 keyset（`<时间>-<id>`）；
+  双向拉黑过滤；固定 2 条 SQL（列表 + 查看者关注集合）；匿名 `followed_by_me=false`。
+- **关注流修复**：`GET /api/feed/following` 改为按发布时间倒序（原来误用热度序），
+  游标改为时间游标（原随机种子游标会让第二页 400）；拉黑过滤保留。
+- **前端**：主页「关注 N / 粉丝 N」可点开右侧抽屉列表（头像 / 昵称 / 简介 /
+  关注按钮）；行内关注/取关即时更新按钮与主页统计；关注/粉丝/空关注流都有
+  空状态文案；「关注」tab 继续走 `api/feed/following`。
+- **索引**：`idx_follows_follower_time(follower_id, created_at DESC)`、
+  `idx_follows_followee_time(followee_id, created_at DESC)`（旧库自动补建）。
+- **验收**：`scripts/accept_follow_lists.sh` → **92 PASS / 0 FAIL**；
+  following/followers/关注流 TTFB 均 1 ms；EXPLAIN 命中两条新索引；
+  `GET /` 200。

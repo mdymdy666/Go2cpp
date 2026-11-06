@@ -945,6 +945,45 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     color: var(--text); background: #23232e; border: 1px solid var(--line);
   }
   .follow-btn:disabled { opacity: .6; cursor: default; }
+
+  /* ---------- 关注 / 粉丝列表（第 13 轮） ---------- */
+  .p-stats .p-stat-link {
+    cursor: pointer; border-radius: 8px; padding: 4px 8px; margin: -4px -8px;
+    transition: background .15s;
+  }
+  .p-stats .p-stat-link:hover { background: rgba(255, 255, 255, .06); }
+  .p-stats .p-stat-link:hover b { color: #fff; }
+  .follow-row {
+    display: flex; align-items: center; gap: 12px;
+    padding: 12px 16px; border-bottom: 1px solid rgba(255, 255, 255, .06);
+  }
+  .follow-row:hover { background: rgba(255, 255, 255, .04); }
+  .follow-avatar {
+    flex: none; width: 42px; height: 42px; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 16px; font-weight: 700; color: #fff;
+    background: linear-gradient(135deg, #fe2c55, #7b61ff); overflow: hidden;
+  }
+  .follow-avatar img { width: 100%; height: 100%; object-fit: cover; }
+  .follow-main { flex: 1 1 auto; min-width: 0; }
+  .follow-name { font-size: 14px; font-weight: 600; color: var(--text); }
+  .follow-bio {
+    margin-top: 3px; font-size: 12px; color: var(--muted);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .follow-btn-sm {
+    flex: none; padding: 6px 14px; border-radius: 999px;
+    font-size: 12.5px; font-weight: 700; color: #fff;
+    background: linear-gradient(92deg, var(--pink), #ff5c7a); cursor: pointer;
+  }
+  .follow-btn-sm.following {
+    color: var(--text); background: #23232e; border: 1px solid var(--line);
+  }
+  .follow-btn-sm.self {
+    color: var(--muted); background: transparent; border: 1px solid var(--line);
+    cursor: default;
+  }
+  .follow-btn-sm:disabled { opacity: .55; cursor: default; }
   .p-self-tag {
     display: inline-block; margin-top: 8px; padding: 3px 10px;
     font-size: 12px; color: var(--muted);
@@ -1241,6 +1280,18 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     <button class="cp-close" id="blockClose" type="button" aria-label="关闭黑名单">✕</button>
   </div>
   <div class="cp-list" id="blockList"><div class="cp-empty">加载中…</div></div>
+</aside>
+
+<aside class="notif-panel" id="followPanel" aria-label="关注与粉丝" aria-hidden="true">
+  <div class="cp-head">
+    <div class="cp-titles">
+      <b id="followPanelTitle">关注</b>
+      <span id="followPanelSub">加载中…</span>
+    </div>
+    <button class="cp-close" id="followPanelClose" type="button" aria-label="关闭列表">✕</button>
+  </div>
+  <div class="cp-list" id="followPanelList"><div class="cp-empty">加载中…</div></div>
+  <button class="notif-more" id="followPanelMore" type="button" hidden>加载更多</button>
 </aside>
 
 <section class="profile-view" id="profileView" hidden aria-label="用户主页">
@@ -4315,6 +4366,15 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
   var blockPanelEl = document.getElementById('blockPanel');
   var blockListEl = document.getElementById('blockList');
   var blockSubEl = document.getElementById('blockSub');
+  var followPanelEl = document.getElementById('followPanel');
+  var followPanelTitleEl = document.getElementById('followPanelTitle');
+  var followPanelSubEl = document.getElementById('followPanelSub');
+  var followPanelListEl = document.getElementById('followPanelList');
+  var followPanelMoreEl = document.getElementById('followPanelMore');
+  var followState = {
+    ownerId: '', kind: 'following', cursor: '', loading: false,
+    items: [], done: true
+  };
   var reportState = { type: '', id: '', reason: '广告营销', busy: false };
 
   /* 底部动作菜单：item = {label, danger, fn}。同一时间只开一个。 */
@@ -4443,6 +4503,167 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
         }
         throw err;
       });
+  }
+
+  /* ---------- 关注 / 粉丝列表（第 13 轮） ---------- */
+
+  /* 打开列表：kind=following|followers，ownerId 是被查看主页的用户。
+     列表公开（匿名可看），点关注按钮时才要求登录。 */
+  function openFollowList(ownerId, kind) {
+    var uid = String(ownerId || '');
+    if (!uid || uid === '0') { toast('用户信息缺失', 'err'); return; }
+    var k = kind === 'followers' ? 'followers' : 'following';
+    closeBlacklist();
+    closeNotifications();
+    followState = {
+      ownerId: uid, kind: k, cursor: '', loading: false, items: [], done: false
+    };
+    followPanelTitleEl.textContent = k === 'following' ? '关注' : '粉丝';
+    followPanelSubEl.textContent = '加载中…';
+    followPanelListEl.innerHTML = '<div class="cp-empty">加载中…</div>';
+    followPanelMoreEl.hidden = true;
+    followPanelEl.classList.add('open');
+    followPanelEl.setAttribute('aria-hidden', 'false');
+    loadFollowList(true);
+  }
+
+  function closeFollowList() {
+    followPanelEl.classList.remove('open');
+    followPanelEl.setAttribute('aria-hidden', 'true');
+  }
+
+  function followApiPath(reset) {
+    var url = 'api/user/' + followState.ownerId + '/' + followState.kind +
+              '?limit=20';
+    if (!reset && followState.cursor) {
+      url += '&cursor=' + encodeURIComponent(followState.cursor);
+    }
+    return url;
+  }
+
+  function loadFollowList(reset) {
+    if (followState.loading) return;
+    followState.loading = true;
+    api(followApiPath(reset)).then(function (data) {
+      followState.loading = false;
+      if (reset) followState.items = [];
+      followState.items = followState.items.concat(data.items || []);
+      followState.cursor = data.next_cursor || '';
+      followState.done = !followState.cursor;
+      renderFollowList();
+    }).catch(function (err) {
+      followState.loading = false;
+      followPanelListEl.innerHTML = '<div class="cp-empty">列表加载失败：' +
+        (err.message || '网络错误') + '</div>';
+      followPanelSubEl.textContent = '加载失败';
+    });
+  }
+
+  function followAvatarEl(u) {
+    var wrap = document.createElement('span');
+    wrap.className = 'follow-avatar';
+    var url = u.avatar_url || '';
+    var src = /^https?:\/\//i.test(url)
+      ? url : (url.indexOf('videos/') === 0 ? BASE + url : '');
+    if (src) {
+      var img = document.createElement('img');
+      img.alt = (u.name || '用户') + ' 的头像';
+      img.loading = 'lazy';
+      img.src = src;
+      wrap.appendChild(img);
+    } else {
+      wrap.textContent = initial(u.name || '?');
+    }
+    return wrap;
+  }
+
+  function renderFollowList() {
+    followPanelListEl.innerHTML = '';
+    var self = !!(state.user &&
+      String(state.user.id) === followState.ownerId);
+    followPanelSubEl.textContent = followState.items.length + ' 人';
+    if (!followState.items.length) {
+      var empty = followState.kind === 'following'
+        ? (self ? '你还没有关注任何人，去推荐流看看' : 'TA 还没有关注任何人')
+        : (self ? '还没有人关注你，发点作品吧' : 'TA 还没有粉丝');
+      followPanelListEl.innerHTML = '<div class="cp-empty">' + empty + '</div>';
+      followPanelMoreEl.hidden = true;
+      return;
+    }
+    followState.items.forEach(function (u) {
+      followPanelListEl.appendChild(followRow(u, self));
+    });
+    followPanelMoreEl.hidden = !followState.cursor;
+  }
+
+  function followRow(u, self) {
+    var row = document.createElement('div');
+    row.className = 'follow-row';
+    row.dataset.id = String(u.id);
+    row.appendChild(followAvatarEl(u));
+    var main = document.createElement('div');
+    main.className = 'follow-main';
+    var name = document.createElement('div');
+    name.className = 'follow-name';
+    name.textContent = u.name || ('user' + u.id);
+    var bio = document.createElement('div');
+    bio.className = 'follow-bio';
+    bio.textContent = u.bio || '这个人很懒，什么都没写';
+    main.appendChild(name);
+    main.appendChild(bio);
+    row.appendChild(main);
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    var isSelf = self || !!(state.user &&
+      String(state.user.id) === String(u.id));
+    if (isSelf) {
+      btn.className = 'follow-btn-sm self';
+      btn.textContent = '自己';
+      btn.disabled = true;
+    } else {
+      var mine = u.followed_by_me === true;
+      btn.className = 'follow-btn-sm' + (mine ? ' following' : '');
+      btn.textContent = mine ? '已关注' : '+ 关注';
+      btn.addEventListener('click', function () { toggleFollowRow(u, btn); });
+    }
+    row.appendChild(btn);
+    return row;
+  }
+
+  /* 行内关注/取关：只改按钮与主页统计，不整页重拉（页面不闪）。 */
+  function toggleFollowRow(u, btn) {
+    if (!state.token) { toast('请先登录再关注', 'err'); return; }
+    var was = btn.classList.contains('following');
+    btn.disabled = true;
+    api('api/user/' + u.id + '/follow', { method: was ? 'DELETE' : 'POST' })
+      .then(function (data) {
+        btn.disabled = false;
+        btn.classList.toggle('following', !was);
+        btn.textContent = !was ? '已关注' : '+ 关注';
+        u.followed_by_me = !was;
+        var followersEl = pageStatEl('p-followers');
+        if (followersEl && data && typeof data.followers === 'number') {
+          followersEl.textContent = fmt(data.followers);
+        }
+        var followingEl = pageStatEl('p-following');
+        if (followingEl) {
+          var n = Number(String(followingEl.textContent).replace(/[^\d]/g, '')) || 0;
+          followingEl.textContent = fmt(Math.max(0, n + (was ? -1 : 1)));
+        }
+        toast(!was ? '已关注 @' + (u.name || u.id)
+                   : '已取消关注 @' + (u.name || u.id), 'ok');
+      })
+      .catch(function (err) {
+        btn.disabled = false;
+        if (!handleAuthError(err)) {
+          toast((was ? '取消关注' : '关注') + '失败：' +
+            (err.message || '网络错误'), 'err');
+        }
+      });
+  }
+
+  function pageStatEl(cls) {
+    return document.querySelector('.p-stats .' + cls);
   }
 
   function openBlacklist() {
@@ -4852,9 +5073,12 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     /* 数据行：作品 / 关注 / 粉丝（作品数等 works tab 加载完再填） */
     var stats = document.createElement('div');
     stats.className = 'p-stats';
-    stats.innerHTML = '<span><b class="p-videos">—</b>作品</span>' +
-                      '<span><b class="p-following"></b>关注</span>' +
-                      '<span><b class="p-followers"></b>粉丝</span>';
+    stats.innerHTML = '<span class="p-stat-link" data-kind="videos">' +
+                      '<b class="p-videos">—</b>作品</span>' +
+                      '<span class="p-stat-link" data-kind="following">' +
+                      '<b class="p-following"></b>关注</span>' +
+                      '<span class="p-stat-link" data-kind="followers">' +
+                      '<b class="p-followers"></b>粉丝</span>';
     stats.querySelector('.p-following').textContent = fmt(user.following);
     stats.querySelector('.p-followers').textContent = fmt(user.followers);
 
@@ -4958,6 +5182,23 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     profileBody.appendChild(panel);
     state.profileView = view;
 
+    /* 统计数字可点：作品切回作品 tab，关注/粉丝打开列表抽屉（第 13 轮）。 */
+    var statEls = stats.querySelectorAll('.p-stat-link');
+    for (var si = 0; si < statEls.length; ++si) {
+      statEls[si].addEventListener('click', function () {
+        var kind = this.dataset.kind;
+        if (kind === 'videos') {
+          view.active = 'works';
+          paintProfilePanel(view);
+          if (!view.tabs.works.loaded && !view.tabs.works.loading) {
+            loadProfileTab(view, 'works', true);
+          }
+          return;
+        }
+        openFollowList(user.id, kind);
+      });
+    }
+
     /* 拉黑后主页只显示「已拉黑」和取消入口，不再请求视频列表——否则
        拉黑等于只挡住 feed，从主页还能绕进去。 */
     if (!self && user.is_blocked) {
@@ -5060,6 +5301,10 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
 
   document.getElementById('blacklistBtn').addEventListener('click', openBlacklist);
   document.getElementById('blockClose').addEventListener('click', closeBlacklist);
+  document.getElementById('followPanelClose').addEventListener('click', closeFollowList);
+  document.getElementById('followPanelMore').addEventListener('click', function () {
+    loadFollowList(false);
+  });
   document.getElementById('whoAvatar').addEventListener('click', function () {
     if (!state.token) { toast('请先登录', 'err'); return; }
     location.href = BASE + 'settings';
@@ -5204,6 +5449,7 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     if (!pub.panel.hidden) { closePublish(); return; }
     if (!reportModalEl.hidden) { closeReport(); return; }
     if (!menuSheetEl.hidden) { closeMenu(); return; }
+    if (followPanelEl.classList.contains('open')) { closeFollowList(); return; }
     if (blockPanelEl.classList.contains('open')) { closeBlacklist(); return; }
     if (!shareSheet.hidden) { closeShare(); return; }
     if (!favViewEl.hidden) { hideFavorites(); return; }
