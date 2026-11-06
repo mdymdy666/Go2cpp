@@ -2,10 +2,10 @@
 
 | 项 | 内容 |
 |---|---|
-| 盘点时间 | 2026-11-06（第 5 轮） |
+| 盘点时间 | 2026-11-06（第 8 轮） |
 | 盘点范围 | `app/douyin/` 全部源码（7 服务 + 网关 + 单页前端） |
 | 盘点方式 | 读 REQUIREMENTS.md、逐服务路由表、前端函数/元素清单、关键词扫描、跑既有验收 |
-| 基线 | `scripts/accept_all.sh` → 70 PASS / 0 FAIL；`scripts/accept_notifications.sh` → 92 PASS / 0 FAIL；`scripts/accept_report_block.sh` → 79 PASS / 0 FAIL；`scripts/accept_share_landing.sh` → 88 PASS / 0 FAIL；`scripts/accept_profile_tabs.sh` → **115 PASS / 0 FAIL** |
+| 基线 | `scripts/accept_all.sh` → 70 PASS / 0 FAIL；`scripts/accept_notifications.sh` → 92 PASS / 0 FAIL；`scripts/accept_report_block.sh` → 79 PASS / 0 FAIL；`scripts/accept_share_landing.sh` → 88 PASS / 0 FAIL；`scripts/accept_profile_tabs.sh` → **115 PASS / 0 FAIL**；`scripts/accept_player_cluster.sh` → **94 PASS / 0 FAIL** |
 
 > 说明：本文档只记录**代码里核实过**的能力。摘要里提到但代码未命中的项，
 > 统一标「待核实」，不当作已完成。
@@ -27,6 +27,9 @@
 
 - [x] 全屏 Feed、单例播放（`playOnly`）、自动暂停其它视频
 - [x] 点击暂停/播放、进度条拖动（`seekToRatio`）、时长显示
+- [x] **第 8 轮**：单击 250ms / 双击点赞 / 长按 2× / 上下滑 / 左右滑手势
+- [x] **第 8 轮**：进度条悬浮时间预览 + buffered 高亮 + 60ms 节流 seek
+- [x] **第 8 轮**：自动连播（默认开，到底刷新）+ 推荐/关注双 tab + 倍速
 - [x] 双击点赞 + 心形动画（`doubleTapLike` / `spawnHeart`）
 - [x] 音量：全局静音开关 + 音量滑块（`applySound` / `setMuted`）
 - [x] 视频地址容错（`videoSrc`：绝对/相对/文件名/回退 demoN.mp4）
@@ -552,14 +555,79 @@
 - **迁移测试停掉全部服务**：gateway 一起被杀导致后续请求全部 000；改为只重启
   video_service，并按 pid 文件精确删除条目。
 
-## 十、下一轮建议
+## 十、第 8 轮交付：播放体验三件套（手势增强 / 进度条预览 / 自动连播）
 
-1. 播放器手势增强：上下滑切换（当前为滚动吸附）、长按 2x 倍速、双击点赞
-   已有；与裁剪窗配合时注意 `clip_end` 停止逻辑。
-2. 举报运营后台：`reports.status` 只有 pending，缺列表 / 处理接口与页面。
-3. 服务端草稿：当前草稿只在 localStorage（换设备/清缓存即丢）；可加
+本轮只改前端 `include/douyin_home_page.hpp`（内联 HTML/CSS/JS），后端零改动；
+「推荐 / 关注」复用已有的 `GET /api/feed` 与 `GET /api/feed/following`。
+
+### 手势增强
+
+- **单击播放/暂停**：延迟 250ms 判定；双击到来时 `clearTapTimer` 取消单击，
+  不会出现「先暂停再播放」的闪屏；
+- **双击点赞**：保留 `doubleTapLike` + 心形动画；鼠标与触摸统一走 `pointerup`
+  的 280ms 双轻点判定（原来只有 `dblclick`，触屏不生效）；
+- **长按 2×**：500ms 未移动 → `playbackRate = 2` + 「2× 倍速」角标
+  （`.speed-badge`）；松手恢复所选倍速；长按期间若视频暂停先 `playOnly`；
+- **上下滑切换**：`goSlide(±1)` 按屏 `scrollIntoView({behavior:'smooth'})`，
+  `scroll-snap` 保证严格对齐；鼠标纵向拖 ≥70px 触发，触摸交给原生滚动；
+- **左右滑切 tab**：topbar 新增「推荐 / 关注」双 tab（`.feed-tabs`）；
+  横向拖 ≥60px 或点 tab 切换；未登录切关注只提示不切；
+- 统一手势状态机：`pointerdown/move/up/cancel` + `setPointerCapture`；
+  长按/双击/滑动后 `suppressUntil` 吃掉随后 click，避免误暂停；
+- 兼容兜底：`!window.PointerEvent` 时保留 click 单击（`detail>=2` 双击）。
+
+### 进度条预览
+
+- 拖动 / 悬停时进度条上方悬浮 `.progress-tip`：`mm:ss / mm:ss`，左右各留 6% 防出屏；
+- 拖动时 `video.pause()`，松手按 `wasPlaying` 恢复播放（原来拖动不暂停）；
+- `video.currentTime = start + ratio * span` 节流 **60ms**（`SEEK_THROTTLE_MS`），
+  松手补一次最终 seek；
+- `.progress-buffer` 按 `video.buffered` 高亮已缓冲区间（优先含当前时间的区间）；
+- 保留裁剪窗（`clip_start/clip_end`）语义；键盘 ←/→ 仍可 5s 微调；
+- `preload=none` 首次拖动仍临时升级 `metadata`，拿到 duration 后补 seek。
+
+### 自动连播
+
+- `state.autoplay` 默认开（`localStorage['douyin_autoplay']`，`'0'` 关），
+  topbar「连播：开/关」按钮切换；
+- 开连播时 `video.loop=false`（否则 `ended` 永不触发），关掉则单条循环；
+- `ended` / 裁剪到点 → `onSlideEnded`：1.2s 去重 → `goSlide(1)`；
+  已在最后一条 → toast「已到底，上滑刷新推荐流」+ 900ms 后 `loadFeed()`；
+- 连播切下一条保留音量/静音/倍速（`playOnly` + `renderFeed` 统一
+  `applySound` / `applyRate` / `applyAutoplay`）；
+- 新增「倍速：1× / 1.25× / 1.5× / 2×」按钮（`localStorage['douyin_rate']`），
+  长按只做临时 2×，松手回到该设置。
+
+### 验收
+
+- `bash app/douyin/build.sh` → 8 个二进制 ok，`-Werror -Wpedantic` 零告警；
+- `bash app/douyin/scripts/accept_player_cluster.sh` → **94 PASS / 0 FAIL**（8 组）：
+  关注流数据面（401 / 空 / 关注 3 条 / 取关）、手势绑定、进度预览、自动连播、
+  空白边界、内联 JS 括号平衡、TTFB、回归；
+- `accept_all.sh` → **70 PASS / 0 FAIL**；历史回归：内容三件套 79、
+  主页三 tab 115、社交三件套 89，全部 0 FAIL；
+- TTFB（20 次均值）：`GET /` **0.68 ms**、`/api/feed` **0.79 ms**、
+  `/api/feed/following` **1.04 ms**（阈值 200 ms），页面 203 KB；
+- 环境无 node/chromium：JS 语法用「抽取 `<script>` + 朴素 tokenizer 括号平衡」
+  校验（跳过字符串/注释/正则），已内置到验收脚本。
+
+### 踩坑记录
+
+- **`video.loop=true` 让 `ended` 永不触发**：自动连播必须先关 loop；
+- **长按后浏览器仍派发 click**：用 `suppressUntil` 吃掉，否则松手会误暂停；
+- **触屏没有 `dblclick`**：双击判定必须走 pointerup 时间差；
+- **进度条拖动 seek 风暴**：pointermove 每像素都 seek 会让解码器抖动，60ms 节流；
+- **括号检查的正则误判**：`/^https?:\/\//` 里的 `//` 会被当行注释，tokenizer
+  必须先判正则字面量，否则整页括号「不平衡」。
+
+## 十一、下一轮建议
+
+1. 举报运营后台：`reports.status` 只有 pending，缺列表 / 处理接口与页面。
+2. 服务端草稿：当前草稿只在 localStorage（换设备/清缓存即丢）；可加
    `drafts` 表 + 多端同步，File 本体仍由用户重选。
-4. 「待核实」剩余两项：WS Resume / 压缩——要么补实现，要么从已完成
+3. 「待核实」剩余两项：WS Resume / 压缩——要么补实现，要么从已完成
    清单里移除；@mention（第 6 轮）与草稿（第 7 轮）已落地。
-5. 落地页增强：评论回复折叠、作者其它作品、播放进度记忆；
+4. 落地页增强：评论回复折叠、作者其它作品、播放进度记忆；
    `og:image` 已支持 `cover_url`，可再加服务端自动截帧。
+5. 播放侧下一批：单条播放进度记忆（localStorage `douyin_pos_<id>`）、
+   关注流分页 / 下拉刷新、字幕开关与倍速音调补偿。

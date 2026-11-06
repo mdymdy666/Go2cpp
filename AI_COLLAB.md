@@ -1522,3 +1522,40 @@ latest（服务重启）→ `resume_gap`，客户端走 REST 全量刷新。
   - 幂等验收基数要取在第一次上传之后；
   - 迁移测试只重启 video_service，不能 `stop_all`（gateway 一起死 = 全 000）。
 - **状态**：已提交（本轮 commit）。
+
+## 2026-11-06 第 8 轮：播放体验三件套（手势增强 / 进度条预览 / 自动连播）
+
+- **需求**：真树 WSL `/UserData/CodexWorkSpace/Go2cpp`（非 `E:\CodexWorkspace\Go2Cpp`）；
+  一轮 2–3 个内联功能；接受标准 = 功能齐全、无明显 bug、2C4G 下 TTFB < 200 ms。
+- **范围**：仅前端 `app/douyin/include/douyin_home_page.hpp`，后端零改动；
+  「推荐 / 关注」复用 `GET /api/feed` 与 `GET /api/feed/following`。
+- **手势增强**：
+  - 单击播放/暂停延迟 250ms，双击（`pointerup` 280ms 双轻点）取消单击定时器；
+  - 长按 500ms → `playbackRate=2` + `.speed-badge` 角标，松手恢复所选倍速；
+  - 上下滑 `goSlide(±1)` + `scrollIntoView({behavior:'smooth'})`；
+    鼠标纵向拖 ≥70px 触发，触摸走原生 scroll-snap；
+  - 左右滑 / 点 tab 切「推荐 / 关注」，未登录只提示不切；
+  - `setPointerCapture` + `suppressUntil` 防止长按/滑动后误触 click。
+- **进度条预览**：
+  - `.progress-tip` 悬浮 `mm:ss / mm:ss`（拖动与悬停都显示）；
+  - `.progress-buffer` 读 `video.buffered` 高亮已缓冲区间；
+  - 拖动先 `pause()`，松手按 `wasPlaying` 恢复；seek 60ms 节流 + 末次补 seek。
+- **自动连播**：
+  - `douyin_autoplay` 默认开；开时 `video.loop=false` 否则 `ended` 不触发；
+  - `onSlideEnded` 1.2s 去重 → `goSlide(1)`；末条 toast「已到底，上滑刷新推荐流」
+    并 900ms 后 `loadFeed()`；
+  - `douyin_rate` 倍速（1/1.25/1.5/2×）+ 连播继承音量/静音/倍速。
+- **验证**：
+  - `bash app/douyin/build.sh` → 8 个二进制 ok，`-Werror -Wpedantic` 零告警；
+  - 新增 `scripts/accept_player_cluster.sh` → **94 PASS / 0 FAIL**；
+  - `accept_all.sh` 70 PASS / 0 FAIL；历史回归：内容三件套 79、主页三 tab 115、
+    社交三件套 89，全 0 FAIL；
+  - TTFB（20 次串行）：`GET /` 0.68 ms、`/api/feed` 0.79 ms、
+    `/api/feed/following` 1.04 ms（阈值 200 ms）。
+- **踩坑**：
+  - `video.loop=true` 时 `ended` 不触发，自动连播必须先关 loop；
+  - 触屏没有 `dblclick`，双击必须用 pointerup 时间差判定；
+  - 内联 JS 括号自检要把正则字面量（`/^https?:\/\//`）先剥离，否则 `//`
+    被当行注释导致误报；
+  - WSL 树仍不能直接 write/edit → 「Windows `.dsh_tmp` 落盘 + `wsl cp`」。
+- **状态**：已提交（本轮 commit）。

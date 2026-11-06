@@ -20,7 +20,13 @@
  *          - `IntersectionObserver`（阈值 0.6）只播放当前屏视频、暂停其它；
  *          - 底部进度条随 `timeupdate` 更新，pointer 拖动 seek 到 `pct * duration`；
  *          - 双击视频任意处点赞（`POST api/like`）+ 心形 keyframes 动画，
- *            已点赞只播动画不重复请求；单击挂起 240ms 以区分双击；
+ *            已点赞只播动画不重复请求；单击挂起 250ms 以区分双击；
+ *          - 长按 500ms 进入 2× 倍速（角标提示，松手回到所选倍速）；
+ *            鼠标纵向拖动 ≥70px 切上/下一条，横向拖动 ≥60px 切「推荐/关注」；
+ *          - 进度条支持 60ms 节流 seek、上方悬浮时间预览与 buffered 高亮，
+ *            松手后恢复原播放状态；
+ *          - 「推荐 / 关注」双 tab（`GET api/feed` / `GET api/feed/following`），
+ *            自动连播默认开：播完切下一条，到底提示并刷新推荐流；
  *          - `preload="none"` + 同名 `videos/<name>.jpg` 封面：首屏只拉缩略图，
  *            视频字节等真正播放/拖动时才加载；
  *          - 评论图标打开右侧抽屉，`GET api/comment/<id>?limit=50&sort=` 拉列表
@@ -140,6 +146,10 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     background: #000;
     scroll-snap-align: start;
     scroll-snap-stop: always;
+    /* 手势：纵向留给原生 scroll-snap，横向由 pointer 手势切 tab；
+       同时禁掉拖拽选中文字，避免鼠标上下拖时选到标题。 */
+    touch-action: pan-y;
+    user-select: none; -webkit-user-select: none;
   }
   /* 视频绝对定位铺满 slide：inset:0 + 宽高 100% 让视频随窗口同步缩放。
      默认 object-fit:contain（完整显示，必要时留黑边）；加 .cover 后为
@@ -192,6 +202,60 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
   }
   .progress:hover .progress-time, .progress.dragging .progress-time,
   .progress:focus-visible .progress-time { opacity: 1; }
+
+  /* ---------- 进度条：缓冲区间 + 悬浮时间预览（第 8 轮） ---------- */
+  /* 已缓冲区间用半透明白铺在 rail 上，位于 fill 之下，避免盖住已播进度。 */
+  .progress .progress-buffer {
+    position: absolute; left: 0; bottom: 0; height: 100%;
+    width: 0%; background: rgba(255, 255, 255, .34);
+    transition: width .12s linear;
+  }
+  /* 拖动 / 悬停时在进度条上方悬浮的时间气泡（mm:ss / mm:ss）。 */
+  .progress .progress-tip {
+    position: absolute; bottom: 26px; left: 0;
+    transform: translateX(-50%);
+    padding: 3px 9px; border-radius: 8px;
+    font-size: 12px; font-variant-numeric: tabular-nums;
+    color: #fff; background: rgba(0, 0, 0, .78);
+    border: 1px solid rgba(255, 255, 255, .16);
+    white-space: nowrap; pointer-events: none; opacity: 0;
+    transition: opacity .12s ease;
+  }
+  .progress.show-tip .progress-tip { opacity: 1; }
+  .progress.dragging .progress-tip { background: rgba(254, 44, 85, .92); }
+
+  /* ---------- 长按 2× 倍速角标（第 8 轮） ---------- */
+  .speed-badge {
+    position: absolute; z-index: 8; top: 96px; left: 50%;
+    transform: translateX(-50%) scale(.9);
+    padding: 5px 12px; border-radius: 999px;
+    font-size: 13px; font-weight: 800; letter-spacing: .5px;
+    color: #08080d; background: linear-gradient(92deg, var(--cyan), #9ff);
+    box-shadow: 0 4px 18px rgba(37, 244, 238, .35);
+    opacity: 0; pointer-events: none;
+    transition: opacity .16s ease, transform .16s ease;
+  }
+  .slide.speed-on .speed-badge { opacity: 1; transform: translateX(-50%) scale(1); }
+  .slide.speed-on .main-video { filter: brightness(1.06); }
+
+  /* ---------- 推荐 / 关注 双 tab（第 8 轮） ---------- */
+  .feed-tabs {
+    display: inline-flex; align-items: center; gap: 2px;
+    padding: 3px; border-radius: 999px;
+    background: rgba(20, 20, 28, .72);
+    border: 1px solid var(--line);
+  }
+  .feed-tab {
+    padding: 5px 14px; border-radius: 999px;
+    font-size: 13px; font-weight: 600; color: var(--muted);
+    background: transparent; transition: color .16s, background .16s;
+  }
+  .feed-tab:hover { color: var(--text); }
+  .feed-tab.on {
+    color: #08080d;
+    background: linear-gradient(92deg, var(--cyan), #fff 60%, var(--pink));
+  }
+  .feed-tab:focus-visible { outline: 2px solid rgba(37, 244, 238, .55); outline-offset: 1px; }
 
   /* ---------- 双击点赞的心形动画 ---------- */
   .heart-burst {
@@ -938,6 +1002,13 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
 <body>
 <header class="topbar" id="topbar">
   <div class="brand">Go2Cpp 抖音<small>FEED · PLAY · LIKE · COMMENT</small></div>
+
+  <nav class="feed-tabs" id="feedTabs" role="tablist" aria-label="推荐与关注">
+    <button class="feed-tab on" type="button" role="tab" aria-selected="true"
+            data-tab="recommend" id="tabRecommend">推荐</button>
+    <button class="feed-tab" type="button" role="tab" aria-selected="false"
+            data-tab="following" id="tabFollowing">关注</button>
+  </nav>
   <div class="nav-search">
     <input id="navSearch" type="search" placeholder="搜索用户 / 视频 / 话题"
            autocomplete="off" spellcheck="false">
@@ -955,6 +1026,10 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     <input class="login-only" id="password" type="password" value="123456"
            placeholder="密码" autocomplete="current-password">
     <button class="btn-primary login-only" id="loginBtn" type="button">登录</button>
+    <button class="btn-ghost" id="autoplayBtn" type="button"
+            title="自动连播：一条播完自动切下一条" aria-pressed="true">连播：开</button>
+    <button class="btn-ghost" id="rateBtn" type="button"
+            title="播放倍速（长按视频可临时 2×）">倍速：1×</button>
     <span class="vol" title="视频音量">
       <span id="volIcon">🔊</span>
       <input id="volumeSlider" type="range" min="0" max="100" value="100" aria-label="音量">
@@ -1193,6 +1268,9 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
   var MUTE_KEY = 'douyin_muted';
   var VOL_KEY = 'douyin_volume';
 
+  var AUTOPLAY_KEY = 'douyin_autoplay';
+  var RATE_KEY = 'douyin_rate';
+
   var state = {
     token: localStorage.getItem(TOKEN_KEY) || '',
     user: null,
@@ -1210,6 +1288,9 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     fit: 'contain',
     muted: true,
     volume: 1,
+    autoplay: true,
+    rate: 1,
+    feedTab: 'recommend',
     deepLink: ''
   };
   try {
@@ -1225,6 +1306,10 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
   state.muted = localStorage.getItem(MUTE_KEY) !== '0';
   var savedVol = Number(localStorage.getItem(VOL_KEY));
   state.volume = isFinite(savedVol) && savedVol >= 0 ? Math.min(savedVol, 1) : 1;
+
+  /* 自动连播默认开；关掉后单条循环。倍速持久化，长按只做临时 2×。 */
+  state.autoplay = localStorage.getItem(AUTOPLAY_KEY) !== '0';
+  state.rate = normalizeRate(Number(localStorage.getItem(RATE_KEY)) || 1);
   /* 直达链接：/v/<id> 或 ?video=<id> */
   var deepPath = location.pathname.match(/\/v\/(\d+)\/?$/);
   var deepQuery = '';
@@ -1493,6 +1578,140 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     return !!(target.closest('.rail') || target.closest('.meta') ||
               target.closest('button') || target.closest('.author-link') ||
               target.closest('.progress'));
+  }
+
+  /* ---------- 播放器手势（第 8 轮） ----------
+     单击暂停/播放：延迟 250ms 等双击，避免双击先触发暂停；
+     双击点赞：280ms 内两下轻点（鼠标与触摸都走 pointerup）；
+     长按 2×：500ms 未移动 → playbackRate=2 + 角标，松手恢复所选倍速；
+     上下滑：鼠标纵向拖动 ≥70px 切上/下一条（触摸用原生 scroll-snap）；
+     左右滑：横向拖动 ≥60px 切「推荐 / 关注」。 */
+  var TAP_DELAY_MS = 250;
+  var DOUBLE_TAP_MS = 280;
+  var LONG_PRESS_MS = 500;
+  var GESTURE_MOVE_PX = 8;
+  var SWIPE_X_PX = 60;
+  var SWIPE_Y_PX = 70;
+  var SEEK_THROTTLE_MS = 60;
+
+  function bindPlayerGestures(slide, video) {
+    var down = null;
+    var longTimer = 0;
+    var tapTimer = 0;
+    var longActive = false;
+    var lastTapAt = 0;
+    var suppressUntil = 0;
+
+    function clearLongTimer() {
+      if (longTimer) { clearTimeout(longTimer); longTimer = 0; }
+    }
+    function clearTapTimer() {
+      if (tapTimer) { clearTimeout(tapTimer); tapTimer = 0; }
+    }
+    function startLongPress() {
+      if (!down || longActive) return;
+      longActive = true;
+      slide.classList.add('speed-on');
+      if (video.paused) playOnly(video);
+      try { video.playbackRate = 2; } catch (e) {}
+    }
+    function stopLongPress() {
+      if (!longActive) return;
+      longActive = false;
+      slide.classList.remove('speed-on');
+      try { video.playbackRate = state.rate; } catch (e) {}
+    }
+    function cancelGesture() {
+      clearLongTimer();
+      stopLongPress();
+      down = null;
+    }
+
+    slide.addEventListener('pointerdown', function (e) {
+      if (e.pointerType === 'mouse' && e.button !== 0) return;
+      if (isUiTarget(e.target)) return;
+      down = { x: e.clientX, y: e.clientY, t: Date.now(),
+               type: e.pointerType || 'mouse' };
+      longActive = false;
+      clearLongTimer();
+      if (slide.setPointerCapture) {
+        try { slide.setPointerCapture(e.pointerId); } catch (err) {}
+      }
+      longTimer = setTimeout(function () {
+        longTimer = 0;
+        if (down) startLongPress();
+      }, LONG_PRESS_MS);
+    });
+
+    slide.addEventListener('pointermove', function (e) {
+      if (!down) return;
+      var dx = e.clientX - down.x;
+      var dy = e.clientY - down.y;
+      if (Math.abs(dx) > GESTURE_MOVE_PX || Math.abs(dy) > GESTURE_MOVE_PX) {
+        clearLongTimer();
+      }
+      down.dx = dx;
+      down.dy = dy;
+    });
+
+    slide.addEventListener('pointerup', function (e) {
+      if (!down) return;
+      var d = down;
+      down = null;
+      clearLongTimer();
+      if (longActive) {
+        /* 长按松手：恢复倍速，并吃掉这次 click，避免顺带暂停。 */
+        stopLongPress();
+        suppressUntil = Date.now() + 400;
+        return;
+      }
+      var dx = e.clientX - d.x;
+      var dy = e.clientY - d.y;
+      var now = Date.now();
+      /* 纵向拖动：鼠标按屏滑动切上/下一条；触摸交给原生滚动，不抢。 */
+      if (d.type === 'mouse' && Math.abs(dy) >= SWIPE_Y_PX &&
+          Math.abs(dy) > Math.abs(dx) * 1.2) {
+        suppressUntil = now + 400;
+        goSlide(dy < 0 ? 1 : -1);
+        return;
+      }
+      /* 横向拖动：推荐 ↔ 关注 */
+      if (Math.abs(dx) >= SWIPE_X_PX && Math.abs(dx) > Math.abs(dy) * 1.2) {
+        suppressUntil = now + 400;
+        stepFeedTab(dx < 0 ? 1 : -1);
+        return;
+      }
+      if (Math.abs(dx) > GESTURE_MOVE_PX || Math.abs(dy) > GESTURE_MOVE_PX) return;
+      /* 轻点：280ms 内第二下 = 双击点赞；否则 250ms 后切播放状态。 */
+      if (now - lastTapAt <= DOUBLE_TAP_MS) {
+        lastTapAt = 0;
+        clearTapTimer();
+        suppressUntil = now + 400;
+        doubleTapLike(slide, e);
+        return;
+      }
+      lastTapAt = now;
+      clearTapTimer();
+      tapTimer = setTimeout(function () {
+        tapTimer = 0;
+        if (Date.now() < suppressUntil) return;
+        togglePlay(slide);
+      }, TAP_DELAY_MS);
+    });
+
+    slide.addEventListener('pointercancel', cancelGesture);
+    slide.addEventListener('contextmenu', function (e) {
+      /* 移动端长按会弹系统菜单，挡住 2× 手势；UI 区域不拦。 */
+      if (!isUiTarget(e.target)) e.preventDefault();
+    });
+    /* 无 PointerEvent 的老浏览器：单击兜底，双击用 click 的 detail 判定。 */
+    if (!window.PointerEvent) {
+      slide.addEventListener('click', function (e) {
+        if (isUiTarget(e.target) || Date.now() < suppressUntil) return;
+        if (e.detail >= 2) { doubleTapLike(slide, e); return; }
+        togglePlay(slide);
+      });
+    }
   }
 
   /* ---------- 评论面板 ---------- */
@@ -2527,6 +2746,154 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
       .then(function () { btn.disabled = false; });
   }
 
+
+  /* ---------- 推荐 / 关注 双 tab（点击或左右滑切换） ---------- */
+
+  function paintFeedTabs() {
+    var tabs = document.querySelectorAll('.feed-tab');
+    for (var i = 0; i < tabs.length; ++i) {
+      var on = tabs[i].dataset.tab === state.feedTab;
+      tabs[i].classList.toggle('on', on);
+      tabs[i].setAttribute('aria-selected', on ? 'true' : 'false');
+    }
+  }
+
+  /* 切 tab 会重建整个 feed：先停掉旧视频并断开观察器，避免旧 slide continue。 */
+  function switchFeedTab(tab) {
+    var next = tab === 'following' ? 'following' : 'recommend';
+    if (next === state.feedTab) return false;
+    if (next === 'following' && !state.token) {
+      toast('请先登录，再查看关注流', 'err');
+      return false;
+    }
+    state.feedTab = next;
+    paintFeedTabs();
+    if (state.observer) { state.observer.disconnect(); state.observer = null; }
+    pauseAllVideos();
+    state.activeVideo = null;
+    loadFeed();
+    toast(next === 'following' ? '已切换到「关注」' : '已切换到「推荐」', 'ok');
+    return true;
+  }
+
+  /* 左右滑：推荐 ⇄ 关注；已经到头就只提示不重建 feed。 */
+  function stepFeedTab(delta) {
+    if (state.feedTab === 'recommend' && delta < 0) {
+      toast('已经在「推荐」');
+      return false;
+    }
+    if (state.feedTab === 'following' && delta > 0) {
+      toast('已经在「关注」');
+      return false;
+    }
+    return switchFeedTab(state.feedTab === 'recommend' ? 'following' : 'recommend');
+  }
+
+  /* ---------- 上下滑切换视频 ---------- */
+
+  /* 滚动容器按屏对齐：用 scrollIntoView({behavior:'smooth'}) 让浏览器做位移动画，
+     scroll-snap 保持每屏严格对齐。返回是否真的移动（自动连播靠它判断到底）。 */
+  function goSlide(delta) {
+    var slides = feedEl.querySelectorAll('.slide');
+    if (!slides.length) return false;
+    var height = feedEl.clientHeight || 1;
+    var index = Math.round(feedEl.scrollTop / height);
+    var next = Math.min(slides.length - 1, Math.max(0, index)) + delta;
+    if (next < 0) {
+      toast('已经是第一条');
+      return false;
+    }
+    if (next >= slides.length) return false;
+    var target = slides[next];
+    if (target.scrollIntoView) {
+      target.scrollIntoView({ block: 'start', behavior: 'smooth' });
+    } else {
+      feedEl.scrollTop = target.offsetTop;
+    }
+    return true;
+  }
+
+  /* 自动连播：一条播完切下一屏；已在末尾则提示并刷新推荐流。
+     同一屏 1.2s 内只处理一次，避免 ended 与裁剪到点的 pause 重复触发。 */
+  function onSlideEnded(slide, clipEnded) {
+    var video = slide.querySelector('video');
+    if (!video) return;
+    var now = Date.now();
+    if (slide.dataset.endedAt && now - Number(slide.dataset.endedAt) < 1200) return;
+    slide.dataset.endedAt = String(now);
+    if (!state.autoplay) {
+      /* 关连播：裁剪到点就停住；自然播完由 loop=true 单条循环。 */
+      if (!clipEnded) {
+        video.loop = true;
+        var p = video.play();
+        if (p && p.catch) p.catch(function () {});
+      }
+      return;
+    }
+    video.pause();
+    if (goSlide(1)) return;
+    toast('已到底，上滑刷新推荐流');
+    setTimeout(function () { loadFeed(); }, 900);
+  }
+
+  /* ---------- 倍速 / 自动连播设置（localStorage 持久化） ---------- */
+
+  var RATE_STEPS = [1, 1.25, 1.5, 2];
+
+  function rateLabel(rate) {
+    return String(Math.round(rate * 100) / 100) + '×';
+  }
+
+  function normalizeRate(rate) {
+    var n = Number(rate);
+    if (!isFinite(n) || n < 0.5) return 1;
+    return n > 2 ? 2 : n;
+  }
+
+  /* 把所选倍速套到所有视频；正在长按 2× 的那条跳过（松手时会再套一次）。 */
+  function applyRate() {
+    feedEl.querySelectorAll('video').forEach(function (v) {
+      var slide = v.closest ? v.closest('.slide') : null;
+      if (slide && slide.classList.contains('speed-on')) return;
+      try { v.playbackRate = state.rate; } catch (e) {}
+    });
+    var btn = document.getElementById('rateBtn');
+    if (btn) {
+      btn.textContent = '倍速：' + rateLabel(state.rate);
+      btn.setAttribute('aria-pressed', state.rate === 1 ? 'false' : 'true');
+    }
+  }
+
+  function setRate(rate) {
+    state.rate = normalizeRate(rate);
+    try { localStorage.setItem(RATE_KEY, String(state.rate)); } catch (e) {}
+    applyRate();
+    toast('倍速：' + rateLabel(state.rate));
+  }
+
+  function cycleRate() {
+    var i = RATE_STEPS.indexOf(state.rate);
+    setRate(RATE_STEPS[(i + 1) % RATE_STEPS.length]);
+  }
+
+  /* 连播开 → loop=false（否则 ended 永远不触发）；关 → 单条无限循环。 */
+  function applyAutoplay() {
+    feedEl.querySelectorAll('video').forEach(function (v) {
+      v.loop = !state.autoplay;
+    });
+    var btn = document.getElementById('autoplayBtn');
+    if (btn) {
+      btn.textContent = '连播：' + (state.autoplay ? '开' : '关');
+      btn.setAttribute('aria-pressed', state.autoplay ? 'true' : 'false');
+    }
+  }
+
+  function setAutoplay(on) {
+    state.autoplay = !!on;
+    try { localStorage.setItem(AUTOPLAY_KEY, state.autoplay ? '1' : '0'); } catch (e) {}
+    applyAutoplay();
+    toast(state.autoplay ? '已开启自动连播' : '已关闭自动连播（单条循环）');
+  }
   /* ---------- 播放控制 ---------- */
 
   function pauseAllVideos() {
@@ -2537,6 +2904,13 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     feedEl.querySelectorAll('video').forEach(function (v) {
       if (v !== video) v.pause();
     });
+    /* 连播切到新一条时，音量/静音/倍速沿用全局设置。 */
+    video.muted = state.muted;
+    video.volume = state.volume;
+    var onSlide = video.closest ? video.closest('.slide') : null;
+    if (!onSlide || !onSlide.classList.contains('speed-on')) {
+      try { video.playbackRate = state.rate; } catch (e) {}
+    }
     var start = Number(video.dataset.clipStart || 0);
     var end = Number(video.dataset.clipEnd || 0);
     if (start > 0 || end > start) {
@@ -2608,6 +2982,9 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
       author: (state.user && (state.user.name || state.user.email)) ||
               ('user' + (video.user_id || ''))
     };
+    /* 上传成功回到推荐流，避免在关注 tab 里看不到自己的新作品。 */
+    state.feedTab = 'recommend';
+    paintFeedTabs();
     state.items.unshift(item);
     feedEl.innerHTML = '';
     var frag = document.createDocumentFragment();
@@ -2695,8 +3072,9 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     return m + ':' + (s < 10 ? '0' + s : s);
   }
 
-  /* 进度条：timeupdate 驱动填充；pointer 拖动 seek 到 pct*duration。
-     preload=none 时首次拖动会临时升级到 metadata，拿到 duration 后补一次 seek。 */
+  /* 进度条：timeupdate 驱动填充；pointer 拖动 seek（60ms 节流）；
+     拖动时暂停并在松手后恢复播放；上方悬浮显示 mm:ss / mm:ss；
+     rail 里半透明层显示 video.buffered 已缓冲区间。 */
   function buildProgress(slide, video) {
     var bar = document.createElement('div');
     bar.className = 'progress';
@@ -2706,14 +3084,22 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     bar.setAttribute('aria-valuemin', '0');
     bar.setAttribute('aria-valuemax', '100');
     bar.setAttribute('aria-valuenow', '0');
-    bar.innerHTML = '<div class="progress-rail"><div class="progress-fill"></div></div>' +
+    bar.innerHTML = '<div class="progress-rail"><div class="progress-buffer"></div>' +
+                    '<div class="progress-fill"></div></div>' +
                     '<div class="progress-thumb"></div>' +
+                    '<span class="progress-tip" aria-hidden="true">0:00 / 0:00</span>' +
                     '<span class="progress-time">0:00 / 0:00</span>';
     var fill = bar.querySelector('.progress-fill');
+    var buffer = bar.querySelector('.progress-buffer');
     var thumb = bar.querySelector('.progress-thumb');
+    var tip = bar.querySelector('.progress-tip');
     var time = bar.querySelector('.progress-time');
     var dragging = false;
+    var wasPlaying = false;
     var pendingRatio = null;
+    var pendingSeekRatio = null;
+    var seekTimer = 0;
+    var lastSeekAt = 0;
 
     /* 完整时长（裁剪前）；0 表示 metadata 还没到。 */
     function fullDuration() {
@@ -2754,10 +3140,51 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
                        fmtClock(pos - w.start) + ' / ' + fmtClock(d));
     }
 
+    /* 缓冲区间：优先取包含当前播放位置的那一段，否则取最大末端。 */
+    function paintBuffer() {
+      var w = clipWindow();
+      var d = duration();
+      if (d <= 0) { buffer.style.width = '0%'; return; }
+      var end = 0;
+      var ranges = video.buffered;
+      if (ranges && ranges.length) {
+        for (var i = 0; i < ranges.length; ++i) {
+          if (ranges.start(i) <= video.currentTime + 0.05 &&
+              ranges.end(i) >= video.currentTime - 0.05) {
+            end = ranges.end(i);
+            break;
+          }
+          if (ranges.end(i) > end) end = ranges.end(i);
+        }
+      }
+      var pct = (Math.min(w.end, Math.max(w.start, end)) - w.start) / d;
+      buffer.style.width = (Math.min(1, Math.max(0, pct)) * 100).toFixed(2) + '%';
+    }
+
     function ratioOf(event) {
       var rect = bar.getBoundingClientRect();
       if (rect.width <= 0) return 0;
       return Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width));
+    }
+
+    /* 悬浮时间气泡：贴着拖动点，左右各留 6% 防出屏。 */
+    function paintTip(ratio) {
+      var d = duration();
+      tip.textContent = fmtClock(d > 0 ? ratio * d : 0) + ' / ' + fmtClock(d);
+      tip.style.left = (Math.min(94, Math.max(6, ratio * 100))).toFixed(2) + '%';
+      bar.classList.add('show-tip');
+    }
+
+    function hideTip() {
+      bar.classList.remove('show-tip');
+    }
+
+    function paintPreview(ratio) {
+      fill.style.width = (ratio * 100).toFixed(2) + '%';
+      thumb.style.left = (ratio * 100).toFixed(2) + '%';
+      var d = duration();
+      time.textContent = fmtClock(d > 0 ? ratio * d : 0) + ' / ' + fmtClock(d);
+      paintTip(ratio);
     }
 
     function seekToRatio(ratio) {
@@ -2769,27 +3196,52 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
       paintPreview(ratio);
     }
 
-    function paintPreview(ratio) {
-      fill.style.width = (ratio * 100).toFixed(2) + '%';
-      thumb.style.left = (ratio * 100).toFixed(2) + '%';
-      var d = duration();
-      time.textContent = fmtClock(d > 0 ? ratio * d : 0) + ' / ' + fmtClock(d);
+    /* 拖动 seek 节流 60ms：pointermove 高频触发，减少解码器 seek 抖动。 */
+    function scheduleSeek(ratio) {
+      var now = Date.now();
+      pendingSeekRatio = ratio;
+      if (now - lastSeekAt >= SEEK_THROTTLE_MS) {
+        lastSeekAt = now;
+        seekToRatio(ratio);
+        return;
+      }
+      if (seekTimer) return;
+      seekTimer = setTimeout(function () {
+        seekTimer = 0;
+        if (pendingSeekRatio === null) return;
+        lastSeekAt = Date.now();
+        seekToRatio(pendingSeekRatio);
+      }, Math.max(0, SEEK_THROTTLE_MS - (now - lastSeekAt)));
     }
 
     function endDrag(event) {
       if (!dragging) return;
       dragging = false;
       bar.classList.remove('dragging');
+      hideTip();
+      if (seekTimer) { clearTimeout(seekTimer); seekTimer = 0; }
+      if (pendingSeekRatio !== null) {
+        seekToRatio(pendingSeekRatio);
+        pendingSeekRatio = null;
+      }
       if (event && bar.hasPointerCapture && bar.hasPointerCapture(event.pointerId)) {
         bar.releasePointerCapture(event.pointerId);
       }
       paint();
+      /* 原来在播就继续播；原来暂停就保持暂停。 */
+      if (wasPlaying) {
+        var p = video.play();
+        if (p && p.catch) p.catch(function () {});
+      }
+      wasPlaying = false;
     }
 
     bar.addEventListener('pointerdown', function (event) {
       event.preventDefault();
       event.stopPropagation();
       dragging = true;
+      wasPlaying = !video.paused && !video.ended;
+      if (wasPlaying) video.pause();
       bar.classList.add('dragging');
       if (bar.setPointerCapture) {
         try { bar.setPointerCapture(event.pointerId); } catch (e) {}
@@ -2798,15 +3250,22 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
         video.preload = 'metadata';
         video.load();
       }
-      seekToRatio(ratioOf(event));
+      scheduleSeek(ratioOf(event));
     });
     bar.addEventListener('pointermove', function (event) {
-      if (!dragging) return;
+      var ratio = ratioOf(event);
+      if (!dragging) {
+        paintTip(ratio);   /* 悬停也显示时间预览 */
+        return;
+      }
       event.preventDefault();
-      seekToRatio(ratioOf(event));
+      scheduleSeek(ratio);
     });
     bar.addEventListener('pointerup', endDrag);
     bar.addEventListener('pointercancel', endDrag);
+    bar.addEventListener('pointerleave', function () {
+      if (!dragging) hideTip();
+    });
     bar.addEventListener('click', function (event) { event.stopPropagation(); });
     bar.addEventListener('dblclick', function (event) { event.stopPropagation(); });
     bar.addEventListener('keydown', function (event) {
@@ -2819,26 +3278,34 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
         var next = video.currentTime + (event.key === 'ArrowRight' ? 5 : -5);
         video.currentTime = Math.min(w.end, Math.max(w.start, next));
         paint();
+        paintBuffer();
       }
     });
     video.addEventListener('loadedmetadata', function () {
       if (pendingRatio !== null) seekToRatio(pendingRatio);
       paint();
+      paintBuffer();
     });
-    video.addEventListener('durationchange', paint);
+    video.addEventListener('durationchange', function () { paint(); paintBuffer(); });
+    video.addEventListener('progress', paintBuffer);
     video.addEventListener('timeupdate', function () {
       var w = clipWindow();
       if (w.full > 0 && w.end > w.start && video.currentTime >= w.end - 0.02) {
         video.pause();
         video.currentTime = w.end;
         paint();
+        /* 裁剪到点等同播完：交给自动连播决定切下一条还是停住。 */
+        onSlideEnded(slide, true);
         return;
       }
-      if (!dragging) paint();
+      if (!dragging) { paint(); paintBuffer(); }
     });
-    video.addEventListener('seeked', function () { if (!dragging) paint(); });
-    video.addEventListener('emptied', paint);
+    video.addEventListener('seeked', function () {
+      if (!dragging) { paint(); paintBuffer(); }
+    });
+    video.addEventListener('emptied', function () { paint(); paintBuffer(); });
     paint();
+    paintBuffer();
     return bar;
   }
 
@@ -2861,7 +3328,9 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     video.src = videoSrc(v);
     video.muted = state.muted;
     video.volume = state.volume;
-    video.loop = true;
+    /* 自动连播开时必须 loop=false，否则 ended 不触发；关时单条循环。 */
+    video.loop = !state.autoplay;
+    try { video.playbackRate = state.rate; } catch (e) {}
     video.playsInline = true;
     /* 首屏不预加载视频本体：只拉同名封面 jpg，真正字节等 play()/拖动时才请求。 */
     video.preload = 'none';
@@ -2884,6 +3353,11 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     var hint = document.createElement('div');
     hint.className = 'pause-hint';
     hint.innerHTML = '<i>▶</i>';
+
+    var speedBadge = document.createElement('span');
+    speedBadge.className = 'speed-badge';
+    speedBadge.textContent = '2× 倍速';
+    speedBadge.setAttribute('aria-hidden', 'true');
 
     var meta = document.createElement('div');
     meta.className = 'meta';
@@ -3036,30 +3510,22 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
       slide.classList.remove('playing');
       if (state.activeVideo === video) state.activeVideo = null;
     });
-    video.addEventListener('ended', function () { slide.classList.remove('playing'); });
+    video.addEventListener('ended', function () {
+      slide.classList.remove('playing');
+      onSlideEnded(slide, false);
+    });
     video.addEventListener('error', function () {
       slide.classList.remove('playing');
       toast('视频加载失败，检查 /videos 静态路由', 'err');
     });
 
-    /* 单击 = 暂停/播放，双击 = 点赞：单击先挂起 240ms，等第二下不来再执行，
-       否则双击会先暂停再播放（画面闪一下）并多走一次播放切换。 */
-    var tapTimer = 0;
-    slide.addEventListener('click', function (e) {
-      if (isUiTarget(e.target)) return;
-      clearTimeout(tapTimer);
-      tapTimer = setTimeout(function () { tapTimer = 0; togglePlay(slide); }, 240);
-    });
-    slide.addEventListener('dblclick', function (e) {
-      if (isUiTarget(e.target)) return;
-      clearTimeout(tapTimer);
-      tapTimer = 0;
-      doubleTapLike(slide, e);
-    });
+    /* 单击 / 双击 / 长按 / 上下滑 / 左右滑统一交给 bindPlayerGestures。 */
+    bindPlayerGestures(slide, video);
 
     slide.appendChild(video);
     slide.appendChild(shade);
     slide.appendChild(hint);
+    slide.appendChild(speedBadge);
     slide.appendChild(meta);
     slide.appendChild(rail);
     slide.appendChild(buildProgress(slide, video));
@@ -3102,17 +3568,33 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     feedEl.scrollTop = 0;
     setupObserver();
     applySound();
+    applyRate();
+    applyAutoplay();
+  }
+
+  /* 当前 tab：推荐 / 关注。关注流要 Bearer，未登录时由 switchFeedTab 拦下；
+     请求期间又切了 tab 的话，旧响应直接丢弃（state.feedTab !== tab）。 */
+  function feedPath() {
+    return state.feedTab === 'following'
+      ? 'api/feed/following?limit=20'
+      : 'api/feed?limit=20';
   }
 
   function loadFeed() {
+    var tab = state.feedTab;
     showSkeleton();
-    api('api/feed?limit=20')
+    api(feedPath())
       .then(function (data) {
+        if (state.feedTab !== tab) return;
         var items = data.items || [];
         state.items = items;
         if (!items.length) {
           feedEl.innerHTML = '';
-          showNotice('还没有视频，先跑 scripts/seed_bulk.sh 灌数据', true);
+          if (tab === 'following') {
+            showNotice('关注的人还没有作品；去推荐流点作者名旁的「+ 关注」', true);
+          } else {
+            showNotice('还没有视频，先跑 scripts/seed_bulk.sh 灌数据', true);
+          }
           return;
         }
         renderFeed();
@@ -3122,10 +3604,17 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
         }
       })
       .catch(function (err) {
+        if (state.feedTab !== tab) return;
+        if (tab === 'following' && err && (err.status === 401 || err.status === 403)) {
+          state.feedTab = 'recommend';
+          paintFeedTabs();
+          toast('登录后才能看关注流，已切回推荐', 'err');
+          loadFeed();
+          return;
+        }
         showNotice('feed 加载失败：' + (err.message || '网络错误'), true);
       });
   }
-
   /* ---------- 搜索结果页：用户 / 视频 / 话题三组结果 ---------- */
 
   function searchTabName(tab) {
@@ -4846,7 +5335,19 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
   if (state.token && state.user) {
     setSignedIn(state.user);
   }
+  document.getElementById('feedTabs').addEventListener('click', function (e) {
+    var btn = e.target && e.target.closest ? e.target.closest('.feed-tab') : null;
+    if (!btn) return;
+    switchFeedTab(btn.dataset.tab);
+  });
+  document.getElementById('autoplayBtn').addEventListener('click', function () {
+    setAutoplay(!state.autoplay);
+  });
+  document.getElementById('rateBtn').addEventListener('click', cycleRate);
+  paintFeedTabs();
   applySound();
+  applyRate();
+  applyAutoplay();
   loadFeed();
   (function () {
     var m = /^#tag=(.+)$/.exec(location.hash || '');
