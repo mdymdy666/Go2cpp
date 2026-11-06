@@ -13,6 +13,7 @@
 #include "go2cpp/storage/orm.hpp"
 
 #include <algorithm>
+#include <unordered_map>
 #include <chrono>
 #include <cstdlib>
 #include <ctime>
@@ -245,7 +246,13 @@ constexpr const char* kSchemaSql =
     "  UNIQUE(user_id, video_id)"
     ");"
     "CREATE INDEX IF NOT EXISTS idx_favorites_user "
-    "ON favorites(user_id, created_at DESC);";
+    "ON favorites(user_id, created_at DESC);"
+    "CREATE TABLE IF NOT EXISTS comment_likes ("
+    "  comment_id INTEGER NOT NULL,"
+    "  user_id INTEGER NOT NULL,"
+    "  created_at INTEGER NOT NULL,"
+    "  PRIMARY KEY (comment_id, user_id)"
+    ");";
 
 /// @brief 把 `Error` 写成可读文本。
 std::string DescribeError(const go2cpp::storage::Error& error) {
@@ -1305,6 +1312,128 @@ bool Store::UpdateVideoCounts(std::int64_t video_id, std::string* error) {
             *error = "计数事务提交失败: " + commit_error.ToString();
         }
         return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// 评论点赞：comment_likes（主键即幂等键，计数用 GROUP BY 批量算）
+// ---------------------------------------------------------------------------
+
+int Store::LikeComment(std::int64_t comment_id, std::int64_t user_id,
+                       std::string* error) {
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return -1;
+    }
+    // step1: INSERT OR IGNORE —— 主键冲突说明已经点过，changes=0 即幂等命中。
+    auto inserted = m_db->Exec(
+        "INSERT OR IGNORE INTO comment_likes(comment_id, user_id, created_at)"
+        " VALUES(?, ?, ?)",
+        comment_id, user_id, static_cast<std::int64_t>(std::time(nullptr)));
+    if (!inserted) {
+        if (error != nullptr) {
+            *error = "评论点赞失败: " + DescribeError(inserted.Err());
+        }
+        return -1;
+    }
+    return inserted.Value().changes > 0 ? 1 : 0;
+}
+
+bool Store::UnlikeComment(std::int64_t comment_id, std::int64_t user_id,
+                          std::string* error) {
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return false;
+    }
+    auto deleted = m_db->Exec(
+        "DELETE FROM comment_likes WHERE comment_id = ? AND user_id = ?",
+        comment_id, user_id);
+    if (!deleted) {
+        if (error != nullptr) {
+            *error = "取消评论点赞失败: " + DescribeError(deleted.Err());
+        }
+        return false;
+    }
+    return true;
+}
+
+bool Store::FillCommentLikes(std::int64_t viewer_id,
+                             std::vector<StoredComment>* comments,
+                             std::string* error) {
+    // step1: 空页直接返回——不产生任何 SQL，也不当作错误。
+    if (comments == nullptr || comments->empty()) {
+        return true;
+    }
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return false;
+    }
+    // step2: 拼 IN 列表。元素全是库内自增 id，无用户输入，不存在注入面；
+    //        一条 GROUP BY 拿到整页计数，避免 N+1。
+    std::string ids;
+    ids.reserve(comments->size() * 8);
+    for (std::size_t i = 0; i < comments->size(); ++i) {
+        if (i != 0) {
+            ids += ',';
+        }
+        ids += std::to_string((*comments)[i].id);
+    }
+    std::unordered_map<std::int64_t, std::int64_t> counts;
+    {
+        auto rows = m_db->Query(
+            "SELECT comment_id, COUNT(*) FROM comment_likes WHERE comment_id IN (" +
+            ids + ") GROUP BY comment_id");
+        if (!rows) {
+            if (error != nullptr) {
+                *error = "统计评论点赞失败: " + DescribeError(rows.Err());
+            }
+            return false;
+        }
+        while (rows.Value().Next()) {
+            counts[rows.Value().Int64(0)] = rows.Value().Int64(1);
+        }
+        if (rows.Value().Err()) {
+            if (error != nullptr) {
+                *error = "遍历评论点赞失败: " + DescribeError(rows.Value().Err());
+            }
+            return false;
+        }
+    }
+    // step3: 查看者已赞集合——匿名（viewer<=0）跳过这条 SQL。
+    std::unordered_map<std::int64_t, bool> liked;
+    if (viewer_id > 0) {
+        auto rows = m_db->Query(
+            "SELECT comment_id FROM comment_likes WHERE user_id = ?"
+            " AND comment_id IN (" + ids + ")",
+            viewer_id);
+        if (!rows) {
+            if (error != nullptr) {
+                *error = "查询已赞评论失败: " + DescribeError(rows.Err());
+            }
+            return false;
+        }
+        while (rows.Value().Next()) {
+            liked[rows.Value().Int64(0)] = true;
+        }
+        if (rows.Value().Err()) {
+            if (error != nullptr) {
+                *error = "遍历已赞评论失败: " + DescribeError(rows.Value().Err());
+            }
+            return false;
+        }
+    }
+    // step4: 回填；没有记录的评论保持 0 赞 / 未赞。
+    for (auto& comment : *comments) {
+        const auto count_it = counts.find(comment.id);
+        comment.like_count = count_it == counts.end() ? 0 : count_it->second;
+        comment.liked = viewer_id > 0 && liked.find(comment.id) != liked.end();
     }
     return true;
 }

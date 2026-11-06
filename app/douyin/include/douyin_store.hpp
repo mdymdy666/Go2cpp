@@ -77,6 +77,8 @@ struct StoredComment {
     std::string content;         ///< 正文（1~500 字，由 service 校验）。
     std::int64_t created_at{0};  ///< Unix 秒。
     std::int64_t parent_id{0};   ///< 二级回复的父评论 id；0=顶层评论。
+    std::int64_t like_count{0};  ///< 评论点赞数；由 `FillCommentLikes` 回填。
+    bool liked{false};           ///< 当前查看者是否点过赞；匿名查看恒为 false。
 };
 
 /**
@@ -445,6 +447,58 @@ class Store {
      * @note 单事务内完成，供点赞/评论/取消赞后调用。
      */
     bool UpdateVideoCounts(std::int64_t video_id, std::string* error);
+
+    // ---- 评论点赞：comment_likes（只加不改既有） ----
+
+    /**
+     * @brief 给评论点赞（幂等：`INSERT OR IGNORE`，主键 `(comment_id,user_id)`）。
+     *
+     * @param comment_id [in] 评论 id；调用方**必须**先确认评论存在。
+     * @param user_id [in] 点赞者 id（登录用户）。
+     * @param error [out] 失败时写错误文本；成功时保持原值。
+     * @return
+     * - 1：本次新插入（前端应显示已点赞）；
+     * - 0：已经点过（幂等，计数不变）；
+     * - -1：数据库错误——调用方**必须**回 500，不要翻转前端状态。
+     *
+     * ## 定位
+     * 评论点赞的唯一提交点；错了会怎样：重复行把计数算成 2 次，
+     * 或按钮状态与库里相反。
+     */
+    int LikeComment(std::int64_t comment_id, std::int64_t user_id,
+                    std::string* error);
+
+    /**
+     * @brief 取消评论点赞（幂等：没点过也不报错）。
+     * @param comment_id [in] 评论 id。
+     * @param user_id [in] 点赞者 id。
+     * @param error [out] 失败时写错误文本；成功时保持原值。
+     * @return 成功返回 true（含「本来就没点」）。
+     */
+    bool UnlikeComment(std::int64_t comment_id, std::int64_t user_id,
+                       std::string* error);
+
+    /**
+     * @brief 批量回填评论的 `like_count` 与 `liked`（两条 SQL 覆盖整页）。
+     *
+     * @param viewer_id [in] 当前查看者 id；<=0 表示匿名（`liked` 全 false）。
+     * @param comments [in,out] 评论列表，不可为 nullptr；进入时读 `id`，
+     *        返回时写 `like_count`/`liked`。空列表直接返回 true。
+     * @param error [out] 失败时写错误文本；成功时保持原值。
+     * @return 成功返回 true；失败时 `comments` 里已写入的值未定义。
+     *
+     * ## 定位
+     * 评论列表的**唯一**批量计数入口。逐条查会变成 N+1（一页 50 条 =
+     * 100 次往返），这里固定 2 条 SQL（`GROUP BY` 计数 + 查看者已赞集合）。
+     * 错了会怎样：前端每条评论显示 0 赞 / 点赞状态错乱。
+     *
+     * ## 性能
+     * `comment_likes` 主键前缀 `comment_id` 命中索引；IN 列表长度等于本页
+     * 评论数（<=100），SQL 文本只含整数，不拼接用户输入。
+     */
+    bool FillCommentLikes(std::int64_t viewer_id,
+                          std::vector<StoredComment>* comments,
+                          std::string* error);
 
     // ---- C6 搜索：name/title 包含匹配（大小写不敏感） ----
 

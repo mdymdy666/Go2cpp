@@ -104,6 +104,26 @@ bool RequireToken(const douyin::HttpRequest& request, douyin::HttpResponse* resp
     return true;
 }
 
+/**
+ * @brief 尝试解析可选的 Bearer token，用于「当前查看者」相关字段。
+ * @param request [in] 原始请求；Authorization 头可为空。
+ * @return 有效 token 的 user_id；无 token / 签名非法 / 过期一律返回 0（匿名）。
+ * @note 评论列表是公开接口，token 无效**不应**回 401，否则匿名与过期用户
+ *       连评论都看不到；这里只影响 `liked` 字段。
+ */
+std::int64_t ViewerId(const douyin::HttpRequest& request) {
+    const std::string token = douyin::BearerToken(request);
+    if (token.empty()) {
+        return 0;
+    }
+    douyin::TokenInfo info;
+    std::string error;
+    if (!douyin::VerifyToken(token, NowSeconds(), &info, &error)) {
+        return 0;
+    }
+    return info.user_id;
+}
+
 /// @brief 解析 `limit`：缺省 20，夹紧到 [1,100]；非数字按缺省处理。
 std::int64_t ParseLimit(const douyin::HttpRequest& request) {
     const std::string text = douyin::QueryParam(request, "limit");
@@ -183,6 +203,41 @@ bool ParseVideoPath(const std::string& path, std::int64_t* id) {
     return *id > 0;
 }
 
+/**
+ * @brief 从 `/api/comment/<id>/like` 解析评论 id。
+ * @param path [in] 请求路径。
+ * @param id [out] 成功时写评论 id（>0）；失败时保持原值。
+ * @return 路径形态匹配且 id 为纯数字时返回 true；否则 false。
+ * @note 与 `ParseVideoPath` 分开：后者会把 `<id>/like` 判为非法，
+ *       所以路由必须先测本函数再测 `ParseVideoPath`。
+ */
+bool ParseCommentLikePath(const std::string& path, std::int64_t* id) {
+    constexpr std::string_view kPrefix = "/api/comment/";
+    constexpr std::string_view kSuffix = "/like";
+    if (path.size() <= kPrefix.size() + kSuffix.size()) {
+        return false;
+    }
+    if (path.compare(0, kPrefix.size(), kPrefix.data(), kPrefix.size()) != 0) {
+        return false;
+    }
+    if (path.compare(path.size() - kSuffix.size(), kSuffix.size(),
+                     kSuffix.data(), kSuffix.size()) != 0) {
+        return false;
+    }
+    const std::string rest =
+        path.substr(kPrefix.size(), path.size() - kPrefix.size() - kSuffix.size());
+    if (rest.empty() || rest.size() > 18) {
+        return false;
+    }
+    for (const char c : rest) {
+        if (c < '0' || c > '9') {
+            return false;
+        }
+    }
+    *id = std::atoll(rest.c_str());
+    return *id > 0;
+}
+
 /// @brief UTF-8 码点个数（按首字节计；非法字节各算一个）。
 std::size_t Utf8Length(const std::string& text) {
     std::size_t count = 0;
@@ -213,6 +268,8 @@ douyin::Comment PublicComment(const douyin::StoredComment& stored) {
     comment.content = stored.content;
     comment.created_at = stored.created_at;
     comment.parent_id = stored.parent_id;
+    comment.like_count = stored.like_count;
+    comment.liked = stored.liked;
     return comment;
 }
 
@@ -422,6 +479,34 @@ bool HandleComments(douyin::Store& store, const douyin::HttpRequest& request,
         return Fail(response, 500, "数据库错误");
     }
 
+    // 评论点赞：先把各顶层评论的回复收进扁平数组并记录区间，再对
+    // comments / all_replies 各做一次批量回填（固定 4 条 SQL，不随页大小增长）。
+    std::vector<std::pair<std::size_t, std::size_t>> spans;
+    std::vector<douyin::StoredComment> all_replies;
+    spans.reserve(comments.size());
+    for (std::size_t i = 0; i < comments.size(); ++i) {
+        std::vector<douyin::StoredComment> replies;
+        if (!store.ListReplies(video_id, comments[i].id, 50, &replies, &error)) {
+            std::fprintf(stderr, "[%s] 查询回复失败: %s\n", kServiceName,
+                         error.c_str());
+            replies.clear();
+        }
+        const std::size_t begin = all_replies.size();
+        for (auto& reply : replies) {
+            all_replies.push_back(std::move(reply));
+        }
+        spans.emplace_back(begin, all_replies.size());
+    }
+    // 回填失败只记日志、不阻断：点赞数缺失不该让整页评论 500。
+    const std::int64_t viewer = ViewerId(request);
+    if (!store.FillCommentLikes(viewer, &comments, &error)) {
+        std::fprintf(stderr, "[%s] 回填评论点赞失败: %s\n", kServiceName,
+                     error.c_str());
+    } else if (!store.FillCommentLikes(viewer, &all_replies, &error)) {
+        std::fprintf(stderr, "[%s] 回填回复点赞失败: %s\n", kServiceName,
+                     error.c_str());
+    }
+
     std::string body = "{\"ok\":true,\"items\":[";
     for (std::size_t i = 0; i < comments.size(); ++i) {
         if (i != 0) {
@@ -429,25 +514,89 @@ bool HandleComments(douyin::Store& store, const douyin::HttpRequest& request,
         }
         body += "{\"comment\":" +
                 douyin::ToJson(PublicComment(comments[i]));
-        // 二级回复：每条顶层评论附前 50 条回复，前端负责折叠/展开。
-        std::vector<douyin::StoredComment> replies;
-        if (!store.ListReplies(video_id, comments[i].id, 50, &replies, &error)) {
-            std::fprintf(stderr, "[%s] 查询回复失败: %s\n", kServiceName,
-                         error.c_str());
-            replies.clear();
-        }
         body += ",\"replies\":[";
-        for (std::size_t j = 0; j < replies.size(); ++j) {
-            if (j != 0) {
+        const std::size_t end = i < spans.size() ? spans[i].second : 0;
+        std::size_t j = i < spans.size() ? spans[i].first : 0;
+        bool first = true;
+        for (; j < end; ++j) {
+            if (!first) {
                 body += ',';
             }
-            body += douyin::ToJson(PublicComment(replies[j]));
+            first = false;
+            body += douyin::ToJson(PublicComment(all_replies[j]));
         }
         body += "]}";
     }
     body += "],\"next_cursor\":\"" + douyin::JsonEscape(next_cursor) + "\"}";
     response->status = 200;
     response->body = std::move(body);
+    return true;
+}
+
+/**
+ * @brief 评论点赞 / 取消点赞（幂等）。
+ *
+ * @param store [in,out] 已打开的存储；借用，生命周期由 main 持有。
+ * @param request [in] 原始请求；必须带有效 Bearer token。
+ * @param comment_id [in] 目标评论 id（>0），由 `ParseCommentLikePath` 解析。
+ * @param like [in] true=点赞，false=取消点赞。
+ * @param response [out] 成功写 `{"ok":true,"liked":bool,"like_count":N}`；
+ *        失败写统一错误体。不可为 nullptr。
+ * @return 恒为 true（表示已处理）；路由层据此区分「未命中」。
+ *
+ * ## 定位
+ * 评论点赞的唯一入口。错了会怎样：计数与按钮状态不一致，或重复点赞把
+ * 计数刷高。
+ *
+ * ## 步骤
+ * step1. 校验 token；失败直接 401（评论点赞必须登录）。
+ * step2. 确认评论存在；不存在 404，数据库错误 500。
+ * step3. 写 comment_likes（INSERT OR IGNORE / DELETE，均幂等）。
+ * step4. 回填最新计数并输出；回填失败按 500，否则前端会显示错误数字。
+ */
+bool HandleCommentLike(douyin::Store& store, const douyin::HttpRequest& request,
+                       std::int64_t comment_id, bool like,
+                       douyin::HttpResponse* response) {
+    // step1: 鉴权。
+    std::int64_t actor = 0;
+    if (!RequireToken(request, response, &actor)) {
+        return true;
+    }
+    // step2: 评论必须存在（否则点赞记录会挂到不存在的评论上）。
+    douyin::StoredComment comment;
+    std::string error;
+    if (!store.FindComment(comment_id, &comment, &error)) {
+        if (!error.empty()) {
+            std::fprintf(stderr, "[%s] 查询评论失败: %s\n", kServiceName,
+                         error.c_str());
+            return Fail(response, 500, "数据库错误");
+        }
+        return Fail(response, 404, "评论不存在");
+    }
+    // step3: 幂等写入/删除。
+    if (like) {
+        if (store.LikeComment(comment_id, actor, &error) < 0) {
+            std::fprintf(stderr, "[%s] 评论点赞失败: %s\n", kServiceName,
+                         error.c_str());
+            return Fail(response, 500, "数据库错误");
+        }
+    } else if (!store.UnlikeComment(comment_id, actor, &error)) {
+        std::fprintf(stderr, "[%s] 取消评论点赞失败: %s\n", kServiceName,
+                     error.c_str());
+        return Fail(response, 500, "数据库错误");
+    }
+    // step4: 以库为准回填计数，避免前端自己加减算出偏差。
+    std::vector<douyin::StoredComment> one;
+    one.push_back(std::move(comment));
+    if (!store.FillCommentLikes(actor, &one, &error)) {
+        std::fprintf(stderr, "[%s] 回填评论点赞失败: %s\n", kServiceName,
+                     error.c_str());
+        return Fail(response, 500, "数据库错误");
+    }
+    response->status = 200;
+    response->body = std::string("{\"ok\":true,\"liked\":") +
+                     (like ? "true" : "false") + ",\"like_count\":" +
+                     std::to_string(one[0].like_count) + "}";
     return true;
 }
 
@@ -481,6 +630,21 @@ bool Handle(douyin::Store& store, const douyin::HttpRequest& request,
     if (request.path == "/api/comment") {
         if (request.method == "POST") {
             return HandleComment(store, request, response);
+        }
+        return Fail(response, 405, "方法不允许");
+    }
+
+    // 评论点赞必须放在 /api/comment/<id> 之前判断：后者的 id 解析只接受
+    // 纯数字，`<id>/like` 会落到这里并 405/404。
+    std::int64_t like_comment_id = 0;
+    if (ParseCommentLikePath(request.path, &like_comment_id)) {
+        if (request.method == "POST") {
+            return HandleCommentLike(store, request, like_comment_id, true,
+                                     response);
+        }
+        if (request.method == "DELETE") {
+            return HandleCommentLike(store, request, like_comment_id, false,
+                                     response);
         }
         return Fail(response, 405, "方法不允许");
     }

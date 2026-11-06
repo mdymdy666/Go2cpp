@@ -594,6 +594,15 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     background: transparent;
   }
   .cp-reply-btn:hover { color: var(--text); }
+  /* 评论点赞：默认灰，已赞变粉；与视频点赞同一套视觉语言。 */
+  .cp-like {
+    margin-left: 8px; padding: 0; font-size: 12px; line-height: 1;
+    color: var(--muted); background: transparent;
+  }
+  .cp-like:hover { color: var(--text); }
+  .cp-like.on { color: var(--pink); }
+  .cp-like .cl-heart { display: inline-block; transition: transform .15s ease; }
+  .cp-like.on .cl-heart { transform: scale(1.15); }
   .cp-reply-form { display: flex; gap: 6px; margin: 8px 0 2px 10px; }
   .cp-reply-form input {
     flex: 1; min-width: 0; padding: 6px 10px; font-size: 13px;
@@ -1087,6 +1096,7 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     replyBtn.textContent = '回复';
     replyBtn.addEventListener('click', function () { openReplyForm(row, c); });
     who.appendChild(replyBtn);
+    who.appendChild(commentLikeButton(c));
 
     var txt = document.createElement('div');
     txt.className = 'cp-txt';
@@ -1099,6 +1109,52 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     row.appendChild(box);
     renderReplies(row, replies || [], !!expandAll);
     return row;
+  }
+
+  /* 评论点赞按钮：点击后由服务端返回最新计数与状态，前端不自行加减。 */
+  function commentLikeButton(c) {
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'cp-like' + (c.liked ? ' on' : '');
+    btn.setAttribute('aria-pressed', c.liked ? 'true' : 'false');
+    btn.title = '点赞这条评论';
+    var heart = document.createElement('span');
+    heart.className = 'cl-heart';
+    heart.textContent = '♥';
+    var num = document.createElement('span');
+    num.className = 'cl-num';
+    num.textContent = fmt(Number(c.like_count) || 0);
+    btn.appendChild(heart);
+    btn.appendChild(document.createTextNode(' '));
+    btn.appendChild(num);
+    btn.addEventListener('click', function () { toggleCommentLike(btn, c); });
+    return btn;
+  }
+
+  function paintCommentLike(btn, c) {
+    btn.classList.toggle('on', !!c.liked);
+    btn.setAttribute('aria-pressed', c.liked ? 'true' : 'false');
+    var num = btn.querySelector('.cl-num');
+    if (num) num.textContent = fmt(Number(c.like_count) || 0);
+  }
+
+  function toggleCommentLike(btn, c) {
+    if (!state.token) { toast('请先登录再点赞', 'err'); return; }
+    if (btn._busy) return;
+    btn._busy = true;
+    var wanted = !c.liked;
+    api('api/comment/' + c.id + '/like', { method: wanted ? 'POST' : 'DELETE' })
+      .then(function (data) {
+        c.liked = !!data.liked;
+        c.like_count = Number(data.like_count) || 0;
+        paintCommentLike(btn, c);
+      })
+      .catch(function (err) {
+        if (!handleAuthError(err)) {
+          toast('点赞失败：' + (err.message || '网络错误'), 'err');
+        }
+      })
+      .then(function () { btn._busy = false; });
   }
 
   /* 渲染某条顶层评论下的回复；超过 REPLY_FOLD 条折叠成「展开更多 N 条」。 */
@@ -1123,6 +1179,7 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
       b.textContent = '用户 #' + (r.user_id === undefined ? '—' : r.user_id);
       who.appendChild(b);
       who.appendChild(document.createTextNode(' · ' + fmtTime(r.created_at)));
+      who.appendChild(commentLikeButton(r));
       var t = document.createElement('div');
       t.className = 'cp-txt';
       t.textContent = r.content || '';

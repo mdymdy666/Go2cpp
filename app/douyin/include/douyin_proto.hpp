@@ -52,6 +52,8 @@ struct Comment {
     std::string content;
     std::int64_t created_at{0};
     std::int64_t parent_id{0};  ///< 二级回复的父评论 id；0=顶层评论。
+    std::int64_t like_count{0}; ///< 评论点赞数（interaction 服务维护）。
+    bool liked{false};          ///< 当前查看者是否已赞；匿名恒 false。
 };
 
 /// @brief 点赞（video_id + user_id 唯一）。
