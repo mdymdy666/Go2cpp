@@ -1414,3 +1414,39 @@ latest（服务重启）→ `resume_gap`，客户端走 REST 全量刷新。
   `go2cpp_network` 编译中断（18:25–18:34），tunnel/douyin 目标连带不可构建；
   已由并发改动恢复 HEAD 消除，本 agent 的临时补丁被覆盖、工作树无残留。
 - 报告：`docs/reports/soak-2026-11-04.md`（93 行）。未 commit。
+
+
+## 2026-11-06 16:55 douyin 第 5 轮：个人主页三 tab（douyin 主页 agent）
+
+- **需求**：主页从「只有作品」升级为抖音式三 tab：作品 / 喜欢 / 收藏；
+  喜欢默认仅本人可见。
+- **后端**（`app/douyin/src/user_service.cpp`、`douyin_store.{hpp,cpp}`）：
+  - 新增 3 个分页接口：`GET /api/user/:id/videos|liked|favorites?cursor=&limit=`；
+    统一响应 `{ok,tab,private,blocked,owner_id,viewer_id,total,next_cursor,items}`，
+    `items` 与 feed 同构（`{video,author}`）；
+  - 隐私：liked / favorites 仅本人（Bearer 且 id 相同）返回数据；他人与匿名
+    `200 + private:true + items:[] + total:0 + hint`，不执行 COUNT、不泄露内容；
+  - 拉黑：三个接口都做双向过滤（viewer 拉黑作者 / 作者拉黑 viewer）；
+    works 命中额外回 `blocked:true`；
+  - 存储：`QueryTimeline` 统一三类时间线（来源表 + 动作时间列是唯一差异），
+    游标 `w/l/f + <created_at>-<video_id>`，同秒按 video.id 倒序；
+    `likes` 补 `idx_likes_user(user_id, created_at DESC)`；
+  - user 服务补 `PublicVideo(StoredVideo)`（序列化与 video 服务同字段）。
+- **前端**（`app/douyin/include/douyin_home_page.hpp`）：
+  - 主页 tab 栏（作品/喜欢/收藏），每 tab 独立游标/列表/加载更多；
+  - 滚动到底自动加载（260px 阈值）+「加载更多」按钮兜底；
+  - 私密锁态、分 tab 空状态、加载失败重试；作品数改用接口 `total`
+    （旧实现从 `/api/feed?limit=100` 拉全量过滤，>100 条会漏）；
+  - CSS 新增 `.p-tabs/.p-tab/.p-hint/.p-load-more`；
+    `state.profileView` 随主页生命周期置空。
+- **验证**：
+  - `bash app/douyin/build.sh` → 8 个二进制全 ok，`-Werror` 零告警；
+  - `bash app/douyin/scripts/accept_profile_tabs.sh` → **115 PASS / 0 FAIL**；
+  - `accept_all.sh` → 70 PASS；`accept_user` 25、`accept_video_feed` 52、
+    `accept_comment_like` 33、`accept_notifications` 92、`accept_report_block` 79、
+    `accept_share_landing` 88、`accept_live` 66、`accept_interaction_search` 80、
+    `accept_upload_resume` 50，全部 0 FAIL；
+  - 性能：liked / favorites TTFB avg **1.0 ms**（20 次串行，阈值 200 ms），
+    `EXPLAIN QUERY PLAN` 命中 `idx_likes_user`。
+- **已知限制**：喜欢/收藏的「他人可见性」是硬编码私密，尚无用户级可见性设置；
+  `/api/video/favorites`（旧收藏页）仍无 cursor 分页，主页新接口有。

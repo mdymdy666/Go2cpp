@@ -462,6 +462,78 @@ class Store {
     bool ListFavorites(std::int64_t user_id, std::int64_t limit,
                        std::vector<StoredVideo>* out, std::string* error);
 
+    // ---- 个人主页三 tab：作品 / 喜欢 / 收藏（第 5 轮新增） ----
+
+    /**
+     * @brief 主页「作品」tab：作者的公开视频，按发布时间倒序 keyset 分页。
+     *
+     * @param owner_id [in] 主页主人 id（>0）；调用方**必须**先确认用户存在。
+     * @param viewer_id [in] 查看者 id；0=匿名（无个人黑名单，不做过滤）。
+     * @param cursor [in] 空串=第一页；否则必须是本接口上一页的 `next_cursor`
+     *        （带 `w` 前缀，与喜欢/收藏的游标互不通用）。
+     * @param limit [in] 期望条数；<=0 返回空页，**不要**当错误。
+     * @param out [out] 追加到末尾（不清空调用方已有内容）；失败时内容未定义。
+     * @param next_cursor [out] 还有下一页时写游标，否则空串。
+     * @param total [out] 同一过滤条件下的总条数；可为 nullptr（省掉 COUNT）。
+     * @param error [out] 失败时写错误文本；成功时保持原值。
+     * @return true=成功（可能空页）；false=cursor 非法或数据库错误。
+     *
+     * ## 定位
+     * 主页三个 tab 的唯一数据源。拉黑**双向**过滤：查看者拉黑作者、作者
+     * 拉黑查看者都不返回；错了会怎样：拉黑后还能从主页绕进去看对方视频。
+     */
+    bool ListUserVideos(std::int64_t owner_id, std::int64_t viewer_id,
+                        const std::string& cursor, std::int64_t limit,
+                        std::vector<StoredVideo>* out, std::string* next_cursor,
+                        std::int64_t* total, std::string* error);
+
+    /**
+     * @brief 主页「喜欢」tab：某用户点赞过的视频，按**点赞时间**倒序分页。
+     *
+     * @param owner_id [in] 点赞者 id（>0）；隐私判断由服务层负责，本层只查。
+     * @param viewer_id [in] 查看者 id；0=匿名。
+     * @param cursor [in] 空串=第一页；否则是本接口上一页的 `next_cursor`
+     *        （带 `l` 前缀，防止和作品/收藏游标串用）。
+     * @param limit [in] 期望条数；<=0 返回空页。
+     * @param out [out] 追加到末尾。
+     * @param next_cursor [out] 还有下一页时写游标，否则空串。
+     * @param total [out] 同一过滤条件下的总条数；可为 nullptr。
+     * @param error [out] 失败时写错误文本。
+     * @return true=成功（可能空页）；false=cursor 非法或数据库错误。
+     *
+     * ## 定位
+     * 与 `ListFavorites` 不同：这里按「发生时间」而不是视频发布时间排序，
+     * 游标也必须携带发生时间，否则同一秒内的多条会在翻页时错位。
+     */
+    bool ListLikedVideos(std::int64_t owner_id, std::int64_t viewer_id,
+                         const std::string& cursor, std::int64_t limit,
+                         std::vector<StoredVideo>* out, std::string* next_cursor,
+                         std::int64_t* total, std::string* error);
+
+    /**
+     * @brief 主页「收藏」tab：某用户收藏的视频，按**收藏时间**倒序分页。
+     *
+     * @param owner_id [in] 收藏者 id（>0）；隐私判断由服务层负责。
+     * @param viewer_id [in] 查看者 id；0=匿名。
+     * @param cursor [in] 空串=第一页；否则是本接口上一页的 `next_cursor`
+     *        （带 `f` 前缀）。
+     * @param limit [in] 期望条数；<=0 返回空页。
+     * @param out [out] 追加到末尾。
+     * @param next_cursor [out] 还有下一页时写游标，否则空串。
+     * @param total [out] 同一过滤条件下的总条数；可为 nullptr。
+     * @param error [out] 失败时写错误文本。
+     * @return true=成功（可能空页）；false=cursor 非法或数据库错误。
+     *
+     * ## 定位
+     * 主页「收藏」对非本人不可见；数据层保持中立，由 user 服务决定回
+     * 200 空列表还是 403——换权限策略时只改服务层。
+     */
+    bool ListFavoriteVideos(std::int64_t owner_id, std::int64_t viewer_id,
+                            const std::string& cursor, std::int64_t limit,
+                            std::vector<StoredVideo>* out,
+                            std::string* next_cursor, std::int64_t* total,
+                            std::string* error);
+
     /**
      * @brief 发评论（`parent_id` 非 0 表示二级回复）。
      * @param parent_id 父评论 id；0=顶层评论（父评论归属由 service 校验）。

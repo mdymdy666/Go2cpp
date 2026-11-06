@@ -10,6 +10,9 @@
  *          - DELETE /api/user/:id/follow       取关（需 Bearer token，幂等）
  *          - GET    /api/user/:id/following    关注列表（分页）
  *          - GET    /api/user/:id/followers    粉丝列表（分页）
+ *          - GET    /api/user/:id/videos       主页「作品」tab（分页）
+ *          - GET    /api/user/:id/liked        主页「喜欢」tab（仅本人可见）
+ *          - GET    /api/user/:id/favorites    主页「收藏」tab（仅本人可见）
  *          - GET    /health, /metrics
  *
  * @author douyin demo
@@ -31,6 +34,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -399,6 +403,234 @@ bool HandleFollowList(douyin::Store& store, const douyin::HttpRequest& request,
     return true;
 }
 
+/// @brief 个人主页的三个 tab。
+enum class ProfileTab {
+    kWorks = 0,     ///< 作品：所有人可见。
+    kLiked = 1,     ///< 喜欢：默认仅本人可见。
+    kFavorite = 2,  ///< 收藏：默认仅本人可见。
+};
+
+/// @brief tab 的稳定名字（响应里回给前端，便于断言与排错）。
+const char* ProfileTabName(ProfileTab tab) {
+    switch (tab) {
+        case ProfileTab::kWorks:
+            return "works";
+        case ProfileTab::kLiked:
+            return "liked";
+        case ProfileTab::kFavorite:
+            return "favorites";
+    }
+    return "works";
+}
+
+/// @brief 该 tab 是否属于「默认私密」：他人只能拿到空列表 + 提示。
+bool IsPrivateTab(ProfileTab tab) {
+    return tab == ProfileTab::kLiked || tab == ProfileTab::kFavorite;
+}
+
+/// @brief 存储行 → 对外 Video（与 video 服务的 PublicVideo 字段一致）。
+douyin::Video PublicVideo(const douyin::StoredVideo& stored) {
+    douyin::Video video;
+    video.id = stored.id;
+    video.user_id = stored.user_id;
+    video.title = stored.title;
+    video.url = stored.url;
+    video.like_count = stored.like_count;
+    video.comment_count = stored.comment_count;
+    video.created_at = stored.created_at;
+    return video;
+}
+
+/// @brief JSON 字符串转义（作者昵称可能含引号/反斜杠/换行）。
+std::string JsonEscape(const std::string& text) {
+    std::string out;
+    out.reserve(text.size() + 8);
+    for (const char c : text) {
+        switch (c) {
+            case '"': out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default: out += c; break;
+        }
+    }
+    return out;
+}
+
+/// @brief 调存储层拉一页：三个 tab 共用同一分页语义，只是数据源不同。
+bool ListTabPage(douyin::Store& store, ProfileTab tab, std::int64_t owner_id,
+                 std::int64_t viewer_id, const std::string& cursor,
+                 std::int64_t limit, std::vector<douyin::StoredVideo>* out,
+                 std::string* next_cursor, std::int64_t* total,
+                 std::string* error) {
+    switch (tab) {
+        case ProfileTab::kWorks:
+            return store.ListUserVideos(owner_id, viewer_id, cursor, limit, out,
+                                        next_cursor, total, error);
+        case ProfileTab::kLiked:
+            return store.ListLikedVideos(owner_id, viewer_id, cursor, limit, out,
+                                         next_cursor, total, error);
+        case ProfileTab::kFavorite:
+            return store.ListFavoriteVideos(owner_id, viewer_id, cursor, limit,
+                                            out, next_cursor, total, error);
+    }
+    return false;
+}
+
+/// @brief 空列表响应：私密 / 被拉黑 / 真空 都走同一形态，前端只需看标记位。
+std::string EmptyTabBody(ProfileTab tab, std::int64_t owner_id,
+                         std::int64_t viewer_id, bool private_tab, bool blocked,
+                         const std::string& hint) {
+    return std::string("{\"ok\":true,\"tab\":\"") + ProfileTabName(tab) +
+           "\",\"private\":" + (private_tab ? "true" : "false") +
+           ",\"blocked\":" + (blocked ? "true" : "false") +
+           ",\"owner_id\":" + std::to_string(owner_id) +
+           ",\"viewer_id\":" + std::to_string(viewer_id) +
+           ",\"total\":0,\"next_cursor\":\"\",\"items\":[]"
+           ",\"hint\":\"" + JsonEscape(hint) + "\"}";
+}
+
+/**
+ * @brief 个人主页三 tab 的统一处理器：作品 / 喜欢 / 收藏。
+ *
+ * @param store [in,out] 已打开的存储；借用，不接管生命周期。
+ * @param request [in] 原始请求；`cursor`/`limit` 为可选查询参数，Bearer 可选
+ *        （匿名也能看公开 tab）。
+ * @param owner_id [in] 主页主人 id（>0），由 `ParseUserPath` 解析。
+ * @param tab [in] 要拉取的 tab。
+ * @param response [out] 成功写 `{ok,tab,private,blocked,owner_id,viewer_id,
+ *        total,next_cursor,items}`；失败写统一错误体。
+ * @return 恒为 true（已处理）；无法识别的方法由调用方先拦成 405。
+ *
+ * ## 定位
+ * 主页数据的唯一出口，同时是**隐私边界**：喜欢/收藏只对本人返回内容，
+ * 他人与匿名一律空列表 + `private:true`（不泄露「有没有内容」）。错了会怎样：
+ * 别人能翻到你点赞/收藏过什么，或本人被误判成他人、自己的列表打不开。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：单请求内串行；游标不跨请求缓存。
+ * - 失败语义：用户不存在 404；cursor 非法 400；数据库错误 500。
+ * - 不变量：`private:true` 时 `items` 必为空、`total` 必为 0。
+ */
+bool HandleProfileTab(douyin::Store& store, const douyin::HttpRequest& request,
+                      std::int64_t owner_id, ProfileTab tab,
+                      douyin::HttpResponse* response) {
+    // step1: 主人必须存在，否则 404（与 /api/user/:id 一致）。
+    douyin::StoredUser owner;
+    std::string error;
+    const bool found = store.FindUserById(owner_id, &owner, &error);
+    if (!error.empty()) {
+        std::fprintf(stderr, "[%s] 查询主页用户失败: %s\n", kServiceName,
+                     error.c_str());
+        return Fail(response, 500, "数据库错误");
+    }
+    if (!found) {
+        return Fail(response, 404, "用户不存在");
+    }
+
+    // step2: 隐私判断放在任何查询之前——他人视角连 COUNT 都不做。
+    const std::int64_t viewer = ViewerId(request);
+    if (IsPrivateTab(tab) && viewer != owner_id) {
+        response->status = 200;
+        response->body = EmptyTabBody(
+            tab, owner_id, viewer, true, false,
+            tab == ProfileTab::kLiked ? "喜欢列表仅本人可见"
+                                      : "收藏列表仅本人可见");
+        return true;
+    }
+
+    // step3: 双向拉黑：只要有一方拉黑另一方，作品 tab 直接空列表（前端据此
+    //        显示「已拉黑」）；喜欢/收藏本人视角不会命中这里。
+    bool blocked = false;
+    if (viewer > 0 && viewer != owner_id) {
+        bool viewer_blocks = false;
+        bool owner_blocks = false;
+        std::string block_error;
+        if (!store.IsBlocked(viewer, owner_id, &viewer_blocks, &block_error) ||
+            !store.IsBlocked(owner_id, viewer, &owner_blocks, &block_error)) {
+            std::fprintf(stderr, "[%s] 查询主页拉黑状态失败: %s\n", kServiceName,
+                         block_error.c_str());
+            // 与资料页一致：拉黑状态查不到时按「未拉黑」处理，但列表层
+            // 仍会再做一次 SQL 过滤，不会因此泄露数据。
+            viewer_blocks = false;
+            owner_blocks = false;
+        }
+        blocked = viewer_blocks || owner_blocks;
+        if (blocked) {
+            response->status = 200;
+            response->body = EmptyTabBody(tab, owner_id, viewer, false, true,
+                                          "由于拉黑设置，该内容不会展示");
+            return true;
+        }
+    }
+
+    // step4: 分页参数：limit 夹到 [1, 100]，缺省 20；cursor 交给存储层校验。
+    std::int64_t limit = kDefaultPageSize;
+    if (const std::string text = douyin::QueryParam(request, "limit");
+        !text.empty()) {
+        limit = std::atoll(text.c_str());
+    }
+    if (limit <= 0) {
+        limit = kDefaultPageSize;
+    }
+    if (limit > kMaxPageSize) {
+        limit = kMaxPageSize;
+    }
+    const std::string cursor = douyin::QueryParam(request, "cursor");
+
+    std::vector<douyin::StoredVideo> videos;
+    std::string next_cursor;
+    std::int64_t total = 0;
+    if (!ListTabPage(store, tab, owner_id, viewer, cursor, limit, &videos,
+                     &next_cursor, &total, &error)) {
+        if (error.rfind("cursor 非法", 0) == 0) {
+            return Fail(response, 400, "cursor 非法");
+        }
+        std::fprintf(stderr, "[%s] 查询主页 %s 失败: %s\n", kServiceName,
+                     ProfileTabName(tab), error.c_str());
+        return Fail(response, 500, "数据库错误");
+    }
+
+    // step5: 作者名按页去重回填（liked/favorites 的作者可能不止一个）；
+    //        查不到时退化成 user<id>，与前端 `authorName` 的兜底一致。
+    std::unordered_map<std::int64_t, std::string> names;
+    for (const douyin::StoredVideo& video : videos) {
+        if (names.find(video.user_id) != names.end()) {
+            continue;
+        }
+        douyin::StoredUser author;
+        std::string name_error;
+        if (store.FindUserById(video.user_id, &author, &name_error) &&
+            name_error.empty()) {
+            names[video.user_id] = author.name;
+        } else {
+            names[video.user_id] = "user" + std::to_string(video.user_id);
+        }
+    }
+
+    // step6: 序列化；items 与 feed 同构（video + author），前端可复用卡片。
+    std::string body = std::string("{\"ok\":true,\"tab\":\"") +
+                       ProfileTabName(tab) + "\",\"private\":false" +
+                       ",\"blocked\":false,\"owner_id\":" +
+                       std::to_string(owner_id) + ",\"viewer_id\":" +
+                       std::to_string(viewer) + ",\"total\":" +
+                       std::to_string(total) + ",\"next_cursor\":\"" +
+                       JsonEscape(next_cursor) + "\",\"items\":[";
+    for (std::size_t i = 0; i < videos.size(); ++i) {
+        if (i != 0) {
+            body += ',';
+        }
+        body += "{\"video\":" + douyin::ToJson(PublicVideo(videos[i])) +
+                ",\"author\":\"" + JsonEscape(names[videos[i].user_id]) +
+                "\"}";
+    }
+    body += "]}";
+    response->status = 200;
+    response->body = std::move(body);
+    return true;
+}
+
 /**
  * @brief 拉黑 / 取消拉黑：`POST|DELETE /api/user/:id/block`。
  *
@@ -633,6 +865,27 @@ bool Handle(douyin::Store& store, const douyin::HttpRequest& request,
     }
     if (suffix == "followers" && request.method == "GET") {
         return HandleFollowList(store, request, id, false, response);
+    }
+    if (suffix == "videos") {
+        if (request.method == "GET") {
+            return HandleProfileTab(store, request, id, ProfileTab::kWorks,
+                                    response);
+        }
+        return Fail(response, 405, "方法不允许");
+    }
+    if (suffix == "liked") {
+        if (request.method == "GET") {
+            return HandleProfileTab(store, request, id, ProfileTab::kLiked,
+                                    response);
+        }
+        return Fail(response, 405, "方法不允许");
+    }
+    if (suffix == "favorites") {
+        if (request.method == "GET") {
+            return HandleProfileTab(store, request, id, ProfileTab::kFavorite,
+                                    response);
+        }
+        return Fail(response, 405, "方法不允许");
     }
     return false;
 }

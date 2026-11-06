@@ -2,10 +2,10 @@
 
 | 项 | 内容 |
 |---|---|
-| 盘点时间 | 2026-11-06（第 4 轮） |
+| 盘点时间 | 2026-11-06（第 5 轮） |
 | 盘点范围 | `app/douyin/` 全部源码（7 服务 + 网关 + 单页前端） |
 | 盘点方式 | 读 REQUIREMENTS.md、逐服务路由表、前端函数/元素清单、关键词扫描、跑既有验收 |
-| 基线 | `scripts/accept_all.sh` → 70 PASS / 0 FAIL；`scripts/accept_notifications.sh` → 92 PASS / 0 FAIL；`scripts/accept_report_block.sh` → 79 PASS / 0 FAIL；`scripts/accept_share_landing.sh` → **88 PASS / 0 FAIL** |
+| 基线 | `scripts/accept_all.sh` → 70 PASS / 0 FAIL；`scripts/accept_notifications.sh` → 92 PASS / 0 FAIL；`scripts/accept_report_block.sh` → 79 PASS / 0 FAIL；`scripts/accept_share_landing.sh` → 88 PASS / 0 FAIL；`scripts/accept_profile_tabs.sh` → **115 PASS / 0 FAIL** |
 
 > 说明：本文档只记录**代码里核实过**的能力。摘要里提到但代码未命中的项，
 > 统一标「待核实」，不当作已完成。
@@ -55,6 +55,10 @@
 - [x] **分享落地页（第 4 轮新增）**：`/v/:id` 由 video 服务 SSR 直出独立页面
       （播放器 / 作者关注 / 点赞评论数 / 评论区翻页 / 下载分享 + OG 预览）；
       已删除、被拉黑作者一律 404，匿名按公开页处理
+- [x] **个人主页三 tab（第 5 轮新增）**：`/api/user/:id/videos|liked|favorites`
+      三个分页接口（作品公开 / 喜欢·收藏仅本人可见）；拉黑双向过滤；
+      主页 tab 栏 + 滚动加载 + 私密锁 + 分 tab 空状态；
+      作品数改用接口 `total`（不再从 feed 拉 100 条过滤）
 
 ### 4. 发现与话题
 
@@ -87,7 +91,7 @@
 | 3 | ~~举报 / 拉黑~~ | 高 | — | **本轮已完成** |
 | 3.1 | 举报列表后台（运营端） | 中 | 1 h | 目前只落库，无管理接口；见 `reports.status` |
 | 4 | ~~分享落地页 `/v/:id`~~ | 中高 | — | **本轮已完成**（独立 SSR 页 + OG 预览） |
-| 5 | 个人主页三 tab（作品/喜欢/收藏） | 中高 | 1.5 h | 需要 `/api/video/liked`；主页目前只有作品 |
+| 5 | ~~个人主页三 tab（作品/喜欢/收藏）~~ | 中高 | — | **本轮已完成** |
 | 6 | 评论 @mention | 中 | 2 h | 输入 @ 弹候选 + 评论渲染高亮 + 通知联动 |
 | 7 | 草稿箱 | 中 | 1 h | 前端已有 localStorage 使用；需明确草稿持久化与恢复入口 |
 | 8 | 播放器手势增强（上下滑/长按倍速） | 中 | 1 h | 现有双击点赞/拖动，缺上下切换与长按 2x |
@@ -338,9 +342,71 @@
 - **教训**：C++ 里凡是「取首字符」的地方都要确认按码点还是按字节；
   验收脚本要加一次 `decode('utf-8')`，否则非法字节在终端里看不出来。
 
-## 七、下一轮建议
+## 七、第 5 轮交付：个人主页三 tab（作品 / 喜欢 / 收藏）
 
-1. 个人主页三 tab（#5）：作品 / 喜欢 / 收藏，需要 `/api/video/liked`。
+### 接口（user 服务 29101，网关 `/api/user/**`）
+
+| 方法 | 路径 | 隐私策略 | 说明 |
+|---|---|---|---|
+| GET | `/api/user/:id/videos?cursor=&limit=` | 公开 | 作者作品，按发布时间倒序 keyset 分页 |
+| GET | `/api/user/:id/liked?cursor=&limit=` | **仅本人** | 该用户点赞过的视频，按点赞时间倒序 |
+| GET | `/api/user/:id/favorites?cursor=&limit=` | **仅本人** | 该用户收藏的视频，按收藏时间倒序 |
+
+- 响应统一：`{ok,tab,private,blocked,owner_id,viewer_id,total,next_cursor,items:[{video,author}]}`；
+  `items` 与 feed 同构，前端卡片直接复用；
+- 隐私：`liked` / `favorites` 对他人与匿名一律 `200 + private:true + items:[] + total:0 + hint`，
+  连 COUNT 都不执行，不泄露「有没有内容」；本人（Bearer 且 id 相同）才返回数据；
+- 拉黑：**双向**过滤（viewer 拉黑作者、作者拉黑 viewer）；works 命中时额外回
+  `blocked:true` + 空列表，前端显示「已拉黑」；
+- 游标带类型前缀 `w` / `l` / `f`，三个 tab 的游标不能串用（串用回 400）；
+- limit 缺省 20、夹到 [1,100]；非法游标 400、用户不存在 404、非 GET 405。
+
+### 存储层
+
+| 改动 | 说明 |
+|---|---|
+| `ListUserVideos` / `ListLikedVideos` / `ListFavoriteVideos` | 三个 tab 共用 `QueryTimeline`：来源表 + 时间列是唯一差异 |
+| `likes` 新索引 `idx_likes_user(user_id, created_at DESC)` | 主键前缀是 video_id，按用户查点赞原本要全表扫 |
+| 游标 `w/l/f + <created_at>-<video_id>` | 时间取「动作时间」（点赞/收藏），不是视频发布时间；同秒按 video.id 倒序 |
+
+### 前端
+
+- 主页 tab 栏：作品 / 喜欢 / 收藏，各自独立游标、独立列表、独立「加载更多」；
+- 滚动到底自动加载下一页（阈值 260px），底部另有「加载更多」按钮兜底；
+- 本人视角：三个 tab 都有内容；他人/匿名点「喜欢」「收藏」→ 锁图标 +「仅本人可见」；
+- 空状态按 tab 且分本人/他人：作品（本人/他人）、喜欢、收藏各一条文案；
+- 作品数统计改用 `works.total`（旧实现从 `/api/feed?limit=100` 拉全量再过滤，
+  视频超过 100 条会漏）；
+- 拉黑用户的主页不再请求列表，只显示「已拉黑 + 取消拉黑」。
+
+### 验收
+
+- `bash app/douyin/build.sh` → 8 个二进制全 ok，`-Werror` 零告警
+- `bash scripts/accept_profile_tabs.sh` → **115 PASS / 0 FAIL**（7 组：作品 / 喜欢 / 收藏 / 拉黑 / 前端 / 性能 / 回归）
+- `bash scripts/accept_all.sh` → **70 PASS / 0 FAIL**
+- `bash scripts/accept_comment_like.sh` / `accept_notifications.sh` / `accept_report_block.sh` / `accept_share_landing.sh` → 33 / 92 / 79 / 88 PASS（回归）
+- 性能（loopback，20 次串行）：`GET /api/user/:id/liked` TTFB avg **1.0 ms**、
+  `favorites` avg **1.0 ms**（阈值 200 ms）；`EXPLAIN QUERY PLAN` 命中 `idx_likes_user`
+- 隐私用例：他人/匿名看 liked、favorites 均 `private:true`、`items` 为空、
+  响应不含任何 `"video"` 对象与标题
+- 拉黑用例：alice 拉黑 carol 后 liked 3→2、favorites 2→1，取消后恢复；
+  bob 拉黑 alice 后 alice 看 bob 主页 `blocked:true`，匿名不受影响
+- 前端：`GET /` 200、页面 > 100 KB，含 `p-tabs` / `profileTabState` / `loadProfileTab` /
+  `paintProfilePanel` / 两条锁文案 / 两条空状态文案 / `加载更多`
+
+### 踩坑记录
+
+- **症状**：`ToJson(StoredVideo)` 编译失败（只有 `Video` 有序列化）。
+- **原因**：主页 tab handler 在 user 服务里，直接拿了存储行去序列化。
+- **修复**：user 服务补一个 `PublicVideo(StoredVideo)`，字段与 video 服务的同名函数一致。
+- **同秒排序**：点赞/收藏时间只到秒，多条操作落在同一秒时必须用
+  `(created_at DESC, video.id DESC)` 的全序，游标也要携带动作时间；
+  想验证「后点的在前」得让两次动作落在不同秒（验收脚本里 sleep 1.1s）。
+
+## 八、下一轮建议
+
+1. 主页 tab 增强：喜欢列表「可见性设置」（公开 / 仅好友 / 私密）、
+   他人主页的授权申请、收藏夹分组。
 2. 举报运营后台：`reports.status` 只有 pending，缺列表 / 处理接口与页面。
 3. 「待核实」三项：@mention / 草稿 / WS Resume / 压缩——要么补实现，要么从
    已完成清单里移除；@mention 可直接复用通知中心的 `mention` 类型。

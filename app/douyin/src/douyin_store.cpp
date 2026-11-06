@@ -218,6 +218,10 @@ constexpr const char* kSchemaSql =
     "  created_at INTEGER NOT NULL,"
     "  PRIMARY KEY (video_id, user_id)"
     ");"
+    // 主页「喜欢」tab 按用户查、按点赞时间倒序：主键前缀是 video_id，帮不上忙，
+    // 必须补一条 (user_id, created_at) 索引，否则每页都全表扫 likes。
+    "CREATE INDEX IF NOT EXISTS idx_likes_user "
+    "ON likes(user_id, created_at DESC);"
     "CREATE TABLE IF NOT EXISTS comments ("
     "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
     "  video_id INTEGER NOT NULL,"
@@ -1217,6 +1221,264 @@ bool Store::ListFavorites(std::int64_t user_id, std::int64_t limit,
         return false;
     }
     return true;
+}
+
+namespace {
+
+/**
+ * @brief 主页时间线的三类数据源。
+ */
+enum class TimelineKind {
+    kWorks = 0,     ///< 作者作品：按 videos.created_at 倒序。
+    kLiked = 1,     ///< 用户点赞：按 likes.created_at 倒序。
+    kFavorite = 2,  ///< 用户收藏：按 favorites.created_at 倒序。
+};
+
+/// @brief 三类时间线各自的游标前缀，防止 A tab 的游标被 B tab 复用。
+char TimelineTag(TimelineKind kind) {
+    switch (kind) {
+        case TimelineKind::kWorks:
+            return 'w';
+        case TimelineKind::kLiked:
+            return 'l';
+        case TimelineKind::kFavorite:
+            return 'f';
+    }
+    return 'w';
+}
+
+/// @brief 编码带类型前缀的时间线游标：`w<created_at>-<video_id>`。
+std::string EncodeTimelineCursor(TimelineKind kind, std::int64_t created_at,
+                                 std::int64_t video_id) {
+    if (created_at <= 0 || video_id <= 0) {
+        return std::string();
+    }
+    return std::string(1, TimelineTag(kind)) + std::to_string(created_at) + "-" +
+           std::to_string(video_id);
+}
+
+/// @brief 解码时间线游标；前缀不匹配一律视为非法（调用方回 400）。
+bool DecodeTimelineCursor(TimelineKind kind, const std::string& cursor,
+                          std::int64_t* created_at, std::int64_t* video_id) {
+    if (cursor.size() < 3 || cursor.front() != TimelineTag(kind)) {
+        return false;
+    }
+    return DecodeVideoCursor(cursor.substr(1), created_at, video_id);
+}
+
+/// @brief 时间线的 FROM/WHERE 前半段：来源表 + 主人过滤（拉黑条件在后面追加）。
+std::string TimelineFromClause(TimelineKind kind) {
+    switch (kind) {
+        case TimelineKind::kWorks:
+            return " FROM videos v WHERE v.user_id = ?";
+        case TimelineKind::kLiked:
+            return " FROM likes a JOIN videos v ON v.id = a.video_id"
+                   " WHERE a.user_id = ?";
+        case TimelineKind::kFavorite:
+            return " FROM favorites a JOIN videos v ON v.id = a.video_id"
+                   " WHERE a.user_id = ?";
+    }
+    return " FROM videos v WHERE v.user_id = ?";
+}
+
+/// @brief 排序/游标的「发生时间」列：作品取发布时间，喜欢/收藏取动作时间。
+const char* TimelineTimeColumn(TimelineKind kind) {
+    return kind == TimelineKind::kWorks ? "v.created_at" : "a.created_at";
+}
+
+/**
+ * @brief 双向拉黑过滤片段：两个占位符都填 `viewer_id`。
+ * @note 匿名（viewer_id=0）时两个子查询都为空集，条件恒真——与既有
+ *       「匿名无个人黑名单」语义一致，不额外分支。
+ */
+constexpr const char* kTimelineBlockFilter =
+    " AND v.user_id NOT IN (SELECT blocked_id FROM blocks WHERE user_id = ?)"
+    " AND NOT EXISTS (SELECT 1 FROM blocks b WHERE b.user_id = v.user_id"
+    " AND b.blocked_id = ?)";
+
+/**
+ * @brief 主页时间线通用查询：作品 / 喜欢 / 收藏，keyset 分页 + 双向拉黑过滤。
+ *
+ * @param db [in] 已打开的数据库；不可为 nullptr，调用前须确认 `Ok()`。
+ * @param kind [in] 数据源类型，决定来源表、时间列与游标前缀。
+ * @param owner_id [in] 主页主人 id（>0）；喜欢/收藏时是动作发起者。
+ * @param viewer_id [in] 查看者 id；0=匿名，不做个人黑名单过滤。
+ * @param cursor [in] 空串=第一页；否则必须是同 kind 的 `next_cursor`。
+ * @param limit [in] 本页最多条数（>0）；调用方已 clamp。
+ * @param out [out] 追加到末尾（不清空调用方已有内容）；失败时内容可能已部分写入。
+ * @param next_cursor [out] 还有下一页时写游标，否则写空串。
+ * @param total [out] 同过滤条件下的总条数；可为 nullptr 表示不统计。
+ * @param error [out] 失败时写错误文本；成功时保持原值。
+ * @return true=成功（可能空页）；false=cursor 前缀/格式非法或数据库错误。
+ *
+ * ## 定位
+ * 主页三个 tab 的唯一分页实现；三个 tab 的差异只有「来源表 + 时间列」，
+ * 合成一处避免三份 SQL 各自漏掉拉黑过滤。错了会怎样：拉黑后仍能从主页
+ * 看到对方视频，或翻页时同一秒的多条重复/漏出。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：在服务请求线程内串行调用，不跨线程共享游标。
+ * - 失败语义：返回 false 时 `next_cursor` 为空、`out` 可能已追加部分行；
+ *   调用方应回 400/500 并丢弃本页。
+ * - 不变量：成功时 `out` 中每条的 `video.created_at` 是视频发布时间，
+ *   游标时间来自第 8 列（点赞/收藏时间），两者不可混用。
+ */
+bool QueryTimeline(go2cpp::storage::DB* db, TimelineKind kind,
+                   std::int64_t owner_id, std::int64_t viewer_id,
+                   const std::string& cursor, std::int64_t limit,
+                   std::vector<StoredVideo>* out, std::string* next_cursor,
+                   std::int64_t* total, std::string* error) {
+    // step1: 拼公共 FROM/WHERE；拉黑过滤对三个 tab 一视同仁。
+    const std::string from = TimelineFromClause(kind) + kTimelineBlockFilter;
+    // step2: 首页顺带统计总数（同一 where，参数顺序与列表一致）。
+    if (total != nullptr) {
+        auto counted = db->Query("SELECT COUNT(*)" + from, owner_id, viewer_id,
+                                 viewer_id);
+        if (!counted) {
+            if (error != nullptr) {
+                *error = "统计主页视频失败: " + DescribeError(counted.Err());
+            }
+            return false;
+        }
+        if (!counted.Value().Next()) {
+            if (error != nullptr) {
+                *error = "统计主页视频失败: 无结果行";
+            }
+            return false;
+        }
+        *total = counted.Value().Int64(0);
+    }
+    // step3: 游标解码——前缀必须与 kind 匹配，防止三个 tab 的游标串用。
+    const bool has_cursor = !cursor.empty();
+    std::int64_t cursor_time = 0;
+    std::int64_t cursor_id = 0;
+    if (has_cursor &&
+        !DecodeTimelineCursor(kind, cursor, &cursor_time, &cursor_id)) {
+        if (error != nullptr) {
+            *error = "cursor 非法";
+        }
+        return false;
+    }
+    // step4: 时间倒序 keyset 分页；多取一条判断是否还有下一页。
+    const char* time_col = TimelineTimeColumn(kind);
+    std::string sql =
+        std::string("SELECT v.id, v.user_id, v.title, v.url, v.like_count, "
+                    "v.comment_count, v.created_at, ") +
+        time_col + from;
+    if (has_cursor) {
+        sql += std::string(" AND (") + time_col + " < ? OR (" + time_col +
+               " = ? AND v.id < ?))";
+    }
+    sql += std::string(" ORDER BY ") + time_col + " DESC, v.id DESC LIMIT ?";
+
+    auto rows = has_cursor
+                    ? db->Query(sql, owner_id, viewer_id, viewer_id,
+                                cursor_time, cursor_time, cursor_id, limit + 1)
+                    : db->Query(sql, owner_id, viewer_id, viewer_id, limit + 1);
+    if (!rows) {
+        if (error != nullptr) {
+            *error = "查询主页视频失败: " + DescribeError(rows.Err());
+        }
+        return false;
+    }
+    // step5: 每行同时记住视频（前 7 列）与动作时间（第 8 列），游标用后者。
+    struct TimelineRow {
+        StoredVideo video;
+        std::int64_t activity_at{0};
+    };
+    std::vector<TimelineRow> page;
+    while (rows.Value().Next()) {
+        TimelineRow row;
+        ReadVideoRow(&rows.Value(), &row.video);
+        row.activity_at = rows.Value().Int64(7);
+        page.push_back(std::move(row));
+    }
+    if (rows.Value().Err()) {
+        if (error != nullptr) {
+            *error = "遍历主页视频失败: " + DescribeError(rows.Value().Err());
+        }
+        return false;
+    }
+    // step6: 截断到 limit；只有确实还有下一页时才给游标。
+    if (static_cast<std::int64_t>(page.size()) > limit) {
+        page.resize(static_cast<std::size_t>(limit));
+        if (!page.empty()) {
+            *next_cursor = EncodeTimelineCursor(kind, page.back().activity_at,
+                                                page.back().video.id);
+        }
+    }
+    for (TimelineRow& row : page) {
+        out->push_back(std::move(row.video));
+    }
+    return true;
+}
+
+}  // namespace
+
+bool Store::ListUserVideos(std::int64_t owner_id, std::int64_t viewer_id,
+                           const std::string& cursor, std::int64_t limit,
+                           std::vector<StoredVideo>* out,
+                           std::string* next_cursor, std::int64_t* total,
+                           std::string* error) {
+    next_cursor->clear();
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return false;
+    }
+    if (limit <= 0) {
+        if (total != nullptr) {
+            *total = 0;
+        }
+        return true;
+    }
+    return QueryTimeline(m_db.get(), TimelineKind::kWorks, owner_id, viewer_id,
+                         cursor, limit, out, next_cursor, total, error);
+}
+
+bool Store::ListLikedVideos(std::int64_t owner_id, std::int64_t viewer_id,
+                            const std::string& cursor, std::int64_t limit,
+                            std::vector<StoredVideo>* out,
+                            std::string* next_cursor, std::int64_t* total,
+                            std::string* error) {
+    next_cursor->clear();
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return false;
+    }
+    if (limit <= 0) {
+        if (total != nullptr) {
+            *total = 0;
+        }
+        return true;
+    }
+    return QueryTimeline(m_db.get(), TimelineKind::kLiked, owner_id, viewer_id,
+                         cursor, limit, out, next_cursor, total, error);
+}
+
+bool Store::ListFavoriteVideos(std::int64_t owner_id, std::int64_t viewer_id,
+                               const std::string& cursor, std::int64_t limit,
+                               std::vector<StoredVideo>* out,
+                               std::string* next_cursor, std::int64_t* total,
+                               std::string* error) {
+    next_cursor->clear();
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return false;
+    }
+    if (limit <= 0) {
+        if (total != nullptr) {
+            *total = 0;
+        }
+        return true;
+    }
+    return QueryTimeline(m_db.get(), TimelineKind::kFavorite, owner_id, viewer_id,
+                         cursor, limit, out, next_cursor, total, error);
 }
 
 std::int64_t Store::AddComment(std::int64_t video_id, std::int64_t user_id,

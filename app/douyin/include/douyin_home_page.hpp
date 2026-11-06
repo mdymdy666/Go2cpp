@@ -647,6 +647,33 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   }
   .profile-note { margin-top: 16px; color: var(--muted); font-size: 13.5px; }
+  /* ---------- 主页三 tab：作品 / 喜欢 / 收藏 ---------- */
+  .p-tabs {
+    display: flex; gap: 4px; margin-top: 18px;
+    border-bottom: 1px solid var(--line);
+  }
+  .p-tab {
+    flex: 1 1 0; padding: 10px 6px; font-size: 14px; font-weight: 700;
+    color: var(--muted); background: transparent; border: 0;
+    border-bottom: 2px solid transparent; cursor: pointer;
+  }
+  .p-tab:hover { color: var(--text); }
+  .p-tab.on { color: var(--text); border-bottom-color: #fe2c55; }
+  .p-tab b { margin-left: 5px; font-size: 12px; font-weight: 600; color: var(--muted); }
+  .p-panel { margin-top: 16px; }
+  .p-hint {
+    padding: 30px 18px; text-align: center; color: var(--muted);
+    font-size: 14px; line-height: 1.8;
+    background: rgba(255, 255, 255, .03);
+    border: 1px dashed var(--line); border-radius: 14px;
+  }
+  .p-hint .lock { display: block; font-size: 26px; margin-bottom: 6px; }
+  .p-load-more {
+    display: block; width: 100%; margin-top: 14px; padding: 11px;
+    font-size: 13.5px; color: var(--text); background: #1e1e29;
+    border: 1px solid var(--line); border-radius: 11px; cursor: pointer;
+  }
+  .p-load-more:hover { background: #262633; }
 
   /* ---------- 话题页 ---------- */
   .topic-link { color: #7fd6ff; text-decoration: none; }
@@ -973,6 +1000,7 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     panelVideoId: '',
     panelSlide: null,
     profileUserId: '',
+    profileView: null,
     fit: 'contain',
     muted: true,
     volume: 1,
@@ -3120,7 +3148,210 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     openMenu('评论操作', items);
   }
 
-  /* ---------- 用户主页 ---------- */
+  /* ---------- 用户主页三 tab：作品 / 喜欢 / 收藏 ---------- */
+
+  /** 三个 tab 的固定顺序：作品 → 喜欢 → 收藏（与抖音一致）。 */
+  function profileTabKeys() {
+    return ['works', 'liked', 'favorites'];
+  }
+
+  /** 单个 tab 的独立分页状态：游标/已加载项/是否到底都各存一份。 */
+  function profileTabState(key, path) {
+    return {
+      key: key,
+      path: path,
+      cursor: '',
+      items: [],
+      total: 0,
+      loaded: false,
+      loading: false,
+      done: false,
+      private: false,
+      blocked: false,
+      error: ''
+    };
+  }
+
+  /** 空状态文案：本人/他人、三个 tab 各不相同。 */
+  function profileEmptyText(key, self) {
+    if (key === 'works') {
+      return self ? '你还没有发过视频，点右上角「上传」发一条'
+                  : '该用户暂时没有视频';
+    }
+    if (key === 'liked') {
+      return '你还没有点赞过视频，在 feed 里双击红心试试';
+    }
+    return '你还没有收藏视频，点视频右侧的 ⭐ 收藏';
+  }
+
+  /** 居中提示块（锁 / 拉黑 / 空状态共用）。 */
+  function profileHint(icon, text) {
+    var box = document.createElement('div');
+    box.className = 'p-hint';
+    if (icon) {
+      var span = document.createElement('span');
+      span.className = 'lock';
+      span.textContent = icon;
+      box.appendChild(span);
+    }
+    var line = document.createElement('div');
+    line.textContent = text;
+    box.appendChild(line);
+    return box;
+  }
+
+  /** 主页网格里的一张视频卡（与原作品卡片一致，点击走 feed 播放）。 */
+  function profileVideoCard(item) {
+    var v = item.video || item;
+    var cardBtn = document.createElement('button');
+    cardBtn.type = 'button';
+    cardBtn.className = 'pv-card';
+    cardBtn.dataset.id = String(v.id || 0);
+    var pv = document.createElement('video');
+    pv.src = videoSrc(v);
+    pv.muted = true;
+    pv.playsInline = true;
+    pv.preload = 'metadata';
+    pv.setAttribute('muted', '');
+    pv.setAttribute('playsinline', '');
+    var pt = document.createElement('span');
+    pt.className = 'pv-title';
+    pt.textContent = v.title || ('视频 #' + (v.id || ''));
+    cardBtn.appendChild(pv);
+    cardBtn.appendChild(pt);
+    cardBtn.addEventListener('click', function () { playInFeed(item, v); });
+    return cardBtn;
+  }
+
+  /** 重绘 tab 栏：选中态 + 计数（私密 tab 显示锁，未加载不显示数字）。 */
+  function paintProfileTabs(view) {
+    var keys = profileTabKeys();
+    for (var i = 0; i < keys.length; i++) {
+      var key = keys[i];
+      var tab = view.tabs[key];
+      var btn = view.tabBar.querySelector('[data-tab="' + key + '"]');
+      if (!btn) { continue; }
+      btn.classList.toggle('on', key === view.active);
+      btn.setAttribute('aria-selected', key === view.active ? 'true' : 'false');
+      var count = btn.querySelector('b');
+      if (!count) { continue; }
+      if (tab.private) {
+        count.textContent = '🔒';
+      } else if (tab.loaded && !tab.blocked) {
+        count.textContent = String(tab.total || 0);
+      } else {
+        count.textContent = '';
+      }
+    }
+    if (view.statsVideos && view.tabs.works.loaded && !view.tabs.works.blocked) {
+      view.statsVideos.textContent = fmt(view.tabs.works.total);
+    }
+  }
+
+  /** 重绘当前 tab 的面板：加载中 / 错误 / 私密 / 拉黑 / 空 / 网格 + 加载更多。 */
+  function paintProfilePanel(view) {
+    var tab = view.tabs[view.active];
+    var panel = view.panel;
+    panel.innerHTML = '';
+    paintProfileTabs(view);
+    if (!tab) { return; }
+    if (!tab.loaded && !tab.error) {
+      var loading = document.createElement('div');
+      loading.className = 'profile-note';
+      loading.textContent = '加载中…';
+      panel.appendChild(loading);
+      return;
+    }
+    if (tab.error) {
+      var failed = profileHint('⚠️', '加载失败：' + tab.error);
+      var retry = document.createElement('button');
+      retry.type = 'button';
+      retry.className = 'p-load-more';
+      retry.textContent = '重试';
+      retry.addEventListener('click', function () {
+        loadProfileTab(view, view.active, true);
+      });
+      failed.appendChild(retry);
+      panel.appendChild(failed);
+      return;
+    }
+    if (tab.private) {
+      panel.appendChild(profileHint(
+        '🔒',
+        view.active === 'liked' ? '喜欢列表仅本人可见' : '收藏列表仅本人可见'));
+      return;
+    }
+    if (tab.blocked) {
+      panel.appendChild(profileHint('🚫', '由于拉黑设置，TA 的内容不会展示'));
+      return;
+    }
+    if (!tab.items.length) {
+      panel.appendChild(profileHint('', profileEmptyText(view.active, view.self)));
+      return;
+    }
+    var grid = document.createElement('div');
+    grid.className = 'profile-grid';
+    tab.items.forEach(function (item) { grid.appendChild(profileVideoCard(item)); });
+    panel.appendChild(grid);
+    var note = document.createElement('div');
+    note.className = 'profile-note';
+    note.textContent = '共 ' + (tab.total || tab.items.length) + ' 条 · 点击播放' +
+                       (tab.done ? '' : ' · 滚动到底加载更多');
+    panel.appendChild(note);
+    if (!tab.done) {
+      var more = document.createElement('button');
+      more.type = 'button';
+      more.className = 'p-load-more';
+      more.textContent = '加载更多';
+      more.addEventListener('click', function () {
+        loadProfileTab(view, view.active, false);
+      });
+      panel.appendChild(more);
+    }
+  }
+
+  /**
+   * 拉取某个 tab 的一页。
+   * @param view 主页视图对象（闭包持有 DOM 引用）。
+   * @param key works / liked / favorites。
+   * @param reset true=从第一页重来（首次打开或重试）。
+   */
+  function loadProfileTab(view, key, reset) {
+    var tab = view.tabs[key];
+    if (!tab || tab.loading) { return; }
+    if (!reset && tab.done) { return; }
+    tab.loading = true;
+    tab.error = '';
+    if (reset) {
+      tab.cursor = '';
+      tab.items = [];
+      tab.loaded = false;
+      tab.done = false;
+      tab.private = false;
+      tab.blocked = false;
+    }
+    var url = tab.path + '?limit=20';
+    if (tab.cursor) { url += '&cursor=' + encodeURIComponent(tab.cursor); }
+    api(url).then(function (data) {
+      tab.loading = false;
+      tab.loaded = true;
+      tab.private = !!data.private;
+      tab.blocked = !!data.blocked;
+      tab.total = Number(data.total || 0);
+      tab.items = reset ? (data.items || []) : tab.items.concat(data.items || []);
+      tab.cursor = data.next_cursor || '';
+      tab.done = !tab.cursor;
+      /* 主页已被关闭/替换：只保留数据，不碰已经脱离 DOM 的节点。 */
+      if (state.profileView !== view) { return; }
+      if (view.active === key) { paintProfilePanel(view); }
+      paintProfileTabs(view);
+    }).catch(function (err) {
+      tab.loading = false;
+      tab.error = err.message || '网络错误';
+      if (state.profileView !== view) { return; }
+      if (view.active === key) { paintProfilePanel(view); }
+    });
+  }
 
   function renderProfile(user, isFollowing) {
     var name = user.name || ('user' + (user.id || ''));
@@ -3144,7 +3375,7 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     created.className = 'p-line';
     created.textContent = '注册时间：' + fmtTime(user.created_at);
 
-    /* 数据行：作品 / 关注 / 粉丝（作品数加载完视频再填） */
+    /* 数据行：作品 / 关注 / 粉丝（作品数等 works tab 加载完再填） */
     var stats = document.createElement('div');
     stats.className = 'p-stats';
     stats.innerHTML = '<span><b class="p-videos">—</b>作品</span>' +
@@ -3206,19 +3437,60 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     card.appendChild(info);
     profileBody.appendChild(card);
 
-    var grid = document.createElement('div');
-    grid.className = 'profile-grid';
-    profileBody.appendChild(grid);
-    var note = document.createElement('div');
-    note.className = 'profile-note';
-    note.textContent = '加载视频中…';
-    profileBody.appendChild(note);
-
+    /* 三 tab：作品 / 喜欢 / 收藏。每个 tab 各自游标与列表，切换互不影响；
+       「喜欢」「收藏」的可见性由后端判定（他人拿到的就是空列表 + private），
+       前端只按标记渲染锁，不自行决定隐私。 */
     var uid = String(user.id);
+    var view = {
+      user: user,
+      self: self,
+      active: 'works',
+      statsVideos: stats.querySelector('.p-videos'),
+      tabs: {
+        works: profileTabState('works', 'api/user/' + uid + '/videos'),
+        liked: profileTabState('liked', 'api/user/' + uid + '/liked'),
+        favorites: profileTabState('favorites', 'api/user/' + uid + '/favorites')
+      }
+    };
+
+    var labels = { works: '作品', liked: '喜欢', favorites: '收藏' };
+    var bar = document.createElement('div');
+    bar.className = 'p-tabs';
+    bar.setAttribute('role', 'tablist');
+    profileTabKeys().forEach(function (key) {
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'p-tab';
+      btn.setAttribute('role', 'tab');
+      btn.dataset.tab = key;
+      btn.textContent = labels[key];
+      btn.appendChild(document.createElement('b'));
+      btn.addEventListener('click', function () {
+        if (view.active !== key) {
+          view.active = key;
+          paintProfilePanel(view);
+        }
+        var tab = view.tabs[key];
+        if (!tab.loaded && !tab.loading) { loadProfileTab(view, key, true); }
+      });
+      bar.appendChild(btn);
+    });
+    view.tabBar = bar;
+    profileBody.appendChild(bar);
+
+    var panel = document.createElement('div');
+    panel.className = 'p-panel';
+    view.panel = panel;
+    profileBody.appendChild(panel);
+    state.profileView = view;
+
     /* 拉黑后主页只显示「已拉黑」和取消入口，不再请求视频列表——否则
        拉黑等于只挡住 feed，从主页还能绕进去。 */
     if (!self && user.is_blocked) {
-      note.textContent = '你已拉黑该用户，TA 的视频不会展示';
+      view.tabs.works.loaded = true;
+      view.tabs.works.blocked = true;
+      paintProfileTabs(view);
+      paintProfilePanel(view);
       var unblockBtn = document.createElement('button');
       unblockBtn.type = 'button';
       unblockBtn.className = 'btn-primary';
@@ -3231,47 +3503,10 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
       profileBody.appendChild(unblockBtn);
       return;
     }
-    /* 自己的主页走 /api/video/mine（只取自己的，不受 feed 热度排序影响）；
-       别人的主页仍走 feed 过滤，与既有数据路径兼容。 */
-    var source = self ? api('api/video/mine?limit=30') : api('api/feed?limit=100');
-    source.then(function (data) {
-      var all = data.items || [];
-      var mine = self ? all : all.filter(function (it) {
-        return String((it.video || {}).user_id) === uid;
-      }).slice(0, 30);
-      var vcount = stats.querySelector('.p-videos');
-      if (vcount) vcount.textContent = fmt(mine.length);
-      grid.innerHTML = '';
-      if (!mine.length) {
-        note.textContent = self ? '你还没有发过视频，点右上角「上传」发一条' :
-                                  '该用户暂时没有视频';
-        return;
-      }
-      note.textContent = '共 ' + mine.length + ' 条视频 · 点击播放';
-      mine.forEach(function (item) {
-        var v = item.video || item;
-        var cardBtn = document.createElement('button');
-        cardBtn.type = 'button';
-        cardBtn.className = 'pv-card';
-        cardBtn.dataset.id = String(v.id || 0);
-        var pv = document.createElement('video');
-        pv.src = videoSrc(v);
-        pv.muted = true;
-        pv.playsInline = true;
-        pv.preload = 'metadata';
-        pv.setAttribute('muted', '');
-        pv.setAttribute('playsinline', '');
-        var pt = document.createElement('span');
-        pt.className = 'pv-title';
-        pt.textContent = v.title || ('视频 #' + (v.id || ''));
-        cardBtn.appendChild(pv);
-        cardBtn.appendChild(pt);
-        cardBtn.addEventListener('click', function () { playInFeed(item, v); });
-        grid.appendChild(cardBtn);
-      });
-    }).catch(function (err) {
-      note.textContent = '视频列表加载失败：' + (err.message || '网络错误');
-    });
+
+    paintProfileTabs(view);
+    paintProfilePanel(view);
+    loadProfileTab(view, 'works', true);
   }
 
   function showProfile(userId, fallbackName) {
@@ -3309,6 +3544,7 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
   function hideProfile() {
     profileEl.hidden = true;
     state.profileUserId = '';
+    state.profileView = null;
     var active = feedEl.querySelector('.slide.active video') || state.activeVideo;
     if (active) playOnly(active);
   }
@@ -3391,6 +3627,20 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     sendComment();
   });
   document.getElementById('profileBack').addEventListener('click', hideProfile);
+  /* 主页 tab 的「滚动到底加载更多」：只在当前 tab 还有下一页时触发；
+     滚动事件里不做 DOM 重建，交给 loadProfileTab 的响应回调统一重绘。 */
+  profileEl.addEventListener('scroll', function () {
+    var view = state.profileView;
+    if (!view) { return; }
+    var tab = view.tabs[view.active];
+    if (!tab || !tab.loaded || tab.loading || tab.done ||
+        tab.private || tab.blocked) {
+      return;
+    }
+    if (profileEl.scrollTop + profileEl.clientHeight + 260 >= profileEl.scrollHeight) {
+      loadProfileTab(view, view.active, false);
+    }
+  });
   document.getElementById('tagBack').addEventListener('click', hideTagView);
   document.getElementById('searchBack').addEventListener('click', hideSearch);
   document.getElementById('searchSubmit').addEventListener('click', function () {
