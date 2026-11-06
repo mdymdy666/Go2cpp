@@ -868,6 +868,12 @@ int main(int argc, char** argv) {
                  true, 10, "comment-write") &&
         // 通知是私密数据：读接口也必须带 Bearer（与评论/feed 的公开读不同），
         // 网关先 401 掉匿名请求，上游只处理「已认证但可能越权」的读写。
+        // 系统通知：静态路由优先于下面的 /api/notifications/** 通配；
+        // require_auth=false 表示网关不拦 Bearer，由 interaction 自己认
+        // `X-Internal-Token` 或 admin 用户（普通用户 403，无凭证 401）。
+        AddRoute(gateway.get(), method_mask::kAll,
+                 "/api/notifications/system", kInteractionPort, false, 0,
+                 "notification-system") &&
         AddRoute(gateway.get(), kReadMask, "/api/notifications/**",
                  kInteractionPort, true, 0, "notification-read") &&
         AddRoute(gateway.get(), kWriteMask, "/api/notifications/**",

@@ -93,7 +93,7 @@ struct StoredNotification {
     std::int64_t user_id{0};     ///< 接收者（通知归属人）。
     std::int64_t actor_id{0};    ///< 触发者（点赞/评论/关注的人）。
     std::string actor_name;      ///< 触发者昵称（JOIN 回填；可能为空）。
-    std::string kind;            ///< 类型：like / comment / follow / mention。
+    std::string kind;            ///< 类型：like / comment / follow / mention / system。
     std::string target_type;     ///< 目标类型：video / comment / user。
     std::int64_t target_id{0};   ///< 目标 id（配合 target_type）。
     std::string content;         ///< 摘要（评论/标题截断；follow 为空）。
@@ -712,11 +712,13 @@ class Store {
      * @brief 写一条通知（「该不该写」由服务层判定，存储层只负责落库）。
      *
      * @param user_id [in] 接收者 id；必须 > 0。
-     * @param actor_id [in] 触发者 id；必须 > 0。
+     * @param actor_id [in] 触发者 id；必须 > 0——**唯一例外**是
+     *        `kind=system`（系统广播没有真人触发者），此时允许 0。
      * @param kind [in] 通知类型，只接受 `like` / `comment` / `follow` /
-     *        `mention`；其它值视为脏数据拒绝。
-     * @param target_type [in] 目标类型：`video` / `comment` / `user`。
-     * @param target_id [in] 目标 id（> 0）。
+     *        `mention` / `system`；其它值视为脏数据拒绝。
+     * @param target_type [in] 目标类型：`video` / `comment` / `user` /
+     *        `system`（system 仅用于系统通知，可不指向具体资源）。
+     * @param target_id [in] 目标 id（> 0；`kind=system` 时允许 0 表示无目标）。
      * @param content [in] 摘要文本（可为空）；存储层不截断，调用方负责长度。
      * @param error [out] 失败时写错误文本；成功时保持原值。
      * @return 成功返回 true。
@@ -740,6 +742,7 @@ class Store {
      * @brief 通知列表：按时间倒序 keyset 分页，一次 JOIN 回填触发者昵称。
      *
      * @param user_id [in] 接收者 id（只返回这个人的通知）。
+     * @param kind [in] 空串=全部类型；非空只返回该类型（调用方已按白名单校验）。
      * @param cursor [in] 空串=第一页；否则为本页最后一条的游标。
      * @param limit [in] 期望条数；<=0 返回空页（不当成错误）。
      * @param out [out] 追加到末尾（不清空调用方已有内容）。
@@ -752,8 +755,8 @@ class Store {
      * `idx_notifications_timeline(user_id, created_at DESC, id DESC)`；
      * 昵称用 JOIN 而不是逐条查，避免 N+1。
      */
-    bool ListNotifications(std::int64_t user_id, const std::string& cursor,
-                           std::int64_t limit,
+    bool ListNotifications(std::int64_t user_id, const std::string& kind,
+                           const std::string& cursor, std::int64_t limit,
                            std::vector<StoredNotification>* out,
                            std::string* next_cursor, std::string* error);
 
@@ -770,12 +773,43 @@ class Store {
     std::int64_t CountUnreadNotifications(std::int64_t user_id,
                                           std::string* error);
 
+    /// @brief 通知面板 6 个 tab 的未读数（一次 GROUP BY 查出）。
+    /// @note `all` 是各 kind 之和，含历史脏 kind——徽章不能比列表少。
+    struct NotificationUnreadCounts {
+        std::int64_t all{0};      ///< 全部未读。
+        std::int64_t like{0};     ///< 赞。
+        std::int64_t comment{0};  ///< 评论 / 回复。
+        std::int64_t follow{0};   ///< 关注。
+        std::int64_t mention{0};  ///< @我。
+        std::int64_t system{0};   ///< 系统通知。
+    };
+
+    /**
+     * @brief 按 kind 分组统计未读数（消息面板 tab 角标）。
+     *
+     * @param user_id [in] 接收者 id（> 0）。
+     * @param out [out] 成功时整体写入；失败保持原值。
+     * @param error [out] 失败时写错误文本。
+     * @return 成功 true；失败 false 且 error 非空。
+     *
+     * ## 性能
+     * **固定 1 条 SQL**（`GROUP BY kind`），命中
+     * `idx_notifications_kind(user_id, read_at, kind)`，输出行数 = kind 数（<=6），
+     * 不是 N+1。过滤条件与列表一致（拉黑者触发的不计入），避免 tab 角标
+     * 与列表条数对不上。
+     */
+    bool CountUnreadNotificationsByKind(std::int64_t user_id,
+                                        NotificationUnreadCounts* out,
+                                        std::string* error);
+
     /**
      * @brief 标记已读：按 id 列表或全部。
      *
      * @param user_id [in] 接收者 id；SQL 里同时作为条件，**别人的通知改不到**。
-     * @param ids [in] 要标记的通知 id；`all=true` 时忽略。
+     * @param ids [in] 要标记的通知 id；`all=true` 或 `kind` 非空时忽略。
      * @param all [in] true=把这个人的全部未读标成已读。
+     * @param kind [in] 非空=只把这个人的该类型未读标成已读（tab 级「全部已读」）；
+     *        与 `all` 同时出现时 **kind 优先**。
      * @param error [out] 失败时写错误文本。
      * @return 实际更新的行数（>=0）；出错返回 -1。
      *
@@ -784,7 +818,8 @@ class Store {
      */
     std::int64_t MarkNotificationsRead(std::int64_t user_id,
                                        const std::vector<std::int64_t>& ids,
-                                       bool all, std::string* error);
+                                       bool all, const std::string& kind,
+                                       std::string* error);
 
     // ---- 举报 / 拉黑：reports / blocks（第 3 轮新增，只加不改既有） ----
 

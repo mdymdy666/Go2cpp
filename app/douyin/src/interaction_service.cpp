@@ -10,9 +10,11 @@
  *          - GET    /api/video/:id/comments   同一接口的路径别名（第 6 轮）
  *          - POST   /api/comment/:id/pin   置顶评论（Bearer；仅视频作者）
  *          - DELETE /api/comment/:id/pin   取消置顶（Bearer；仅视频作者）
- *          - GET    /api/notifications          通知列表（Bearer；倒序 + 游标）
- *          - POST   /api/notifications/read     标记已读（Bearer；ids 或 all）
+ *          - GET    /api/notifications          通知列表（Bearer；kind 分类 +
+ *                                                倒序 + 游标 + 6 类未读数）
+ *          - POST   /api/notifications/read     标记已读（Bearer；ids / all / kind）
  *          - GET    /api/notifications/unread_count 未读数（Bearer）
+ *          - POST   /api/notifications/system   写系统通知（内部 token 或 admin）
  *          - GET    /health, /metrics
  *
  *          通知写入点（第 2 轮）：视频被赞 / 评论被赞 / 视频被评论（含回复
@@ -49,6 +51,13 @@ namespace {
 
 constexpr std::uint16_t kDefaultPort = 29104;
 constexpr const char* kServiceName = "interaction";
+
+/// @brief 通知类型白名单（与存储层 `IsValidNotificationKind` 一致）。
+/// @note 定义在所有通知 handler 之前：列表过滤、单类已读、系统通知共用同一份。
+bool IsValidNotificationKind(std::string_view kind) {
+    return kind == "like" || kind == "comment" || kind == "follow" ||
+           kind == "mention" || kind == "system";
+}
 constexpr std::int64_t kDefaultPageSize = 20;
 constexpr std::int64_t kMaxPageSize = 100;
 constexpr std::size_t kMaxCommentChars = 500;
@@ -1324,23 +1333,24 @@ std::string NotificationJson(const douyin::StoredNotification& item) {
 }
 
 /**
- * @brief 通知列表：`GET /api/notifications?cursor=&limit=20`。
+ * @brief 通知列表：`GET /api/notifications?kind=&cursor=&limit=20`。
  *
  * @param store [in,out] 已打开的存储；借用。
  * @param request [in] 原始请求；必须带有效 Bearer token。
- * @param response [out] 成功写 `{ok,items,unread_count,next_cursor}`；
- *        失败写统一错误体。不可为 nullptr。
+ * @param response [out] 成功写
+ *        `{ok,items,counts:{all,like,comment,follow,mention,system},
+ *        unread_count,next_cursor}`；失败写统一错误体。不可为 nullptr。
  * @return 恒为 true（已处理）。
  *
  * ## 定位
  * 消息中心唯一列表入口。错了会怎样：别人能看到不属于自己的通知
- * （鉴权/过滤错），或分页重复/漏条。
+ * （鉴权/过滤错），或分页重复/漏条，或 tab 角标与列表条数对不上。
  *
  * ## 步骤
  * step1. 鉴权——通知是私密数据，匿名必须 401，不能像评论列表那样降级。
- * step2. 校验游标格式；非法回 400（不是 500）。
+ * step2. 分类过滤（kind 白名单）+ 游标格式；非法回 400（不是 500）。
  * step3. 列表查询（1 条 SQL，JOIN 回填昵称）。
- * step4. 未读数（1 条 COUNT，走索引）；两次查询固定条数，不随页大小增长。
+ * step4. 6 类未读数（1 条 GROUP BY）；两次查询固定条数，不随页大小增长。
  */
 bool HandleNotifications(douyin::Store& store, const douyin::HttpRequest& request,
                          douyin::HttpResponse* response) {
@@ -1349,7 +1359,12 @@ bool HandleNotifications(douyin::Store& store, const douyin::HttpRequest& reques
     if (!RequireToken(request, response, &viewer)) {
         return true;
     }
-    // step2: 游标。
+    // step2: 分类过滤 + 游标。
+    const std::string kind = douyin::QueryParam(request, "kind");
+    if (!kind.empty() && !IsValidNotificationKind(kind)) {
+        return Fail(response, 400,
+                    "kind 非法（like/comment/follow/mention/system）");
+    }
     const std::string cursor_text = douyin::QueryParam(request, "cursor");
     std::int64_t cursor_created = 0;
     std::int64_t cursor_id = 0;
@@ -1363,16 +1378,16 @@ bool HandleNotifications(douyin::Store& store, const douyin::HttpRequest& reques
     std::vector<douyin::StoredNotification> items;
     std::string next_cursor;
     std::string error;
-    if (!store.ListNotifications(viewer, cursor_text, limit, &items, &next_cursor,
-                                 &error)) {
+    if (!store.ListNotifications(viewer, kind, cursor_text, limit, &items,
+                                 &next_cursor, &error)) {
         std::fprintf(stderr, "[%s] 查询通知失败: %s\n", kServiceName,
                      error.c_str());
         return Fail(response, 500, "数据库错误");
     }
-    // step4: 未读数——固定再多一条 COUNT，不做 N+1。
-    const std::int64_t unread = store.CountUnreadNotifications(viewer, &error);
-    if (unread < 0) {
-        std::fprintf(stderr, "[%s] 统计未读失败: %s\n", kServiceName,
+    // step4: 分类未读数——固定 1 条 GROUP BY，不按 6 个 tab 查 6 次。
+    douyin::Store::NotificationUnreadCounts counts;
+    if (!store.CountUnreadNotificationsByKind(viewer, &counts, &error)) {
+        std::fprintf(stderr, "[%s] 统计分类未读失败: %s\n", kServiceName,
                      error.c_str());
         return Fail(response, 500, "数据库错误");
     }
@@ -1383,7 +1398,13 @@ bool HandleNotifications(douyin::Store& store, const douyin::HttpRequest& reques
         }
         body += NotificationJson(items[i]);
     }
-    body += "],\"unread_count\":" + std::to_string(unread) +
+    body += "],\"counts\":{\"all\":" + std::to_string(counts.all) +
+            ",\"like\":" + std::to_string(counts.like) +
+            ",\"comment\":" + std::to_string(counts.comment) +
+            ",\"follow\":" + std::to_string(counts.follow) +
+            ",\"mention\":" + std::to_string(counts.mention) +
+            ",\"system\":" + std::to_string(counts.system) + "}" +
+            ",\"unread_count\":" + std::to_string(counts.all) +
             ",\"next_cursor\":\"" + douyin::JsonEscape(next_cursor) + "\"}";
     response->status = 200;
     response->body = std::move(body);
@@ -1420,8 +1441,8 @@ bool HandleUnreadCount(douyin::Store& store, const douyin::HttpRequest& request,
 }
 
 /**
- * @brief 标记已读：`POST /api/notifications/read`，body `{"ids":[...]}`
- *        或 `{"all":true}`。
+ * @brief 标记已读：`POST /api/notifications/read`，body 三选一：
+ *        `{"ids":[...]}`、`{"all":true}`、`{"kind":"like"}`（单类全部已读）。
  *
  * @param store [in,out] 已打开的存储；借用。
  * @param request [in] 原始请求；必须带有效 Bearer token。
@@ -1446,16 +1467,22 @@ bool HandleNotificationsRead(douyin::Store& store,
     if (!RequireToken(request, response, &viewer)) {
         return true;
     }
-    // step2: body。
+    // step2: body：kind（单类）优先，其次 all，最后 ids。
+    std::string kind;
+    if (douyin::JsonStringField(request.body, "kind", &kind) && !kind.empty() &&
+        !IsValidNotificationKind(kind)) {
+        return Fail(response, 400,
+                    "kind 非法（like/comment/follow/mention/system）");
+    }
     const bool all = JsonBoolTrue(request.body, "all");
     std::vector<std::int64_t> ids;
-    if (!all && !JsonIntArrayField(request.body, "ids", &ids)) {
-        return Fail(response, 400, "ids 或 all 必须提供");
+    if (kind.empty() && !all && !JsonIntArrayField(request.body, "ids", &ids)) {
+        return Fail(response, 400, "ids / all / kind 必须提供一个");
     }
-    // step3: 标记。
+    // step3: 标记（kind 非空时存储层只改该类型）。
     std::string error;
     const std::int64_t updated =
-        store.MarkNotificationsRead(viewer, ids, all, &error);
+        store.MarkNotificationsRead(viewer, ids, all, kind, &error);
     if (updated < 0) {
         std::fprintf(stderr, "[%s] 标记通知已读失败: %s\n", kServiceName,
                      error.c_str());
@@ -1472,6 +1499,175 @@ bool HandleNotificationsRead(douyin::Store& store,
     response->body = std::string("{\"ok\":true,\"updated\":") +
                      std::to_string(updated) + ",\"unread_count\":" +
                      std::to_string(unread) + "}";
+    return true;
+}
+
+/// @brief 常量时间字符串比较：内部 token 校验不能因提前返回泄漏前缀长度。
+bool ConstantTimeEquals(std::string_view left, std::string_view right) {
+    if (left.size() != right.size()) {
+        return false;
+    }
+    unsigned char diff = 0;
+    for (std::size_t i = 0; i < left.size(); ++i) {
+        diff |= static_cast<unsigned char>(left[i] ^ right[i]);
+    }
+    return diff == 0;
+}
+
+/// @brief 读环境变量；未设置或空串都返回空串。
+std::string EnvOrEmpty(const char* name) {
+    const char* value = std::getenv(name);
+    return value == nullptr ? std::string() : std::string(value);
+}
+
+/// @brief 内部调用 token（`DOUYIN_INTERNAL_TOKEN`）；空串表示该通道关闭。
+const std::string& InternalToken() {
+    static const std::string token = EnvOrEmpty("DOUYIN_INTERNAL_TOKEN");
+    return token;
+}
+
+/// @brief 管理员 id 集合（`DOUYIN_ADMIN_USER_IDS`，逗号分隔）。
+/// @note 缺省 `1`：演示环境首个注册用户即管理员；生产用环境变量覆盖。
+const std::vector<std::int64_t>& AdminUserIds() {
+    static const std::vector<std::int64_t> ids = [] {
+        std::string text = EnvOrEmpty("DOUYIN_ADMIN_USER_IDS");
+        if (text.empty()) {
+            text = "1";
+        }
+        std::vector<std::int64_t> parsed;
+        std::size_t pos = 0;
+        while (pos <= text.size()) {
+            const std::size_t comma = text.find(',', pos);
+            const std::string part = text.substr(
+                pos, comma == std::string::npos ? std::string::npos : comma - pos);
+            if (!part.empty()) {
+                char* end = nullptr;
+                const long long value = std::strtoll(part.c_str(), &end, 10);
+                if (end != part.c_str() && *end == '\0' && value > 0) {
+                    parsed.push_back(static_cast<std::int64_t>(value));
+                }
+            }
+            if (comma == std::string::npos) {
+                break;
+            }
+            pos = comma + 1;
+        }
+        return parsed;
+    }();
+    return ids;
+}
+
+/// @brief 是否是管理员。
+bool IsAdminUser(std::int64_t user_id) {
+    if (user_id <= 0) {
+        return false;
+    }
+    for (const std::int64_t id : AdminUserIds()) {
+        if (id == user_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * @brief 写系统通知：`POST /api/notifications/system`，body
+ *        `{user_id, content, target_type?, target_id?}`。
+ *
+ * @param store [in,out] 已打开的存储；借用。
+ * @param request [in] 原始请求；需 `X-Internal-Token` 或管理员 Bearer token。
+ * @param response [out] 成功写 201 `{ok,kind,user_id}`；失败写统一错误体。
+ * @return 恒为 true（已处理）。
+ *
+ * ## 定位
+ * 系统通知的**唯一**写入入口。错了会怎样：普通用户伪造「官方通知」，
+ * 或服务端广播写进了不存在的收件人（列表永远打不开）。
+ *
+ * ## 步骤
+ * step1. 鉴权：内部 token（环境变量，常量时间比较）或 admin 用户；都不是
+ *        则 401（无凭证）/ 403（有凭证但非管理员）——两者不能混为一谈。
+ * step2. 字段校验：user_id > 0、content 1~200 字、target 类型/ id 合法。
+ * step3. 接收者必须存在（404），避免通知投递给幽灵用户。
+ * step4. 写库：actor_id=admin id 或 0（内部调用），kind 固定 system。
+ *
+ * ## 并发/失败语义
+ * - 调用线程：HTTP 事件循环单线程；内部 token/管理员列表在首次调用时缓存。
+ * - 失败语义：写库失败回 500，**不重试**（调用方可重试，通知非幂等）。
+ * - 不变量：成功返回即 notification 已落库，接收者下次拉列表可见。
+ */
+bool HandleSystemNotification(douyin::Store& store,
+                              const douyin::HttpRequest& request,
+                              douyin::HttpResponse* response) {
+    // step1: 内部 token 或 admin Bearer。
+    std::int64_t actor = 0;
+    bool authorized = false;
+    const std::string provided = request.Header("x-internal-token");
+    const std::string& expected = InternalToken();
+    if (!expected.empty() && !provided.empty() &&
+        ConstantTimeEquals(provided, expected)) {
+        authorized = true;
+    } else {
+        const std::string bearer = douyin::BearerToken(request);
+        if (!bearer.empty()) {
+            douyin::TokenInfo info;
+            std::string token_error;
+            if (douyin::VerifyToken(bearer, NowSeconds(), &info, &token_error)) {
+                if (!IsAdminUser(info.user_id)) {
+                    return Fail(response, 403, "需要管理员权限");
+                }
+                authorized = true;
+                actor = info.user_id;
+            }
+        }
+    }
+    if (!authorized) {
+        return Fail(response, 401, "缺少内部 token 或管理员 token");
+    }
+    // step2: 字段校验。
+    std::int64_t user_id = 0;
+    if (!JsonIntField(request.body, "user_id", &user_id) || user_id <= 0) {
+        return Fail(response, 400, "user_id 非法");
+    }
+    std::string content;
+    if (!douyin::JsonStringField(request.body, "content", &content) ||
+        IsBlank(content)) {
+        return Fail(response, 400, "content 不能为空");
+    }
+    if (Utf8Length(content) > 200) {
+        return Fail(response, 400, "content 超过 200 字");
+    }
+    std::string target_type = "system";
+    douyin::JsonStringField(request.body, "target_type", &target_type);
+    if (target_type != "system" && target_type != "video" &&
+        target_type != "user") {
+        return Fail(response, 400, "target_type 非法（system/video/user）");
+    }
+    std::int64_t target_id = 0;
+    if (JsonIntField(request.body, "target_id", &target_id) && target_id < 0) {
+        return Fail(response, 400, "target_id 非法");
+    }
+    // step3: 接收者必须存在。
+    douyin::StoredUser receiver;
+    std::string error;
+    if (!store.FindUserById(user_id, &receiver, &error)) {
+        if (!error.empty()) {
+            std::fprintf(stderr, "[%s] 查询系统通知接收者失败: %s\n", kServiceName,
+                         error.c_str());
+            return Fail(response, 500, "数据库错误");
+        }
+        return Fail(response, 404, "用户不存在");
+    }
+    // step4: 落库（kind 固定 system，actor 可为 0）。
+    if (!store.AddNotification(user_id, actor, "system", target_type, target_id,
+                               content, &error)) {
+        std::fprintf(stderr, "[%s] 写系统通知失败: %s\n", kServiceName,
+                     error.c_str());
+        return Fail(response, 500, "写通知失败");
+    }
+    response->status = 201;
+    response->body = std::string("{\"ok\":true,\"kind\":\"system\","
+                                 "\"user_id\":") +
+                     std::to_string(user_id) + "}";
     return true;
 }
 
@@ -1518,6 +1714,14 @@ bool Handle(douyin::Store& store, const douyin::HttpRequest& request,
         return Fail(response, 405, "方法不允许");
     }
     // 通知接口：精确路径匹配，必须在评论路径解析之前判断，避免被当成视频 id。
+    // 系统通知：网关对该路径注册了 require_auth=false 的静态路由，鉴权在
+    // 本 handler 内完成（内部 token 或 admin），普通用户 403。
+    if (request.path == "/api/notifications/system") {
+        if (request.method == "POST") {
+            return HandleSystemNotification(store, request, response);
+        }
+        return Fail(response, 405, "方法不允许");
+    }
     if (request.path == "/api/notifications") {
         if (request.method == "GET") {
             return HandleNotifications(store, request, response);

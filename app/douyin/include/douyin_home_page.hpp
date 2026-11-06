@@ -588,6 +588,24 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     transition: transform .26s cubic-bezier(.4, 0, .2, 1);
   }
   .notif-panel.open { transform: translateX(0); }
+  .notif-tabs {
+    display: flex; gap: 4px; padding: 8px 14px 6px; flex: none;
+    overflow-x: auto; border-bottom: 1px solid var(--line);
+  }
+  .notif-tab {
+    position: relative; flex: none; padding: 7px 11px; font-size: 13px;
+    color: var(--muted); background: transparent; border: 0; border-radius: 9px;
+    white-space: nowrap; cursor: pointer; transition: background .15s, color .15s;
+  }
+  .notif-tab:hover { color: var(--text); background: rgba(255, 255, 255, .05); }
+  .notif-tab.active {
+    color: #fff; font-weight: 600; background: rgba(254, 44, 85, .16);
+  }
+  .notif-tab-badge {
+    display: inline-block; min-width: 15px; height: 15px; margin-left: 5px;
+    padding: 0 5px; font-size: 10px; font-weight: 700; line-height: 15px;
+    text-align: center; color: #fff; background: var(--pink); border-radius: 999px;
+  }
   .notif-item {
     display: flex; gap: 11px; align-items: flex-start;
     padding: 12px 4px; border-bottom: 1px solid var(--line);
@@ -1092,8 +1110,23 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
       <b>消息通知</b>
       <span id="notifSub">全部已读</span>
     </div>
-    <button class="btn-ghost" id="notifAllRead" type="button">全部已读</button>
+    <button class="btn-ghost" id="notifAllRead" type="button"
+            title="只清空当前分类的未读">全部已读</button>
     <button class="cp-close" id="notifClose" type="button" aria-label="关闭通知">✕</button>
+  </div>
+  <div class="notif-tabs" id="notifTabs" role="tablist" aria-label="通知分类">
+    <button class="notif-tab active" type="button" role="tab" data-kind=""
+            aria-selected="true">全部<span class="notif-tab-badge" data-count="all" hidden></span></button>
+    <button class="notif-tab" type="button" role="tab" data-kind="like"
+            aria-selected="false">赞<span class="notif-tab-badge" data-count="like" hidden></span></button>
+    <button class="notif-tab" type="button" role="tab" data-kind="comment"
+            aria-selected="false">评论<span class="notif-tab-badge" data-count="comment" hidden></span></button>
+    <button class="notif-tab" type="button" role="tab" data-kind="follow"
+            aria-selected="false">关注<span class="notif-tab-badge" data-count="follow" hidden></span></button>
+    <button class="notif-tab" type="button" role="tab" data-kind="mention"
+            aria-selected="false">@我<span class="notif-tab-badge" data-count="mention" hidden></span></button>
+    <button class="notif-tab" type="button" role="tab" data-kind="system"
+            aria-selected="false">系统<span class="notif-tab-badge" data-count="system" hidden></span></button>
   </div>
   <div class="cp-list" id="notifList"><div class="cp-empty">加载中…</div></div>
   <button class="notif-more" id="notifMore" type="button" hidden>加载更多</button>
@@ -2179,13 +2212,19 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
   var notifSubEl = document.getElementById('notifSub');
   var notifBadgeEl = document.getElementById('notifBadge');
   var notifMoreBtn = document.getElementById('notifMore');
-  var notifState = { items: [], cursor: '', unread: 0, loading: false };
+  var notifTabsEl = document.getElementById('notifTabs');
+  /* kind：当前分类（''=全部）；counts：后端一次 GROUP BY 返回的 6 类未读。 */
+  var notifState = {
+    items: [], cursor: '', unread: 0, loading: false, pending: false,
+    kind: '', counts: null
+  };
 
   /* 类型 → 图标；后端已限制 kind 枚举，未知识别成 @mention 兜底。 */
   function notifIcon(kind) {
     if (kind === 'like') return '❤️';
     if (kind === 'comment') return '💬';
     if (kind === 'follow') return '➕';
+    if (kind === 'system') return '📢';
     return '@';
   }
 
@@ -2204,6 +2243,7 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
 
   /* 文案：谁 + 做了什么；content 是后端截断后的摘要。 */
   function notifLine(n) {
+    if (n.kind === 'system') return n.content || '系统通知';
     var who = n.actor_name || ('用户#' + n.actor_id);
     if (n.kind === 'like') {
       return who + (n.target_type === 'comment' ? ' 赞了你的评论' : ' 赞了你的视频');
@@ -2213,6 +2253,34 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     }
     if (n.kind === 'follow') return who + ' 关注了你';
     return who + ' 在评论中提到了你';
+  }
+
+  /* 当前分类的未读数：'' 用 counts.all，其余用 counts[kind]。 */
+  function notifCountFor(kind) {
+    var counts = notifState.counts;
+    if (!counts) return 0;
+    return Number(kind ? counts[kind] : counts.all) || 0;
+  }
+
+  /* 刷新 6 个 tab 的选中态与未读角标（counts 缺失时全部隐藏）。 */
+  function paintNotifTabs() {
+    if (!notifTabsEl) return;
+    notifTabsEl.querySelectorAll('.notif-tab').forEach(function (tab) {
+      var kind = tab.dataset.kind || '';
+      var active = kind === (notifState.kind || '');
+      tab.classList.toggle('active', active);
+      tab.setAttribute('aria-selected', active ? 'true' : 'false');
+      var badge = tab.querySelector('.notif-tab-badge');
+      if (!badge) return;
+      var n = notifState.counts ? notifCountFor(kind) : 0;
+      if (n <= 0) {
+        badge.hidden = true;
+        badge.textContent = '';
+      } else {
+        badge.hidden = false;
+        badge.textContent = n > 99 ? '99+' : String(n);
+      }
+    });
   }
 
   function paintNotifBadge() {
@@ -2277,7 +2345,9 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
   function renderNotifications() {
     notifListEl.innerHTML = '';
     if (!notifState.items.length) {
-      notifEmpty(state.token ? '还没有新消息，去发点视频吧' : '登录后查看消息');
+      notifEmpty(notifState.kind === 'system'
+        ? '还没有系统通知'
+        : (state.token ? '还没有新消息，去发点视频吧' : '登录后查看消息'));
       notifMoreBtn.hidden = true;
       notifSubEl.textContent = '全部已读';
       return;
@@ -2293,11 +2363,15 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
   /* 拉列表：reset=true 重拉第一页，否则按游标续页；固定 limit=20。 */
   function loadNotifications(reset) {
     if (!state.token) { notifState.items = []; renderNotifications(); return; }
-    if (notifState.loading) return;
+    // 切 tab 时若上一页还在飞：记 pending，等它回来再按新分类重拉，避免丢点击。
+    if (notifState.loading) { notifState.pending = true; return; }
     if (reset) { notifState.items = []; notifState.cursor = ''; }
     if (!reset && !notifState.cursor) return;
     notifState.loading = true;
     var path = 'api/notifications?limit=20';
+    if (notifState.kind) {
+      path += '&kind=' + encodeURIComponent(notifState.kind);
+    }
     if (!reset && notifState.cursor) {
       path += '&cursor=' + encodeURIComponent(notifState.cursor);
     }
@@ -2307,14 +2381,22 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
         notifState.items = reset ? items : notifState.items.concat(items);
         notifState.cursor = data.next_cursor || '';
         notifState.unread = Number(data.unread_count) || 0;
+        notifState.counts = data.counts || notifState.counts;
         paintNotifBadge();
+        paintNotifTabs();
         renderNotifications();
       })
       .catch(function (err) {
         notifEmpty('消息加载失败：' + (err.message || '网络错误'));
         handleAuthError(err);
       })
-      .then(function () { notifState.loading = false; });
+      .then(function () {
+        notifState.loading = false;
+        if (notifState.pending) {
+          notifState.pending = false;
+          loadNotifications(true);
+        }
+      });
   }
 
   function openNotifications() {
@@ -2323,6 +2405,7 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     notifPanelEl.classList.add('open');
     notifPanelEl.setAttribute('aria-hidden', 'false');
     backdropEl.classList.add('show');
+    paintNotifTabs();
     renderNotifications();
     loadNotifications(true);
   }
@@ -2338,10 +2421,20 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
   /* 标已读：本地先改（立即反馈），接口失败再回退并提示。 */
   function markNotificationRead(n, row) {
     if (!state.token || n.read_at) return;
+    var kind = n.kind || '';
     n.read_at = Math.floor(Date.now() / 1000);
     if (row) row.classList.remove('unread');
     notifState.unread = Math.max(0, notifState.unread - 1);
+    if (notifState.counts) {
+      notifState.counts.all =
+        Math.max(0, (Number(notifState.counts.all) || 0) - 1);
+      if (kind && Object.prototype.hasOwnProperty.call(notifState.counts, kind)) {
+        notifState.counts[kind] =
+          Math.max(0, (Number(notifState.counts[kind]) || 0) - 1);
+      }
+    }
     paintNotifBadge();
+    paintNotifTabs();
     notifSubEl.textContent = notifState.unread > 0
       ? (notifState.unread + ' 条未读') : '全部已读';
     api('api/notifications/read', { method: 'POST', body: { ids: [n.id] } })
@@ -2353,7 +2446,15 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
         n.read_at = 0;
         if (row) row.classList.add('unread');
         notifState.unread += 1;
+        if (notifState.counts) {
+          notifState.counts.all = (Number(notifState.counts.all) || 0) + 1;
+          if (kind &&
+              Object.prototype.hasOwnProperty.call(notifState.counts, kind)) {
+            notifState.counts[kind] = (Number(notifState.counts[kind]) || 0) + 1;
+          }
+        }
         paintNotifBadge();
+        paintNotifTabs();
         handleAuthError(err);
       });
   }
@@ -2362,6 +2463,11 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
      直接定位到那条视频；评论点赞没有视频 id，只标已读。 */
   function openNotification(n, row) {
     markNotificationRead(n, row);
+    if (n.kind === 'system') {
+      // 系统通知没有可跳转的目标：只标已读并展示正文。
+      toast(n.content || '系统通知', 'ok');
+      return;
+    }
     if (n.kind === 'follow' && n.actor_id) {
       closeNotifications();
       showProfile(n.actor_id);
@@ -2377,21 +2483,51 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     }
   }
 
+  /* 只清当前分类：全部 tab 用 all=true，其它 tab 用 kind=当前类型。 */
   function markAllNotificationsRead() {
-    if (!state.token || notifState.unread <= 0) return;
-    api('api/notifications/read', { method: 'POST', body: { all: true } })
-      .then(function () {
+    if (!state.token) return;
+    var kind = notifState.kind || '';
+    if (notifCountFor(kind) <= 0) {
+      toast('当前分类没有未读消息');
+      return;
+    }
+    var payload = kind ? { kind: kind } : { all: true };
+    api('api/notifications/read', { method: 'POST', body: payload })
+      .then(function (data) {
         var now = Math.floor(Date.now() / 1000);
-        notifState.items.forEach(function (n) { n.read_at = now; });
-        notifState.unread = 0;
+        notifState.items.forEach(function (n) {
+          if (!kind || n.kind === kind) n.read_at = now;
+        });
+        notifState.unread = Number(data.unread_count) || 0;
+        if (notifState.counts) {
+          if (kind) {
+            notifState.counts[kind] = 0;
+            notifState.counts.all = Math.max(0, notifState.unread);
+          } else {
+            ['all', 'like', 'comment', 'follow', 'mention', 'system']
+              .forEach(function (k) { notifState.counts[k] = 0; });
+          }
+        }
         paintNotifBadge();
+        paintNotifTabs();
         renderNotifications();
-        toast('已全部标记为已读', 'ok');
+        toast(kind ? '当前分类已全部标记为已读' : '已全部标记为已读', 'ok');
       })
       .catch(function (err) {
         toast('操作失败：' + (err.message || '网络错误'), 'err');
         handleAuthError(err);
       });
+  }
+
+  /* 切换分类：清空当前列表后按新 kind 重拉第一页。 */
+  function setNotifKind(kind) {
+    if ((notifState.kind || '') === kind) return;
+    notifState.kind = kind;
+    notifState.items = [];
+    notifState.cursor = '';
+    paintNotifTabs();
+    renderNotifications();
+    loadNotifications(true);
   }
 
   function slideById(videoId) {
@@ -4643,6 +4779,11 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
   document.getElementById('notifBtn').addEventListener('click', openNotifications);
   document.getElementById('notifClose').addEventListener('click', closeNotifications);
   document.getElementById('notifAllRead').addEventListener('click', markAllNotificationsRead);
+  notifTabsEl.addEventListener('click', function (ev) {
+    var tab = ev.target.closest ? ev.target.closest('.notif-tab') : null;
+    if (!tab) return;
+    setNotifKind(tab.dataset.kind || '');
+  });
   notifMoreBtn.addEventListener('click', function () { loadNotifications(false); });
   setInterval(function () {
     if (state.token) refreshUnreadNotifications();

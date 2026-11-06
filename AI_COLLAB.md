@@ -1559,3 +1559,46 @@ latest（服务重启）→ `resume_gap`，客户端走 REST 全量刷新。
     被当行注释导致误报；
   - WSL 树仍不能直接 write/edit → 「Windows `.dsh_tmp` 落盘 + `wsl cp`」。
 - **状态**：已提交（本轮 commit）。
+
+## 2026-11-06 第 9 轮：消息三件套（通知分类 / 系统通知 / 单类已读）
+
+- **需求**：真树 WSL `/UserData/CodexWorkSpace/Go2cpp`（非 `E:\CodexWorkspace\Go2Cpp`）；
+  一轮 2–3 个内联功能；验收 = 功能齐全、无明显 bug、2C4G 下 TTFB < 200 ms。
+- **存储层**（`douyin_store.hpp` / `douyin_store.cpp`）：
+  - `kind` 白名单加 `system`；`AddNotification` 对 system 放开
+    `actor_id=0` / `target_id=0`；
+  - `ListNotifications` 增 `kind` 过滤（参数绑定，4 种组合各一条 SQL）；
+  - 新增 `CountUnreadNotificationsByKind`：1 条 `GROUP BY kind` 出 6 类未读，
+    `all` 含历史脏 kind；
+  - 新增索引 `idx_notifications_kind(user_id, read_at, kind)`，
+    分类计数无临时 B 树；
+  - `MarkNotificationsRead` 增 `kind` 参数（单类已读，kind 优先于 all/ids）。
+- **服务层**（`interaction_service.cpp`）：
+  - `GET /api/notifications?kind=` 白名单校验 +
+    `counts{all,like,comment,follow,mention,system}`；`unread_count` 保留兼容
+    （= counts.all）；列表固定 2 条 SQL（列表 + GROUP BY）；
+  - `POST /api/notifications/read` 支持 `{"kind":"like"}`；
+  - 新增 `POST /api/notifications/system`：内部 token
+    （`DOUYIN_INTERNAL_TOKEN`，常量时间比较）或 admin
+    （`DOUYIN_ADMIN_USER_IDS`，演示缺省 1）；无凭证 401 / 非管理员 403 /
+    接收者不存在 404 / content 1~200 字。
+- **网关**（`gateway.cpp`）：`/api/notifications/system` 静态路由（Static 优先于
+  `/api/notifications/**` 通配），`require_auth=false`，鉴权下沉到上游。
+- **前端**（`douyin_home_page.hpp`）：
+  - 通知面板 6 tab（全部/赞/评论/关注/@我/系统）+ 每 tab 未读角标（counts）；
+  - 切 tab 清列表重拉；loading 中切 tab 记 pending，完成后按新分类重拉；
+  - 系统通知 📢、正文直显、点击只标已读不跳转；空态按分类区分；
+  - 「全部已读」按当前 tab 发 `{kind}` 或 `{all:true}`，本地 counts 同步。
+- **验证**：
+  - `bash app/douyin/build.sh` → 8 个二进制 ok，`-Werror -Wpedantic` 零告警；
+  - 新增 `scripts/accept_notif_cluster.sh` → **111 PASS / 0 FAIL**；
+  - 回归 `accept_notifications.sh` 92 PASS、`accept_all.sh` 70 PASS，全 0 FAIL；
+  - TTFB（20 次串行）分类通知平均 0 ms / 最大 1 ms（阈值 200 ms）；
+  - counts 查询计划命中 `idx_notifications_kind` 且无 TEMP B-TREE；
+  - 内联 JS 用 Windows node `--check` 语法通过。
+- **踩坑**：
+  - 服务层 `IsValidNotificationKind` 定义在使用点之后 → `-Werror=unused-function`
+    且编译失败，定义挪到常量区之后；
+  - pwsh 双引号里反引号/中文/`$?` 会被 PowerShell 解析，脚本必须落盘再 `wsl cp`；
+  - `kinds_all` 末尾多逗号导致 5 个分类断言误报，改函数去掉尾逗号。
+- **状态**：已提交（本轮 commit）。

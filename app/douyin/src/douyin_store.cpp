@@ -362,6 +362,9 @@ constexpr const char* kSchemaSql =
     "ON notifications(user_id, read_at, created_at);"
     "CREATE INDEX IF NOT EXISTS idx_notifications_timeline "
     "ON notifications(user_id, created_at DESC, id DESC);"
+    // 分类计数：`GROUP BY kind` 直接按索引顺序分组，不建临时 B 树。
+    "CREATE INDEX IF NOT EXISTS idx_notifications_kind "
+    "ON notifications(user_id, read_at, kind);"
     // 举报：唯一键挡住「同一个人对同一目标反复举报」；status 留给运营后台，
     // 用户接口不暴露举报列表。
     "CREATE TABLE IF NOT EXISTS reports ("
@@ -2136,12 +2139,13 @@ namespace {
 /// @brief 合法通知类型；未知 kind 拒绝，避免脏数据让前端渲染成未知文案。
 bool IsValidNotificationKind(std::string_view kind) {
     return kind == "like" || kind == "comment" || kind == "follow" ||
-           kind == "mention";
+           kind == "mention" || kind == "system";
 }
 
-/// @brief 合法通知目标类型。
+/// @brief 合法通知目标类型（`system` 只用于系统通知，可无具体目标）。
 bool IsValidNotificationTargetType(std::string_view type) {
-    return type == "video" || type == "comment" || type == "user";
+    return type == "video" || type == "comment" || type == "user" ||
+           type == "system";
 }
 
 }  // namespace
@@ -2152,7 +2156,11 @@ bool Store::AddNotification(std::int64_t user_id, std::int64_t actor_id,
                             std::int64_t target_id,
                             const std::string& content, std::string* error) {
     // step1: 参数校验——脏数据写进去只能靠人工清理，宁可不写。
-    if (user_id <= 0 || actor_id <= 0 || target_id <= 0 ||
+    //        system 是唯一允许「无真人触发者 / 无具体目标」的类型：
+    //        系统广播由服务端发起，actor_id=0、target_id=0 表示无。
+    const bool is_system = kind == "system";
+    if (user_id <= 0 || actor_id < 0 || target_id < 0 ||
+        (!is_system && (actor_id == 0 || target_id == 0)) ||
         !IsValidNotificationKind(kind) ||
         !IsValidNotificationTargetType(target_type)) {
         if (error != nullptr) {
@@ -2181,8 +2189,8 @@ bool Store::AddNotification(std::int64_t user_id, std::int64_t actor_id,
     return true;
 }
 
-bool Store::ListNotifications(std::int64_t user_id, const std::string& cursor,
-                              std::int64_t limit,
+bool Store::ListNotifications(std::int64_t user_id, const std::string& kind,
+                              const std::string& cursor, std::int64_t limit,
                               std::vector<StoredNotification>* out,
                               std::string* next_cursor, std::string* error) {
     next_cursor->clear();
@@ -2196,6 +2204,7 @@ bool Store::ListNotifications(std::int64_t user_id, const std::string& cursor,
         return true;
     }
     const bool has_cursor = !cursor.empty();
+    const bool has_kind = !kind.empty();
     std::int64_t cursor_created = 0;
     std::int64_t cursor_id = 0;
     if (has_cursor &&
@@ -2216,15 +2225,30 @@ bool Store::ListNotifications(std::int64_t user_id, const std::string& cursor,
         // 数字比列表多。
         " AND n.actor_id NOT IN (SELECT blocked_id FROM blocks"
         " WHERE user_id = ?)";
+    // kind 已由服务层按白名单校验，但仍走参数绑定，不拼进 SQL 文本。
+    if (has_kind) {
+        sql += " AND n.kind = ?";
+    }
     if (has_cursor) {
         sql += " AND (n.created_at < ? OR (n.created_at = ? AND n.id < ?))";
     }
     sql += " ORDER BY n.created_at DESC, n.id DESC LIMIT ?";
 
-    auto rows = has_cursor
-                    ? m_db->Query(sql, user_id, user_id, cursor_created,
-                                  cursor_created, cursor_id, limit + 1)
-                    : m_db->Query(sql, user_id, user_id, limit + 1);
+    // 4 种参数组合各调一次，保持参数绑定顺序与 SQL 占位符一一对应。
+    auto rows = [&]() {
+        if (has_kind) {
+            if (has_cursor) {
+                return m_db->Query(sql, user_id, user_id, kind, cursor_created,
+                                   cursor_created, cursor_id, limit + 1);
+            }
+            return m_db->Query(sql, user_id, user_id, kind, limit + 1);
+        }
+        if (has_cursor) {
+            return m_db->Query(sql, user_id, user_id, cursor_created,
+                               cursor_created, cursor_id, limit + 1);
+        }
+        return m_db->Query(sql, user_id, user_id, limit + 1);
+    }();
     if (!rows) {
         if (error != nullptr) {
             *error = "查询通知失败: " + DescribeError(rows.Err());
@@ -2292,9 +2316,71 @@ std::int64_t Store::CountUnreadNotifications(std::int64_t user_id,
     return rows.Value().Int64(0);
 }
 
+bool Store::CountUnreadNotificationsByKind(
+    std::int64_t user_id, NotificationUnreadCounts* out, std::string* error) {
+    if (out == nullptr) {
+        if (error != nullptr) {
+            *error = "输出参数为空";
+        }
+        return false;
+    }
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return false;
+    }
+    // step1: 一条 GROUP BY 拿到全部 kind 的未读数；输出行数 = kind 数。
+    //        过滤条件与 ListNotifications / CountUnreadNotifications 完全一致，
+    //        保证 tab 角标与列表条数对得上。
+    auto rows = m_db->Query(
+        "SELECT kind, COUNT(*) FROM notifications"
+        " WHERE user_id = ? AND read_at = 0"
+        " AND actor_id NOT IN (SELECT blocked_id FROM blocks WHERE user_id = ?)"
+        " GROUP BY kind",
+        user_id, user_id);
+    if (!rows) {
+        if (error != nullptr) {
+            *error = "统计分类未读失败: " + DescribeError(rows.Err());
+        }
+        return false;
+    }
+    NotificationUnreadCounts counts;
+    while (rows.Value().Next()) {
+        const std::string kind = rows.Value().Text(0);
+        const std::int64_t value = rows.Value().Int64(1);
+        if (value <= 0) {
+            continue;
+        }
+        // all 含历史脏 kind：徽章不能比列表少，否则未读永远清不掉。
+        counts.all += value;
+        if (kind == "like") {
+            counts.like = value;
+        } else if (kind == "comment") {
+            counts.comment = value;
+        } else if (kind == "follow") {
+            counts.follow = value;
+        } else if (kind == "mention") {
+            counts.mention = value;
+        } else if (kind == "system") {
+            counts.system = value;
+        }
+    }
+    if (rows.Value().Err()) {
+        if (error != nullptr) {
+            *error = "遍历分类未读失败: " + DescribeError(rows.Value().Err());
+        }
+        return false;
+    }
+    // step2: 整体写入，避免调用方看到半更新的计数。
+    *out = counts;
+    return true;
+}
+
 std::int64_t Store::MarkNotificationsRead(std::int64_t user_id,
                                           const std::vector<std::int64_t>& ids,
-                                          bool all, std::string* error) {
+                                          bool all, const std::string& kind,
+                                          std::string* error) {
     if (!Ok()) {
         if (error != nullptr) {
             *error = "数据库尚未打开";
@@ -2302,7 +2388,22 @@ std::int64_t Store::MarkNotificationsRead(std::int64_t user_id,
         return -1;
     }
     const std::int64_t now = static_cast<std::int64_t>(std::time(nullptr));
-    // step1: 全部已读——一条 UPDATE 命中 (user_id, read_at) 索引前缀。
+    // step1: 单类已读（tab 右上角「全部已读」）——kind 优先于 all/ids，
+    //        一条 UPDATE 命中 (user_id, read_at, kind) 索引。
+    if (!kind.empty()) {
+        auto updated = m_db->Exec(
+            "UPDATE notifications SET read_at = ?"
+            " WHERE user_id = ? AND read_at = 0 AND kind = ?",
+            now, user_id, kind);
+        if (!updated) {
+            if (error != nullptr) {
+                *error = "标记通知已读失败: " + DescribeError(updated.Err());
+            }
+            return -1;
+        }
+        return updated.Value().changes;
+    }
+    // step2: 全部已读——一条 UPDATE 命中 (user_id, read_at) 索引前缀。
     if (all) {
         auto updated = m_db->Exec(
             "UPDATE notifications SET read_at = ?"

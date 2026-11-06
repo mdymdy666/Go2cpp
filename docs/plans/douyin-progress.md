@@ -2,10 +2,10 @@
 
 | 项 | 内容 |
 |---|---|
-| 盘点时间 | 2026-11-06（第 8 轮） |
+| 盘点时间 | 2026-11-06（第 9 轮） |
 | 盘点范围 | `app/douyin/` 全部源码（7 服务 + 网关 + 单页前端） |
 | 盘点方式 | 读 REQUIREMENTS.md、逐服务路由表、前端函数/元素清单、关键词扫描、跑既有验收 |
-| 基线 | `scripts/accept_all.sh` → 70 PASS / 0 FAIL；`scripts/accept_notifications.sh` → 92 PASS / 0 FAIL；`scripts/accept_report_block.sh` → 79 PASS / 0 FAIL；`scripts/accept_share_landing.sh` → 88 PASS / 0 FAIL；`scripts/accept_profile_tabs.sh` → **115 PASS / 0 FAIL**；`scripts/accept_player_cluster.sh` → **94 PASS / 0 FAIL** |
+| 基线 | `scripts/accept_all.sh` → 70 PASS / 0 FAIL；`scripts/accept_notifications.sh` → 92 PASS / 0 FAIL；`scripts/accept_report_block.sh` → 79 PASS / 0 FAIL；`scripts/accept_share_landing.sh` → 88 PASS / 0 FAIL；`scripts/accept_profile_tabs.sh` → **115 PASS / 0 FAIL**；`scripts/accept_player_cluster.sh` → **94 PASS / 0 FAIL**；`scripts/accept_notif_cluster.sh` → **111 PASS / 0 FAIL** |
 
 > 说明：本文档只记录**代码里核实过**的能力。摘要里提到但代码未命中的项，
 > 统一标「待核实」，不当作已完成。
@@ -50,6 +50,12 @@
 - [x] **消息通知中心（第 2 轮新增）**：`notifications` 表 + 顶部 🔔 未读徽章 +
       右侧通知面板；被赞（视频/评论）/被评论/被回复/被关注写通知，自己触发
       自己不写，重复点赞不重复写；列表固定 2 条 SQL、未读数单条索引 COUNT
+- [x] **消息三件套（第 9 轮新增）**：通知分类 tab（`?kind=like|comment|follow|
+      mention|system`；`counts` 一次 GROUP BY 出 6 类未读，前端每 tab 角标）/
+      系统通知（`POST /api/notifications/system`，内部 token 或 admin，
+      `kind=system` 白名单放开、📢 展示、点击不跳转）/ 单类已读
+      （`POST /api/notifications/read {"kind":"like"}`，每 tab「全部已读」
+      只清当前分类）
 
 - [x] **举报 / 拉黑（第 3 轮新增）**：`reports` / `blocks` 两表；举报去重 +
       拉黑/取消/状态/黑名单 5 个接口；feed / 视频详情 / 评论 / 搜索 / 通知 /
