@@ -26,7 +26,7 @@
  *          - 进度条支持 60ms 节流 seek、上方悬浮时间预览与 buffered 高亮，
  *            松手后恢复原播放状态；
  *          - 「推荐 / 关注」双 tab（`GET api/feed` / `GET api/feed/following`），
- *            自动连播默认开：播完切下一条，到底提示并刷新推荐流；
+ *            自动连播默认**关**（用户反馈无用）：需要时手动开，到底提示并刷新推荐流；
  *          - `preload="none"` + 同名 `videos/<name>.jpg` 封面：首屏只拉缩略图，
  *            视频字节等真正播放/拖动时才加载；
  *          - 评论图标打开右侧抽屉，`GET api/comment/<id>?limit=50&sort=` 拉列表
@@ -1165,7 +1165,7 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
            placeholder="密码" autocomplete="current-password">
     <button class="btn-primary login-only" id="loginBtn" type="button">登录</button>
     <button class="btn-ghost" id="autoplayBtn" type="button"
-            title="自动连播：一条播完自动切下一条" aria-pressed="true">连播：开</button>
+            title="自动连播：一条播完自动切下一条" aria-pressed="false">连播：关</button>
     <button class="btn-ghost" id="rateBtn" type="button"
             title="播放倍速（长按视频可临时 2×）">倍速：1×</button>
     <span class="vol" title="视频音量">
@@ -1468,7 +1468,7 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     fit: 'contain',
     muted: true,
     volume: 1,
-    autoplay: true,
+    autoplay: false,
     rate: 1,
     feedTab: 'recommend',
     deepLink: ''
@@ -1488,7 +1488,7 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
   state.volume = isFinite(savedVol) && savedVol >= 0 ? Math.min(savedVol, 1) : 1;
 
   /* 自动连播默认开；关掉后单条循环。倍速持久化，长按只做临时 2×。 */
-  state.autoplay = localStorage.getItem(AUTOPLAY_KEY) !== '0';
+  state.autoplay = localStorage.getItem(AUTOPLAY_KEY) === '1';
   state.rate = normalizeRate(Number(localStorage.getItem(RATE_KEY)) || 1);
   /* 直达链接：/v/<id> 或 ?video=<id> */
   var deepPath = location.pathname.match(/\/v\/(\d+)\/?$/);
