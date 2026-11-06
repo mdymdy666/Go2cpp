@@ -1275,15 +1275,24 @@ bool HandleSharePage(douyin::Store& store, const douyin::HttpRequest& request,
             data.following = following;
         }
     }
-    // step5: 评论区第一页（20 条）；失败只降级空评论，不回 500。
+    // step5: 评论区第一页（置顶在前，再按时间 20 条）；失败只降级空评论。
     std::vector<douyin::StoredComment> comments;
     std::string next_cursor;
-    if (!store.ListComments(video_id, "", 20, &comments, &next_cursor, &error,
-                            viewer)) {
+    std::vector<douyin::StoredComment> pinned;
+    if (!store.ListPinnedComments(video_id, viewer, &pinned, &error)) {
+        std::fprintf(stderr, "[%s] 查询落地页置顶评论失败: %s\n",
+                     kServiceName, error.c_str());
+        pinned.clear();
+    }
+    if (!store.ListComments(video_id, "", 20, "new", &comments, &next_cursor,
+                            &error, viewer)) {
         std::fprintf(stderr, "[%s] 查询落地页评论失败: %s\n", kServiceName,
                      error.c_str());
         comments.clear();
     } else {
+        if (!pinned.empty()) {
+            comments.insert(comments.begin(), pinned.begin(), pinned.end());
+        }
         if (!store.FillCommentLikes(viewer, &comments, &error)) {
             std::fprintf(stderr, "[%s] 回填落地页评论点赞失败: %s\n",
                          kServiceName, error.c_str());
@@ -1297,6 +1306,7 @@ bool HandleSharePage(douyin::Store& store, const douyin::HttpRequest& request,
             item.created_at = comment.created_at;
             item.like_count = comment.like_count;
             item.liked = comment.liked;
+            item.pinned = comment.pinned_at > 0;
             data.comments.push_back(std::move(item));
         }
         data.next_cursor = std::move(next_cursor);

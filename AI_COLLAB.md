@@ -1450,3 +1450,38 @@ latest（服务重启）→ `resume_gap`，客户端走 REST 全量刷新。
     `EXPLAIN QUERY PLAN` 命中 `idx_likes_user`。
 - **已知限制**：喜欢/收藏的「他人可见性」是硬编码私密，尚无用户级可见性设置；
   `/api/video/favorites`（旧收藏页）仍无 cursor 分页，主页新接口有。
+
+
+## 2026-11-06 17:30 douyin 第 6 轮：社交三件套（@mention / 评论排序 / 评论置顶）
+
+- **需求**：一轮内做 3 个复用「评论」代码的相邻功能，避免单点交付。
+- **后端**（`interaction_service.cpp`、`douyin_store.{hpp,cpp}`、`douyin_proto.*`）：
+  - `GET /api/comment/:video_id?sort=hot|new`（缺省 new）；hot =
+    点赞数 DESC → 时间 DESC → id DESC，点赞数用 `comment_likes` 相关子查询回算
+    （评论点赞数不落列，保持第 1 轮设计）；new/hot 游标格式不同、串用 400；
+  - `GET /api/video/:id/comments` 路径别名（网关 `method_mask::kAll` 参数路由 →
+    interaction，POST 由上游回 405）；
+  - `comments.pinned_at` 迁移 + `idx_comments_pinned`；`POST|DELETE
+    /api/comment/:id/pin` 仅视频作者，非作者 403、不存在 404、回复 400；
+    第一页固定前置置顶评论（不占 limit、翻页不重复）；
+  - `@mention`：解析中文/英文/数字 1~20 码点，`users.name` 精确匹配（重名取
+    id 最小），写 `mention`/`video` 通知；自己@自己、重复@、邮箱 `a@b` 均不写；
+  - `idx_users_name`；`FindUserByName`；`SetCommentPinned`；`ListPinnedComments`。
+- **前端**（`douyin_home_page.hpp`）：评论面板「最新/最热」切换；置顶标签 +
+  作者置顶按钮；`@` 用户补全下拉（search 接口前 5、防抖、↑↓/Enter、
+  过期响应丢弃）；通知文案「X 在评论中提到了你」；分享页首屏置顶标签与排序。
+- **验证**：
+  - `bash app/douyin/build.sh` → 8 个二进制全 ok，`-Werror` 零告警；
+  - `bash app/douyin/scripts/accept_social_cluster.sh` → **89 PASS / 0 FAIL**；
+  - `accept_all.sh` → 70 PASS / 0 FAIL；历史回归 comment_like 33、
+    notifications 92、report_block 79、share_landing 88、profile_tabs 115，全 0 FAIL；
+  - hot 评论列表 TTFB（20 次串行）avg **1.18 ms** / max **1.54 ms**；
+  - 无 node 环境：抓 `GET /` 内联 JS，跳过字符串/注释/正则后括号严格配平，
+    本轮函数与元素齐全。
+- **踩坑**：
+  - `ReadCursor` 用 new 解码器预校验 → hot 游标 400；校验下沉到 store 按 sort 解码；
+  - hot/new SQL 的 `?=0` 开关参数误传 viewer_id（匿名恰好都为 0）；改显式 0/1；
+  - 别名路径只注册 kReadMask → POST 被 `/api/video/**` 吃成 404；改 kAll；
+  - WSL 树不能直接 write/edit：仍用「Windows `.dsh_tmp` 落盘 + `wsl cp`」。
+- **状态**：已提交（本轮 commit）。
+

@@ -152,7 +152,8 @@ std::string ToJson(const Comment& value) {
            std::to_string(value.created_at) + "," + Key("parent_id") +
            std::to_string(value.parent_id) + "," + Key("like_count") +
            std::to_string(value.like_count) + "," + Key("liked") +
-           (value.liked ? "true" : "false") + "}";
+           (value.liked ? "true" : "false") + "," + Key("pinned_at") +
+           std::to_string(value.pinned_at) + "}";
 }
 
 std::string ToJson(const Like& value) {

@@ -23,8 +23,9 @@
  *            已点赞只播动画不重复请求；单击挂起 240ms 以区分双击；
  *          - `preload="none"` + 同名 `videos/<name>.jpg` 封面：首屏只拉缩略图，
  *            视频字节等真正播放/拖动时才加载；
- *          - 评论图标打开右侧抽屉，`GET api/comment/<id>?limit=50` 拉列表，
- *            登录后 `POST api/comment` 发送并插入列表头、同步计数；
+ *          - 评论图标打开右侧抽屉，`GET api/comment/<id>?limit=50&sort=` 拉列表
+ *            （最新/最热切换、置顶标签与作者置顶按钮），登录后 `POST api/comment`
+ *            发送并插入列表头、同步计数；输入 `@` 弹用户补全下拉；
  *          - 作者名/头像打开用户主页，`GET api/user/<id>` + `api/feed?limit=100`
  *            前端按 `user_id` 过滤出该用户视频（最多 30 条），可返回 feed。
  *
@@ -439,6 +440,23 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
   .cp-head .cp-titles { min-width: 0; flex: 1; }
   .cp-head b { display: block; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .cp-head span { font-size: 12px; color: var(--muted); }
+  .cp-sort {
+    display: inline-flex; flex: 0 0 auto; padding: 2px;
+    border-radius: 8px; background: #23232e;
+  }
+  .cp-sort button {
+    padding: 4px 9px; border-radius: 6px;
+    font-size: 12px; color: var(--muted);
+  }
+  .cp-sort button.on { color: #fff; background: rgba(254, 44, 85, .92); }
+  .cp-pin {
+    display: inline-block; margin-left: 6px; padding: 0 5px;
+    border-radius: 5px; font-size: 10.5px; font-weight: 700; color: #fff;
+    background: linear-gradient(92deg, var(--pink), #ff5c7a);
+    vertical-align: 1px;
+  }
+  .cp-pin-btn { margin-left: 6px; font-size: 11.5px; color: var(--muted); }
+  .cp-pin-btn:hover { color: var(--pink); }
   .cp-close {
     width: 32px; height: 32px; border-radius: 50%;
     background: #23232e; color: var(--text); font-size: 15px; line-height: 1;
@@ -451,9 +469,22 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
   .cp-txt { font-size: 14px; line-height: 1.55; word-break: break-word; }
   .cp-empty { padding: 48px 16px; text-align: center; color: var(--muted); font-size: 13.5px; }
   .cp-form {
+    position: relative;
     display: flex; gap: 8px; padding: 12px 16px calc(12px + env(safe-area-inset-bottom));
     border-top: 1px solid var(--line); background: #171721;
   }
+  .mention-menu {
+    position: absolute; left: 16px; right: 16px; bottom: calc(100% - 2px);
+    z-index: 5; overflow: hidden;
+    background: #23232e; border: 1px solid var(--line); border-radius: 10px;
+    box-shadow: 0 -14px 34px -14px rgba(0, 0, 0, .9);
+  }
+  .mention-item {
+    display: block; width: 100%; padding: 9px 12px;
+    text-align: left; font-size: 13px; color: var(--text);
+  }
+  .mention-item:hover, .mention-item.active { background: rgba(254, 44, 85, .16); }
+  .mention-empty { padding: 10px 12px; font-size: 12.5px; color: var(--muted); }
   .cp-form input {
     flex: 1; min-width: 0; padding: 10px 12px;
     background: #1e1e29; color: var(--text);
@@ -865,10 +896,15 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
       <b id="cpTitle">评论</b>
       <span id="cpCount">0 条评论</span>
     </div>
+    <div class="cp-sort" id="cpSort" role="tablist" aria-label="评论排序">
+      <button type="button" data-sort="new" class="on" role="tab" aria-selected="true">最新</button>
+      <button type="button" data-sort="hot" role="tab" aria-selected="false">最热</button>
+    </div>
     <button class="cp-close" id="cpClose" type="button" aria-label="关闭评论">✕</button>
   </div>
   <div class="cp-list" id="cpList"><div class="cp-empty">加载中…</div></div>
   <form class="cp-form" id="cpForm">
+    <div class="mention-menu" id="mentionMenu" hidden></div>
     <input id="cpInput" type="text" maxlength="500" placeholder="说点什么…" autocomplete="off">
     <button id="cpSend" type="submit">发送</button>
   </form>
@@ -999,6 +1035,8 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     activeVideo: null,
     panelVideoId: '',
     panelSlide: null,
+    panelOwnerId: '',
+    commentSort: 'new',
     profileUserId: '',
     profileView: null,
     fit: 'contain',
@@ -1035,6 +1073,8 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
   var cpCount = document.getElementById('cpCount');
   var cpInput = document.getElementById('cpInput');
   var cpSend = document.getElementById('cpSend');
+  var cpSort = document.getElementById('cpSort');
+  var mentionMenu = document.getElementById('mentionMenu');
   var profileEl = document.getElementById('profileView');
   var profileBody = document.getElementById('profileBody');
   var tagEl = document.getElementById('tagView');
@@ -1300,6 +1340,12 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     var uid = document.createElement('b');
     uid.textContent = '用户 #' + (c.user_id === undefined ? '—' : c.user_id);
     who.appendChild(uid);
+    if (Number(c.pinned_at) > 0) {
+      var pinTag = document.createElement('span');
+      pinTag.className = 'cp-pin';
+      pinTag.textContent = '置顶';
+      who.appendChild(pinTag);
+    }
     who.appendChild(document.createTextNode(' · ' + fmtTime(c.created_at)));
     var replyBtn = document.createElement('button');
     replyBtn.type = 'button';
@@ -1315,6 +1361,18 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     cmtMore.title = '举报 / 拉黑';
     cmtMore.addEventListener('click', function () { openCommentMenu(c); });
     who.appendChild(cmtMore);
+    /* 置顶按钮只对视频作者显示；服务端仍会再校验一次权限（非作者 403）。 */
+    if (state.user && state.panelOwnerId &&
+        String(state.user.id) === state.panelOwnerId) {
+      var pinBtn = document.createElement('button');
+      pinBtn.type = 'button';
+      pinBtn.className = 'cp-pin-btn';
+      pinBtn.textContent = Number(c.pinned_at) > 0 ? '取消置顶' : '置顶';
+      pinBtn.addEventListener('click', function () {
+        toggleCommentPin(pinBtn, c);
+      });
+      who.appendChild(pinBtn);
+    }
 
     var txt = document.createElement('div');
     txt.className = 'cp-txt';
@@ -1500,19 +1558,73 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     var v = item.video || {};
     state.panelVideoId = String(v.id || slide.dataset.id);
     state.panelSlide = slide;
+    /* 记录视频作者：决定是否显示「置顶」按钮（服务端仍会二次校验）。 */
+    state.panelOwnerId = v.user_id === undefined ? '' : String(v.user_id);
     cpTitle.textContent = v.title || ('视频 #' + state.panelVideoId);
     cpCount.textContent = fmt(v.comment_count) + ' 条评论';
-    cpList.innerHTML = '<div class="cp-empty">加载中…</div>';
     panelEl.classList.add('open');
     panelEl.setAttribute('aria-hidden', 'false');
     backdropEl.classList.add('show');
-    api('api/comment/' + state.panelVideoId + '?limit=50')
+    syncCommentSort();
+    loadComments();
+    setTimeout(function () { cpInput.focus(); }, 120);
+  }
+
+  /* 评论列表重新拉取：切换排序、置顶/取消置顶后都走这里。
+     排序与置顶都由服务端决定；第一页固定把置顶评论放在最前。 */
+  function loadComments() {
+    cpList.innerHTML = '<div class="cp-empty">加载中…</div>';
+    api('api/comment/' + state.panelVideoId + '?limit=50&sort=' +
+        encodeURIComponent(state.commentSort))
       .then(function (data) { renderComments(data.items); })
       .catch(function (err) {
         cpList.innerHTML = '<div class="cp-empty">评论加载失败：' +
           (err.message || '网络错误') + '</div>';
       });
-    setTimeout(function () { cpInput.focus(); }, 120);
+  }
+
+  /* 排序按钮高亮：state 是唯一真源，按钮只跟着它画。 */
+  function syncCommentSort() {
+    if (!cpSort) return;
+    cpSort.querySelectorAll('button').forEach(function (btn) {
+      var on = btn.getAttribute('data-sort') === state.commentSort;
+      btn.classList.toggle('on', on);
+      btn.setAttribute('aria-selected', on ? 'true' : 'false');
+    });
+  }
+
+  if (cpSort) {
+    cpSort.addEventListener('click', function (ev) {
+      var btn = ev.target.closest('button');
+      if (!btn) return;
+      var sort = btn.getAttribute('data-sort');
+      if (!sort || sort === state.commentSort) return;
+      state.commentSort = sort;
+      syncCommentSort();
+      loadComments();
+    });
+  }
+
+  /* 置顶 / 取消置顶：成功后重拉列表，让顺序与标签以服务端为准。 */
+  function toggleCommentPin(btn, c) {
+    if (btn._busy) return;
+    if (!state.token) { toast('请先登录', 'err'); return; }
+    btn._busy = true;
+    var wanted = !(Number(c.pinned_at) > 0);
+    api('api/comment/' + c.id + '/pin', { method: wanted ? 'POST' : 'DELETE' })
+      .then(function (data) {
+        var comment = (data && data.comment) || {};
+        c.pinned_at = Number(comment.pinned_at) || 0;
+        toast(wanted ? '已置顶这条评论' : '已取消置顶', 'ok');
+        loadComments();
+      })
+      .catch(function (err) {
+        if (!handleAuthError(err)) {
+          toast((wanted ? '置顶' : '取消置顶') + '失败：' +
+                (err.message || '网络错误'), 'err');
+        }
+      })
+      .then(function () { btn._busy = false; });
   }
 
   function closeComments() {
@@ -1521,6 +1633,157 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     backdropEl.classList.remove('show');
     state.panelSlide = null;
   }
+
+  /* ---------- @mention 补全 ---------- */
+
+  /* 下拉的当前状态：items 是搜索到的用户（最多 5 个），index 是键盘高亮项，
+     seq 用来丢弃「已过时」的搜索响应（快速输入时后发先至）。 */
+  var mentionState = { open: false, items: [], index: -1, seq: 0 };
+  var mentionTimer = 0;
+
+  function closeMention() {
+    mentionTimer = 0;
+    mentionState.open = false;
+    mentionState.items = [];
+    mentionState.index = -1;
+    mentionState.seq += 1;
+    if (!mentionMenu) return;
+    mentionMenu.hidden = true;
+    mentionMenu.innerHTML = '';
+  }
+
+  /* 光标前是否正处于一个 `@昵称` 输入中；返回 @ 的位置与已输入片段。
+     `a@b` 这类邮箱不算提及，与后端解析规则保持一致。 */
+  function mentionQuery() {
+    var pos = cpInput.selectionStart;
+    if (pos === null || pos === undefined) pos = cpInput.value.length;
+    var text = cpInput.value.slice(0, pos);
+    var at = text.lastIndexOf('@');
+    if (at < 0) return null;
+    if (at > 0) {
+      var prev = text.charAt(at - 1);
+      if (/[0-9A-Za-z_]/.test(prev)) return null;
+    }
+    var word = text.slice(at + 1);
+    if (/[\s@]/.test(word)) return null;
+    if (word.length > 20) return null;
+    return { at: at, word: word };
+  }
+
+  function paintMention() {
+    if (!mentionMenu) return;
+    mentionMenu.innerHTML = '';
+    if (!mentionState.items.length) {
+      var empty = document.createElement('div');
+      empty.className = 'mention-empty';
+      empty.textContent = '没有匹配的用户';
+      mentionMenu.appendChild(empty);
+      mentionMenu.hidden = false;
+      return;
+    }
+    mentionState.items.forEach(function (u, i) {
+      var item = document.createElement('button');
+      item.type = 'button';
+      item.className = 'mention-item' + (i === mentionState.index ? ' active' : '');
+      item.textContent = u.name;
+      /* mousedown 阻止默认行为：不让输入框先失焦，否则光标位置丢失。 */
+      item.addEventListener('mousedown', function (ev) {
+        ev.preventDefault();
+        pickMention(i);
+      });
+      mentionMenu.appendChild(item);
+    });
+    mentionMenu.hidden = false;
+  }
+
+  /* 把光标前的 `@片段` 替换成 `@昵称 `，并把光标放到空格之后。 */
+  function pickMention(index) {
+    var u = mentionState.items[index];
+    if (!u) return;
+    var pos = cpInput.selectionStart;
+    if (pos === null || pos === undefined) pos = cpInput.value.length;
+    var text = cpInput.value;
+    var at = text.lastIndexOf('@', pos - 1);
+    if (at < 0) return;
+    var before = text.slice(0, at);
+    var after = text.slice(pos);
+    var insert = '@' + u.name + ' ';
+    cpInput.value = before + insert + after;
+    var caret = (before + insert).length;
+    cpInput.selectionStart = caret;
+    cpInput.selectionEnd = caret;
+    closeMention();
+    cpInput.focus();
+  }
+
+  function searchMention(word) {
+    var seq = ++mentionState.seq;
+    api('api/search?type=user&limit=5&q=' + encodeURIComponent(word))
+      .then(function (data) {
+        if (seq !== mentionState.seq) return;
+        var users = (data.items || []).filter(function (it) {
+          return it.type === 'user';
+        });
+        if (!users.length && data.users) users = data.users.slice(0, 5);
+        mentionState.items = users.slice(0, 5).map(function (u) {
+          return { id: u.id, name: u.name || u.title || ('用户#' + u.id) };
+        });
+        mentionState.index = mentionState.items.length ? 0 : -1;
+        paintMention();
+      })
+      .catch(function () {
+        if (seq !== mentionState.seq) return;
+        mentionState.items = [];
+        mentionState.index = -1;
+        paintMention();
+      });
+  }
+
+  cpInput.addEventListener('input', function () {
+    var q = mentionQuery();
+    if (!q) { closeMention(); return; }
+    mentionState.open = true;
+    mentionState.index = -1;
+    mentionState.items = [];
+    clearTimeout(mentionTimer);
+    if (!q.word) {
+      /* 刚敲下 @：先提示，不发请求，避免每个 @ 都打一次搜索。 */
+      if (mentionMenu) {
+        mentionMenu.innerHTML =
+          '<div class="mention-empty">继续输入昵称，选择要 @ 的人</div>';
+        mentionMenu.hidden = false;
+      }
+      return;
+    }
+    mentionTimer = setTimeout(function () { searchMention(q.word); }, 160);
+  });
+
+  cpInput.addEventListener('keydown', function (ev) {
+    if (!mentionState.open) return;
+    if (ev.key === 'ArrowDown' || ev.key === 'ArrowUp') {
+      if (!mentionState.items.length) return;
+      ev.preventDefault();
+      var n = mentionState.items.length;
+      var step = ev.key === 'ArrowDown' ? 1 : n - 1;
+      mentionState.index = (mentionState.index + step) % n;
+      paintMention();
+      return;
+    }
+    if (ev.key === 'Enter') {
+      if (!mentionState.items.length) return;
+      ev.preventDefault();
+      pickMention(mentionState.index < 0 ? 0 : mentionState.index);
+      return;
+    }
+    if (ev.key === 'Escape') {
+      closeMention();
+    }
+  });
+
+  cpInput.addEventListener('blur', function () {
+    /* 延时关闭：mousedown 选词发生在 blur 之前，直接关会点不到。 */
+    setTimeout(closeMention, 160);
+  });
 
   /* ---------- 消息通知中心 ---------- */
 
@@ -1562,7 +1825,7 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
       return who + (n.target_type === 'comment' ? ' 回复了你的评论' : ' 评论了你的视频');
     }
     if (n.kind === 'follow') return who + ' 关注了你';
-    return who + ' 提到了你';
+    return who + ' 在评论中提到了你';
   }
 
   function paintNotifBadge() {
@@ -1788,6 +2051,7 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
       body: { video_id: Number(state.panelVideoId), content: content }
     }).then(function (data) {
       cpInput.value = '';
+      closeMention();
       var c = (data && data.comment) || {
         user_id: state.user ? state.user.id : 0,
         content: content,

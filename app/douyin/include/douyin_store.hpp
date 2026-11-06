@@ -79,6 +79,7 @@ struct StoredComment {
     std::int64_t parent_id{0};   ///< 二级回复的父评论 id；0=顶层评论。
     std::int64_t like_count{0};  ///< 评论点赞数；由 `FillCommentLikes` 回填。
     bool liked{false};           ///< 当前查看者是否点过赞；匿名查看恒为 false。
+    std::int64_t pinned_at{0};   ///< 置顶时间（Unix 秒）；0=未置顶。
 };
 
 /// @brief `notifications` 表里的一行通知（消息中心，第 2 轮新增）。
@@ -280,6 +281,19 @@ class Store {
      * @return 找到返回 true。
      */
     bool FindUserName(std::int64_t id, std::string* name, std::string* error);
+
+    /**
+     * @brief 按昵称精确查用户（@mention 用）。
+     * @param name [in] 昵称原文，按 UTF-8 字节精确匹配（区分大小写）。
+     * @param out [out] 成功时写用户；失败保持原值。
+     * @param error [out] 数据库错误时写文本；未找到时为空。
+     * @return 找到返回 true；未找到返回 false 且 error 为空。
+     * @note 昵称不唯一（只有 email 唯一）。重名时取 **id 最小**（最早注册）
+     *       的那一个，保证同一份评论文本每次解析结果一致；`users.name`
+     *       已建索引，避免每条评论都全表扫。
+     */
+    bool FindUserByName(const std::string& name, StoredUser* out,
+                        std::string* error);
 
     /**
      * @brief 清空 ORM 语句缓存（finalize 全部缓存语句，结束悬挂的读游标）。
@@ -544,15 +558,45 @@ class Store {
                             std::int64_t parent_id = 0);
 
     /**
-     * @brief 某视频的顶层评论（`parent_id=0`），`created_at` 倒序 keyset 分页。
-     * @param cursor 空串表示第一页；否则为本页最后一条的游标。
-     * @param out 追加到末尾。
-     * @param next_cursor 还有下一页时写游标，否则空串。
+     * @brief 某视频的顶层评论（`parent_id=0` 且未置顶），keyset 分页。
+     *
+     * @param video_id [in] 视频 id（>0）。
+     * @param cursor [in] 空串=第一页；否则为本页最后一条的游标。
+     * @param limit [in] 本页最多返回条数（>0；<=0 时直接返回 true）。
+     * @param sort [in] `new`（缺省）：`created_at DESC, id DESC`；
+     *        `hot`：`like_count DESC, created_at DESC, id DESC`。
+     *        其它值视为非法，`error` 写 `sort 非法` 并返回 false。
+     * @param out [out] 追加到末尾（不追加置顶评论，置顶由
+     *        `ListPinnedComments` 单独返回）。
+     * @param next_cursor [out] 还有下一页时写游标，否则空串。
+     * @param error [out] 失败时写错误文本；成功时保持原值。
+     * @param viewer_id [in] 查看者 id；>0 时过滤被其拉黑的评论作者。
+     * @return 成功返回 true。
+     *
+     * ## 游标格式
+     * - `new`：`<created_at>-<id>`（第 1 轮起的旧格式，直接兼容）；
+     * - `hot`：`h<like_count>-<created_at>-<id>`，点赞数变化后仍能续页。
+     * 两种游标不能串用：传给不匹配的 sort 一律 400，避免静默跳过/重复。
      */
     bool ListComments(std::int64_t video_id, const std::string& cursor,
-                      std::int64_t limit, std::vector<StoredComment>* out,
+                      std::int64_t limit, const std::string& sort,
+                      std::vector<StoredComment>* out,
                       std::string* next_cursor, std::string* error,
                       std::int64_t viewer_id = 0);
+
+    /**
+     * @brief 某视频的置顶评论（`pinned_at > 0`），按置顶时间倒序。
+     * @param video_id [in] 视频 id（>0）。
+     * @param viewer_id [in] 查看者 id；>0 时过滤被其拉黑的评论作者。
+     * @param out [out] 追加到末尾。
+     * @param error [out] 失败时写错误文本；成功时保持原值。
+     * @return 成功返回 true（没有置顶评论时 out 不变）。
+     * @note 置顶评论**不占**分页 limit：第一页固定额外返回，保证无论
+     *       翻到第几页，置顶都只在首屏出现一次。
+     */
+    bool ListPinnedComments(std::int64_t video_id, std::int64_t viewer_id,
+                            std::vector<StoredComment>* out,
+                            std::string* error);
 
     /**
      * @brief 某条顶层评论的二级回复，按 `created_at` 正序（同秒按 id 正序）。
@@ -572,6 +616,18 @@ class Store {
 
     /// @brief 删除评论（仅作者）；返回受影响行数，出错 -1。
     int DeleteComment(std::int64_t id, std::int64_t user_id, std::string* error);
+
+    /**
+     * @brief 置顶/取消置顶一条评论（幂等）。
+     * @param id [in] 评论 id（>0）。
+     * @param pinned_at [in] 0=取消置顶；>0=置顶并记录该 Unix 秒。
+     * @param error [out] 失败时写错误文本；成功时保持原值。
+     * @return 受影响行数（1=成功，0=评论不存在）；出错 -1。
+     * @note 权限（只有视频作者能置顶）与「只能置顶顶层评论」由 service
+     *       校验，本方法只负责落库；重复置顶同一秒也算 1 行。
+     */
+    int SetCommentPinned(std::int64_t id, std::int64_t pinned_at,
+                         std::string* error);
 
     /**
      * @brief 按 likes/comments 实表重算 `videos.like_count/comment_count`。

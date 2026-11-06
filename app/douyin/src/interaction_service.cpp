@@ -5,8 +5,11 @@
  * @details 路由：
  *          - POST   /api/like              点赞（Bearer；幂等）
  *          - DELETE /api/like              取消赞（Bearer；幂等）
- *          - POST   /api/comment           发评论（Bearer；1~500 字）
- *          - GET    /api/comment/:video_id 评论列表（倒序 + cursor 分页）
+ *          - POST   /api/comment           发评论（Bearer；1~500 字；解析 @mention）
+ *          - GET    /api/comment/:video_id 评论列表（sort=hot|new + cursor 分页）
+ *          - GET    /api/video/:id/comments   同一接口的路径别名（第 6 轮）
+ *          - POST   /api/comment/:id/pin   置顶评论（Bearer；仅视频作者）
+ *          - DELETE /api/comment/:id/pin   取消置顶（Bearer；仅视频作者）
  *          - GET    /api/notifications          通知列表（Bearer；倒序 + 游标）
  *          - POST   /api/notifications/read     标记已读（Bearer；ids 或 all）
  *          - GET    /api/notifications/unread_count 未读数（Bearer）
@@ -31,6 +34,7 @@
 #include "go2cpp/storage/db.hpp"
 #include "idempotency.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -147,15 +151,13 @@ std::int64_t ParseLimit(const douyin::HttpRequest& request) {
     return static_cast<std::int64_t>(value);
 }
 
-/// @brief 读取评论游标；空串合法，格式非法返回 false。
+/// @brief 读取评论游标；空串合法。
+/// @note 只取值、不校验格式：hot / new 的游标格式不同（`h<赞>-<时间>-<id>`
+///       与 `<时间>-<id>`），统一交给 `Store::ListComments` 按 sort 解码，
+///       在这里按 new 格式预校验会把 hot 游标误判成 400。
 bool ReadCursor(const douyin::HttpRequest& request, std::string* cursor) {
     *cursor = douyin::QueryParam(request, "cursor");
-    if (cursor->empty()) {
-        return true;
-    }
-    std::int64_t created_at = 0;
-    std::int64_t id = 0;
-    return douyin::DecodeCommentCursor(*cursor, &created_at, &id);
+    return true;
 }
 
 /**
@@ -244,6 +246,76 @@ bool ParseCommentLikePath(const std::string& path, std::int64_t* id) {
     return *id > 0;
 }
 
+/**
+ * @brief 从 `/api/comment/<id>/pin` 解析评论 id。
+ * @param path [in] 请求路径。
+ * @param id [out] 成功时写评论 id（>0）；失败时保持原值。
+ * @return 路径形态匹配且 id 为纯数字时 true；否则 false。
+ * @note 必须在 `ParseCommentLikePath` 之后、`ParseVideoPath` 之前判断：
+ *       后者只接受「/api/comment/<纯数字>」，带 `/pin` 会被判非法。
+ */
+bool ParseCommentPinPath(const std::string& path, std::int64_t* id) {
+    constexpr std::string_view kPrefix = "/api/comment/";
+    constexpr std::string_view kSuffix = "/pin";
+    if (path.size() <= kPrefix.size() + kSuffix.size()) {
+        return false;
+    }
+    if (path.compare(0, kPrefix.size(), kPrefix.data(), kPrefix.size()) != 0) {
+        return false;
+    }
+    if (path.compare(path.size() - kSuffix.size(), kSuffix.size(),
+                     kSuffix.data(), kSuffix.size()) != 0) {
+        return false;
+    }
+    const std::string rest =
+        path.substr(kPrefix.size(), path.size() - kPrefix.size() - kSuffix.size());
+    if (rest.empty() || rest.size() > 18) {
+        return false;
+    }
+    for (const char c : rest) {
+        if (c < '0' || c > '9') {
+            return false;
+        }
+    }
+    *id = std::atoll(rest.c_str());
+    return *id > 0;
+}
+
+/**
+ * @brief 从 `/api/video/<id>/comments` 解析视频 id（第 6 轮新增的别名路径）。
+ * @param path [in] 请求路径。
+ * @param id [out] 成功时写视频 id（>0）；失败时保持原值。
+ * @return 路径形态匹配且 id 为纯数字时 true；否则 false。
+ * @note 网关注册了 `/api/video/:id/comments` 精确路由到本服务；同一个
+ *       handler 同时服务旧路径 `/api/comment/<id>`，两个入口行为完全一致。
+ */
+bool ParseVideoCommentsPath(const std::string& path, std::int64_t* id) {
+    constexpr std::string_view kPrefix = "/api/video/";
+    constexpr std::string_view kSuffix = "/comments";
+    if (path.size() <= kPrefix.size() + kSuffix.size()) {
+        return false;
+    }
+    if (path.compare(0, kPrefix.size(), kPrefix.data(), kPrefix.size()) != 0) {
+        return false;
+    }
+    if (path.compare(path.size() - kSuffix.size(), kSuffix.size(),
+                     kSuffix.data(), kSuffix.size()) != 0) {
+        return false;
+    }
+    const std::string rest =
+        path.substr(kPrefix.size(), path.size() - kPrefix.size() - kSuffix.size());
+    if (rest.empty() || rest.size() > 18) {
+        return false;
+    }
+    for (const char c : rest) {
+        if (c < '0' || c > '9') {
+            return false;
+        }
+    }
+    *id = std::atoll(rest.c_str());
+    return *id > 0;
+}
+
 /// @brief UTF-8 码点个数（按首字节计；非法字节各算一个）。
 std::size_t Utf8Length(const std::string& text) {
     std::size_t count = 0;
@@ -276,6 +348,7 @@ douyin::Comment PublicComment(const douyin::StoredComment& stored) {
     comment.parent_id = stored.parent_id;
     comment.like_count = stored.like_count;
     comment.liked = stored.liked;
+    comment.pinned_at = stored.pinned_at;
     return comment;
 }
 
@@ -323,6 +396,192 @@ void AppendNotification(douyin::Store& store, std::int64_t user_id,
                                content, &error)) {
         std::fprintf(stderr, "[%s] 写通知失败: %s\n", kServiceName,
                      error.c_str());
+    }
+}
+
+/// @brief 解码一个 UTF-8 码点；非法/截断序列返回 0 并只前进 1 字节。
+std::uint32_t DecodeUtf8At(const std::string& text, std::size_t pos,
+                           std::size_t* width) {
+    const auto lead = static_cast<unsigned char>(text[pos]);
+    if (lead < 0x80U) {
+        *width = 1;
+        return lead;
+    }
+    std::size_t need = 0;
+    std::uint32_t cp = 0;
+    if ((lead & 0xE0U) == 0xC0U) {
+        need = 2;
+        cp = lead & 0x1FU;
+    } else if ((lead & 0xF0U) == 0xE0U) {
+        need = 3;
+        cp = lead & 0x0FU;
+    } else if ((lead & 0xF8U) == 0xF0U) {
+        need = 4;
+        cp = lead & 0x07U;
+    } else {
+        *width = 1;
+        return 0;
+    }
+    if (pos + need > text.size()) {
+        *width = 1;
+        return 0;
+    }
+    for (std::size_t i = 1; i < need; ++i) {
+        const auto byte = static_cast<unsigned char>(text[pos + i]);
+        if ((byte & 0xC0U) != 0x80U) {
+            *width = 1;
+            return 0;
+        }
+        cp = (cp << 6) | (byte & 0x3FU);
+    }
+    *width = need;
+    return cp;
+}
+
+/// @brief 是否 ASCII 字母或数字（用于判断 `@` 前是不是邮箱/普通词）。
+bool IsAsciiAlnum(unsigned char c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||
+           (c >= 'A' && c <= 'Z');
+}
+
+/// @brief 是否 @mention 允许的字符：中文（CJK 基本区/扩展 A）、英文、数字。
+bool IsMentionCodepoint(std::uint32_t cp) {
+    if (cp >= '0' && cp <= '9') {
+        return true;
+    }
+    if (cp >= 'a' && cp <= 'z') {
+        return true;
+    }
+    if (cp >= 'A' && cp <= 'Z') {
+        return true;
+    }
+    if (cp >= 0x4E00U && cp <= 0x9FFFU) {
+        return true;
+    }
+    if (cp >= 0x3400U && cp <= 0x4DBFU) {
+        return true;
+    }
+    return false;
+}
+
+/**
+ * @brief 解析评论正文里的 `@昵称`（中文/英文/数字，长度 1~20 个码点）。
+ *
+ * @param content [in] 评论原文（UTF-8）——借用，函数内只读。
+ * @return 按首次出现顺序去重后的昵称列表（不含 `@`）；
+ *         没有任何合法提及时返回空列表。
+ *
+ * ## 定位
+ * @mention 解析的唯一实现。错了会怎样：给错误的人发通知、重复通知刷屏，
+ * 或把 `a@b.com` 这类邮箱误判成提及。
+ *
+ * ## 步骤
+ * step1. 逐个扫描 `@`；前一个字节是 ASCII 字母/数字/下划线时跳过（邮箱）；
+ * step2. 从 `@` 后连续取合法码点，最多 20 个；
+ * step3. 至少 1 个码点才算提及，按原文子串去重。
+ *
+ * ## 并发/失败语义
+ * - 纯函数、无共享状态，可并发调用；
+ * - 不抛异常（内存不足除外）；非法 UTF-8 字节按「不是合法码点」处理并中止
+ *   当前 token，不会无限循环。
+ */
+std::vector<std::string> ParseMentionNames(const std::string& content) {
+    constexpr std::size_t kMaxMentionChars = 20;
+    std::vector<std::string> names;
+    std::size_t pos = 0;
+    while (pos < content.size()) {
+        const std::size_t at = content.find('@', pos);
+        if (at == std::string::npos) {
+            break;
+        }
+        pos = at + 1;
+        // step1: `a@b` / `a1@b` / `a_@b` 都不算提及。
+        if (at > 0 &&
+            (IsAsciiAlnum(static_cast<unsigned char>(content[at - 1])) ||
+             content[at - 1] == '_')) {
+            continue;
+        }
+        // step2: 取连续合法码点，长度上限 20。
+        std::size_t cursor = at + 1;
+        std::size_t chars = 0;
+        std::size_t end = cursor;
+        while (cursor < content.size() && chars < kMaxMentionChars) {
+            std::size_t width = 0;
+            const std::uint32_t cp = DecodeUtf8At(content, cursor, &width);
+            if (width == 0 || !IsMentionCodepoint(cp)) {
+                break;
+            }
+            cursor += width;
+            end = cursor;
+            ++chars;
+        }
+        if (chars == 0) {
+            continue;
+        }
+        // step3: 按原文子串去重（同一人只通知一次）。
+        std::string name = content.substr(at + 1, end - at - 1);
+        if (std::find(names.begin(), names.end(), name) == names.end()) {
+            names.push_back(std::move(name));
+        }
+    }
+    return names;
+}
+
+/**
+ * @brief 给评论里被 @ 的人写 `mention` 通知（跳过自己 / 已通知过的人）。
+ *
+ * @param store [in,out] 已打开的存储；借用，生命周期由 main 持有。
+ * @param actor [in] 评论作者 id（>0）；给自己不写通知。
+ * @param video_id [in] 评论所属视频 id（>0）；点击通知跳该视频。
+ * @param content [in] 评论正文；用于解析昵称并截断成摘要。
+ * @param notified [in,out] 本次评论已收到 mention 的接收者 id 列表；
+ *        进入时通常为空，返回后追加本次写入的接收者（供去重）。
+ * @return 无（写通知失败只记日志，不影响评论主流程）。
+ *
+ * ## 定位
+ * mention 通知的唯一写入点。错了会怎样：同一条评论给同一个人发两条通知
+ * （comment + mention），或被 @ 的人收不到任何提醒。
+ *
+ * ## 步骤
+ * step1. 解析正文里的昵称列表；
+ * step2. 逐个按昵称精确查用户（重名取最早注册者）；
+ * step3. 跳过 actor 自己、跳过已在 notified 里的接收者（同一条评论里
+ *        重复 @ 同一个人只写一条）；
+ * step4. 写 `mention`/`video` 通知，成功与否都把接收者记为已通知。
+ *
+ * ## 并发/失败语义
+ * - 单线程事件循环调用；依赖 Store 内部连接，不可并发进入；
+ * - 通知写失败只打印日志，**不**回滚已入库的评论。
+ */
+void AppendMentionNotifications(douyin::Store& store, std::int64_t actor,
+                                std::int64_t video_id,
+                                const std::string& content,
+                                std::vector<std::int64_t>* notified) {
+    const std::vector<std::string> names = ParseMentionNames(content);
+    if (names.empty()) {
+        return;
+    }
+    const std::string summary = ClampText(content, 60);
+    for (const std::string& name : names) {
+        douyin::StoredUser target;
+        std::string lookup_error;
+        if (!store.FindUserByName(name, &target, &lookup_error)) {
+            if (!lookup_error.empty()) {
+                std::fprintf(stderr, "[%s] 解析 @%s 失败: %s\n", kServiceName,
+                             name.c_str(), lookup_error.c_str());
+            }
+            continue;
+        }
+        if (target.id <= 0 || target.id == actor) {
+            continue;
+        }
+        if (std::find(notified->begin(), notified->end(), target.id) !=
+            notified->end()) {
+            continue;
+        }
+        notified->push_back(target.id);
+        AppendNotification(store, target.id, actor, "mention", "video",
+                           video_id, summary);
     }
 }
 
@@ -602,6 +861,9 @@ bool HandleComment(douyin::Store& store, const douyin::HttpRequest& request,
     }
     // 评论通知：视频作者一条；若是回复，父评论作者再一条（去重、跳过自己）。
     const std::string summary = ClampText(content, 60);
+    // notified 只做 mention 内部去重（同一条评论里 @ 同一个人两次只写一条）；
+    // comment 通知与 mention 是两类通知，互不抑制。
+    std::vector<std::int64_t> notified;
     if (video.user_id != actor) {
         AppendNotification(store, video.user_id, actor, "comment", "video",
                            video_id, summary);
@@ -609,13 +871,17 @@ bool HandleComment(douyin::Store& store, const douyin::HttpRequest& request,
     if (parent_id != 0) {
         douyin::StoredComment parent_author;
         std::string parent_error;
-        if (store.FindComment(parent_id, &parent_author, &parent_error) &&
-            parent_author.user_id != actor &&
-            parent_author.user_id != video.user_id) {
-            AppendNotification(store, parent_author.user_id, actor, "comment",
-                               "comment", parent_id, summary);
+        if (store.FindComment(parent_id, &parent_author, &parent_error)) {
+            if (parent_author.user_id != actor &&
+                parent_author.user_id != video.user_id) {
+                AppendNotification(store, parent_author.user_id, actor,
+                                   "comment", "comment", parent_id, summary);
+            }
         }
     }
+    // @mention（第 6 轮）：解析正文里的 @昵称，给被提及者写 mention 通知；
+    // 自己 @ 自己、同一条评论里重复 @ 同一人都不再写。
+    AppendMentionNotifications(store, actor, video_id, content, &notified);
     if (!store.UpdateVideoCounts(video_id, &error)) {
         std::fprintf(stderr, "[%s] 计数同步失败: %s\n", kServiceName,
                      error.c_str());
@@ -636,7 +902,7 @@ bool HandleComment(douyin::Store& store, const douyin::HttpRequest& request,
     return true;
 }
 
-/// @brief 评论列表（倒序 + cursor 分页）。
+/// @brief 评论列表（sort=hot|new + cursor 分页；第一页额外前置置顶评论）。
 bool HandleComments(douyin::Store& store, const douyin::HttpRequest& request,
                     std::int64_t video_id, douyin::HttpResponse* response) {
     douyin::StoredVideo video;
@@ -675,13 +941,29 @@ bool HandleComments(douyin::Store& store, const douyin::HttpRequest& request,
         return Fail(response, 400, "cursor 非法");
     }
     const std::int64_t limit = ParseLimit(request);
+    // 第 6 轮：sort 缺省 new；非法值回 400，不静默降级成时间序。
+    std::string sort = douyin::QueryParam(request, "sort");
+    if (sort.empty()) {
+        sort = "new";
+    }
+    if (sort != "hot" && sort != "new") {
+        return Fail(response, 400, "sort 非法（hot/new）");
+    }
 
     std::vector<douyin::StoredComment> comments;
     std::string next_cursor;
-    if (!store.ListComments(video_id, cursor, limit, &comments, &next_cursor,
-                            &error, viewer)) {
-        if (error == "cursor 非法") {
-            return Fail(response, 400, "cursor 非法");
+    // 置顶评论不占分页 limit：只在第一页固定前置，翻页时不重复返回。
+    // 置顶优先于 sort——hot / new 两种排序下都排最前。
+    if (cursor.empty() &&
+        !store.ListPinnedComments(video_id, viewer, &comments, &error)) {
+        std::fprintf(stderr, "[%s] 查询置顶评论失败: %s\n", kServiceName,
+                     error.c_str());
+        return Fail(response, 500, "数据库错误");
+    }
+    if (!store.ListComments(video_id, cursor, limit, sort, &comments,
+                            &next_cursor, &error, viewer)) {
+        if (error == "cursor 非法" || error == "sort 非法") {
+            return Fail(response, 400, error);
         }
         std::fprintf(stderr, "[%s] 查询评论失败: %s\n", kServiceName,
                      error.c_str());
@@ -716,7 +998,8 @@ bool HandleComments(douyin::Store& store, const douyin::HttpRequest& request,
                      error.c_str());
     }
 
-    std::string body = "{\"ok\":true,\"items\":[";
+    std::string body = "{\"ok\":true,\"sort\":\"" + sort +
+                       "\",\"items\":[";
     for (std::size_t i = 0; i < comments.size(); ++i) {
         if (i != 0) {
             body += ',';
@@ -829,6 +1112,89 @@ std::string ReportJson(const douyin::StoredReport& item) {
            "\",\"detail\":\"" + douyin::JsonEscape(item.detail) +
            "\",\"status\":\"" + douyin::JsonEscape(item.status) +
            "\",\"created_at\":" + std::to_string(item.created_at) + "}";
+}
+
+/**
+ * @brief 置顶 / 取消置顶一条评论（`POST|DELETE /api/comment/:id/pin`）。
+ *
+ * @param store [in,out] 已打开的存储；借用，生命周期由 main 持有。
+ * @param request [in] 原始请求；必须带有效 Bearer token。
+ * @param comment_id [in] 目标评论 id（>0），由 `ParseCommentPinPath` 解析。
+ * @param pin [in] true=置顶（记录当前秒），false=取消置顶。
+ * @param response [out] 成功写 `{"ok":true,"pinned":bool,"comment":{...}}`；
+ *        失败写统一错误体。不可为 nullptr。
+ * @return 恒为 true（表示已处理）。
+ *
+ * ## 定位
+ * 评论置顶的唯一写入入口。错了会怎样：普通用户能把别人的评论钉在首屏
+ * （越权），或把二级回复置顶导致主列表结构错乱。
+ *
+ * ## 步骤
+ * step1. 鉴权——置顶必须实名登录，匿名 401；
+ * step2. 查评论（不存在 404），再查所属视频（数据异常 404）；
+ * step3. 权限：只有视频作者可以置顶/取消（否则 403）；
+ * step4. 只允许顶层评论（`parent_id=0`），回复返回 400；
+ * step5. 写前清 ORM 语句缓存，再 UPDATE `pinned_at`；返回最新状态。
+ *
+ * ## 并发/失败语义
+ * - 单线程事件循环调用；写操作与其它写接口串行；
+ * - 幂等：重复置顶/重复取消都是同一条 UPDATE，不产生额外行；
+ * - 失败语义：数据库错误回 500，评论/视频不存在回 404，权限不足回 403。
+ */
+bool HandleCommentPin(douyin::Store& store, const douyin::HttpRequest& request,
+                      std::int64_t comment_id, bool pin,
+                      douyin::HttpResponse* response) {
+    // step1: 鉴权。
+    std::int64_t actor = 0;
+    if (!RequireToken(request, response, &actor)) {
+        return true;
+    }
+    std::string error;
+    // step2: 评论与所属视频都必须存在。
+    douyin::StoredComment comment;
+    if (!store.FindComment(comment_id, &comment, &error)) {
+        if (!error.empty()) {
+            std::fprintf(stderr, "[%s] 查询评论失败: %s\n", kServiceName,
+                         error.c_str());
+            return Fail(response, 500, "数据库错误");
+        }
+        return Fail(response, 404, "评论不存在");
+    }
+    douyin::StoredVideo video;
+    if (!store.FindVideo(comment.video_id, &video, &error)) {
+        if (!error.empty()) {
+            std::fprintf(stderr, "[%s] 查询视频失败: %s\n", kServiceName,
+                         error.c_str());
+            return Fail(response, 500, "数据库错误");
+        }
+        return Fail(response, 404, "视频不存在");
+    }
+    // step3: 只有视频作者能置顶/取消。
+    if (video.user_id != actor) {
+        return Fail(response, 403, "只有视频作者可以置顶评论");
+    }
+    // step4: 只允许顶层评论；回复置顶会让「置顶区」出现孤立回复。
+    if (comment.parent_id != 0) {
+        return Fail(response, 400, "只能置顶顶层评论");
+    }
+    // step5: 写前清缓存（与评论/点赞写入同一约定），再落库。
+    store.ResetStatements();
+    const std::int64_t pinned_at = pin ? NowSeconds() : 0;
+    const int changed = store.SetCommentPinned(comment_id, pinned_at, &error);
+    if (changed < 0) {
+        std::fprintf(stderr, "[%s] 置顶评论失败: %s\n", kServiceName,
+                     error.c_str());
+        return Fail(response, 500, "数据库错误");
+    }
+    if (changed == 0) {
+        return Fail(response, 404, "评论不存在");
+    }
+    comment.pinned_at = pinned_at;
+    response->status = 200;
+    response->body = std::string("{\"ok\":true,\"pinned\":") +
+                     (pin ? "true" : "false") + ",\"comment\":" +
+                     douyin::ToJson(PublicComment(comment)) + "}";
+    return true;
 }
 
 /**
@@ -1171,6 +1537,15 @@ bool Handle(douyin::Store& store, const douyin::HttpRequest& request,
         return Fail(response, 405, "方法不允许");
     }
 
+    // 新路径别名：GET /api/video/<id>/comments（与旧路径同一个 handler）。
+    std::int64_t alias_video_id = 0;
+    if (ParseVideoCommentsPath(request.path, &alias_video_id)) {
+        if (request.method == "GET") {
+            return HandleComments(store, request, alias_video_id, response);
+        }
+        return Fail(response, 405, "方法不允许");
+    }
+
     // 评论点赞必须放在 /api/comment/<id> 之前判断：后者的 id 解析只接受
     // 纯数字，`<id>/like` 会落到这里并 405/404。
     std::int64_t like_comment_id = 0;
@@ -1182,6 +1557,20 @@ bool Handle(douyin::Store& store, const douyin::HttpRequest& request,
         if (request.method == "DELETE") {
             return HandleCommentLike(store, request, like_comment_id, false,
                                      response);
+        }
+        return Fail(response, 405, "方法不允许");
+    }
+
+    // 评论置顶：POST 置顶 / DELETE 取消；非作者 403、不存在 404。
+    std::int64_t pin_comment_id = 0;
+    if (ParseCommentPinPath(request.path, &pin_comment_id)) {
+        if (request.method == "POST") {
+            return HandleCommentPin(store, request, pin_comment_id, true,
+                                    response);
+        }
+        if (request.method == "DELETE") {
+            return HandleCommentPin(store, request, pin_comment_id, false,
+                                    response);
         }
         return Fail(response, 405, "方法不允许");
     }

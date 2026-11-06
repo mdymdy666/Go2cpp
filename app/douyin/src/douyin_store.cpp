@@ -168,6 +168,74 @@ bool DecodeCommentCursor(const std::string& cursor, std::int64_t* created_at,
     return DecodeVideoCursor(cursor, created_at, id);
 }
 
+/**
+ * @brief 编码 hot 排序游标：`h<like_count>-<created_at>-<id>`。
+ * @param comment [in] 游标指向的评论（通常是本页最后一条，其 like_count
+ *        必须已由 hot 查询回填）。
+ * @return 形如 `h7-1762260000-42` 的串；`id<=0` 时返回空串。
+ * @note 与 new 游标（`<created_at>-<id>`）格式不同，主动加 `h` 前缀，
+ *       两种 sort 的游标串用会解码失败回 400，而不是静默跳页。
+ */
+std::string EncodeHotCommentCursor(const StoredComment& comment) {
+    if (comment.id <= 0) {
+        return std::string();
+    }
+    return "h" + std::to_string(comment.like_count) + "-" +
+           std::to_string(comment.created_at) + "-" +
+           std::to_string(comment.id);
+}
+
+/**
+ * @brief 解码 hot 排序游标。
+ * @param cursor [in] 非空游标串，必须匹配 `h<非负整数>-<正整数>-<正整数>`。
+ * @param like_count [out] 成功时写点赞数（可为 0）；失败保持原值。
+ * @param created_at [out] 成功时写 created_at；失败保持原值。
+ * @param id [out] 成功时写 id；失败保持原值。
+ * @return 格式合法返回 true；否则 false（调用方回 400）。
+ */
+bool DecodeHotCommentCursor(const std::string& cursor,
+                            std::int64_t* like_count,
+                            std::int64_t* created_at, std::int64_t* id) {
+    if (cursor.size() < 5 || cursor[0] != 'h') {
+        return false;
+    }
+    const std::size_t first = cursor.find('-', 1);
+    if (first == std::string::npos) {
+        return false;
+    }
+    const std::size_t second = cursor.find('-', first + 1);
+    if (second == std::string::npos) {
+        return false;
+    }
+    const std::string_view like_text(cursor.data() + 1, first - 1);
+    const std::string_view created_text(cursor.data() + first + 1,
+                                        second - first - 1);
+    const std::string_view id_text(cursor.data() + second + 1,
+                                   cursor.size() - second - 1);
+    if (!IsAllDigits(like_text) || !IsAllDigits(created_text) ||
+        !IsAllDigits(id_text)) {
+        return false;
+    }
+    const std::int64_t like_value =
+        std::atoll(std::string(like_text).c_str());
+    const std::int64_t created_value =
+        std::atoll(std::string(created_text).c_str());
+    const std::int64_t id_value = std::atoll(std::string(id_text).c_str());
+    if (like_value < 0 || created_value <= 0 || id_value <= 0) {
+        return false;
+    }
+    if (like_count != nullptr) {
+        *like_count = like_value;
+    }
+    if (created_at != nullptr) {
+        *created_at = created_value;
+    }
+    if (id != nullptr) {
+        *id = id_value;
+    }
+    return true;
+}
+
 std::string EncodeNotificationCursor(const StoredNotification& notification) {
     if (notification.id <= 0) {
         return std::string();
@@ -194,6 +262,8 @@ constexpr const char* kSchemaSql =
     "  created_at INTEGER NOT NULL"
     ");"
     "CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);"
+    // @mention 按昵称精确查人：没有索引就是每条评论一次全表扫。
+    "CREATE INDEX IF NOT EXISTS idx_users_name ON users(name);"
     "CREATE TABLE IF NOT EXISTS follows ("
     "  follower_id INTEGER NOT NULL,"
     "  followee_id INTEGER NOT NULL,"
@@ -228,7 +298,8 @@ constexpr const char* kSchemaSql =
     "  user_id INTEGER NOT NULL,"
     "  content TEXT NOT NULL,"
     "  created_at INTEGER NOT NULL,"
-    "  parent_id INTEGER NOT NULL DEFAULT 0"
+    "  parent_id INTEGER NOT NULL DEFAULT 0,"
+    "  pinned_at INTEGER NOT NULL DEFAULT 0"
     ");"
     "CREATE INDEX IF NOT EXISTS idx_comments_video "
     "ON comments(video_id, created_at DESC);"
@@ -352,7 +423,19 @@ void ReadVideoRow(go2cpp::storage::Rows* rows, StoredVideo* out) {
 
 /// @brief comments 查询的固定列顺序（与 `ReadCommentRow` 的下标对应）。
 constexpr const char* kCommentColumns =
-    "id, video_id, user_id, content, created_at, parent_id";
+    "id, video_id, user_id, content, created_at, parent_id, pinned_at";
+
+/// @brief 评论点赞数相关子查询（hot 排序与游标比较共用同一表达式）。
+/// @note 评论点赞数不落 comments 列（第 1 轮设计），只能按主键回查
+///       `comment_likes`；每页最多 100 条评论，COUNT 走主键前缀，代价可控。
+constexpr const char* kCommentLikeExpr =
+    "(SELECT COUNT(*) FROM comment_likes cl WHERE cl.comment_id = c.id)";
+
+/// @brief hot 排序的固定列顺序：前 7 列同 `kCommentColumns`，第 8 列为点赞数。
+constexpr const char* kHotCommentColumns =
+    "c.id, c.video_id, c.user_id, c.content, c.created_at, c.parent_id, "
+    "c.pinned_at, "
+    "(SELECT COUNT(*) FROM comment_likes cl WHERE cl.comment_id = c.id)";
 
 /// @brief 读当前行（列顺序必须为 `kCommentColumns`）。
 void ReadCommentRow(go2cpp::storage::Rows* rows, StoredComment* out) {
@@ -362,6 +445,7 @@ void ReadCommentRow(go2cpp::storage::Rows* rows, StoredComment* out) {
     out->content = rows->Text(3);
     out->created_at = rows->Int64(4);
     out->parent_id = rows->Int64(5);
+    out->pinned_at = rows->Int64(6);
 }
 
 /**
@@ -392,6 +476,45 @@ bool ReadCommentPage(go2cpp::storage::Rows* rows, std::int64_t limit,
         page.resize(static_cast<std::size_t>(limit));
         if (!page.empty()) {
             *next_cursor = EncodeCommentCursor(page.back());
+        }
+    }
+    for (StoredComment& comment : page) {
+        out->push_back(std::move(comment));
+    }
+    return true;
+}
+
+/**
+ * @brief 读一页 hot 排序评论：多取一条判断 next_cursor，再裁剪到 limit。
+ * @param rows [in,out] 已执行成功的查询结果集（列顺序为 kHotCommentColumns：
+ *        前 7 列同 kCommentColumns，第 8 列为点赞数）。
+ * @param limit [in] 期望条数；<=0 时直接返回 true。
+ * @param next_cursor [out] 还有下一页时写 hot 游标，否则空串。
+ * @param out [out] 追加到末尾；每条评论的 like_count 已按计数回填。
+ * @param error [out] 遍历失败时写错误文本。
+ * @return 成功返回 true。
+ */
+bool ReadHotCommentPage(go2cpp::storage::Rows* rows, std::int64_t limit,
+                        std::string* next_cursor,
+                        std::vector<StoredComment>* out,
+                        std::string* error) {
+    std::vector<StoredComment> page;
+    while (rows->Next()) {
+        StoredComment comment;
+        ReadCommentRow(rows, &comment);
+        comment.like_count = rows->Int64(7);
+        page.push_back(std::move(comment));
+    }
+    if (rows->Err()) {
+        if (error != nullptr) {
+            *error = "遍历评论失败: " + DescribeError(rows->Err());
+        }
+        return false;
+    }
+    if (static_cast<std::int64_t>(page.size()) > limit) {
+        page.resize(static_cast<std::size_t>(limit));
+        if (!page.empty()) {
+            *next_cursor = EncodeHotCommentCursor(page.back());
         }
     }
     for (StoredComment& comment : page) {
@@ -543,10 +666,19 @@ bool Store::EnsureSchema(std::string* error) {
     //        所以先补 parent_id；列已存在时 ALTER 报 duplicate column，属预期。
     (void)m_db->Exec(
         "ALTER TABLE comments ADD COLUMN parent_id INTEGER NOT NULL DEFAULT 0");
-    // step3: 列补齐后再建索引（放在建表脚本里会在旧库上报 no such column）。
+    // step3: 第 6 轮评论置顶：旧库补 pinned_at（同上，重复 ALTER 报
+    //        duplicate column，属预期）。
+    (void)m_db->Exec(
+        "ALTER TABLE comments ADD COLUMN pinned_at INTEGER NOT NULL DEFAULT 0");
+    // step4: 列补齐后再建索引（放在建表脚本里会在旧库上报 no such column）。
     (void)m_db->Exec(
         "CREATE INDEX IF NOT EXISTS idx_comments_parent "
         "ON comments(video_id, parent_id, created_at)");
+    // 置顶评论只占极少数行：按 (video_id, pinned_at DESC) 直接取，
+    // 不参与主列表的 created_at 扫描。
+    (void)m_db->Exec(
+        "CREATE INDEX IF NOT EXISTS idx_comments_pinned "
+        "ON comments(video_id, pinned_at DESC, id DESC)");
     return true;
 }
 
@@ -649,6 +781,47 @@ bool Store::FindUserName(std::int64_t id, std::string* name, std::string* error)
     }
     return true;
 }
+
+bool Store::FindUserByName(const std::string& name, StoredUser* out,
+                           std::string* error) {
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return false;
+    }
+    if (name.empty()) {
+        return false;
+    }
+    // 昵称不唯一：取 id 最小（最早注册）的那个，保证同一份评论文本每次
+    // 解析结果一致；走 idx_users_name 精确匹配，不做 LIKE。
+    auto rows = m_db->Query(
+        "SELECT id, name, email, password_hash, salt, created_at FROM users "
+        "WHERE name = ? ORDER BY id ASC LIMIT 1",
+        name);
+    if (!rows) {
+        if (error != nullptr) {
+            *error = "查询用户失败: " + DescribeError(rows.Err());
+        }
+        return false;
+    }
+    if (!rows.Value().Next()) {
+        if (rows.Value().Err() && error != nullptr) {
+            *error = "遍历用户失败: " + DescribeError(rows.Value().Err());
+        }
+        return false;
+    }
+    if (out != nullptr) {
+        out->id = rows.Value().Int64(0);
+        out->name = rows.Value().Text(1);
+        out->email = rows.Value().Text(2);
+        out->password_hash = rows.Value().Text(3);
+        out->salt = rows.Value().Text(4);
+        out->created_at = rows.Value().Int64(5);
+    }
+    return true;
+}
+
 
 void Store::ResetStatements() {
     if (m_session != nullptr) {
@@ -1505,7 +1678,8 @@ std::int64_t Store::AddComment(std::int64_t video_id, std::int64_t user_id,
 }
 
 bool Store::ListComments(std::int64_t video_id, const std::string& cursor,
-                         std::int64_t limit, std::vector<StoredComment>* out,
+                         std::int64_t limit, const std::string& sort,
+                         std::vector<StoredComment>* out,
                          std::string* next_cursor, std::string* error,
                          std::int64_t viewer_id) {
     next_cursor->clear();
@@ -1518,48 +1692,78 @@ bool Store::ListComments(std::int64_t video_id, const std::string& cursor,
     if (limit <= 0) {
         return true;
     }
-    const bool has_cursor = !cursor.empty();
-    std::int64_t cursor_created = 0;
-    std::int64_t cursor_id = 0;
-    if (has_cursor &&
-        !DecodeCommentCursor(cursor, &cursor_created, &cursor_id)) {
+    // step1: sort 只接受 new / hot；其它值回 400，不静默按 new 处理
+    //        （否则客户端以为在按热度翻页，实际拿到时间序）。
+    if (sort != "new" && sort != "hot") {
         if (error != nullptr) {
-            *error = "cursor 非法";
+            *error = "sort 非法";
         }
         return false;
     }
-
-    std::string sql = std::string("SELECT ") + kCommentColumns +
-                      " FROM comments WHERE video_id = ? AND parent_id = 0";
-    if (viewer_id > 0) {
-        sql += " AND user_id NOT IN"
-               " (SELECT blocked_id FROM blocks WHERE user_id = ?)";
-    }
+    const bool hot = sort == "hot";
+    const bool has_cursor = !cursor.empty();
+    std::int64_t cursor_like = 0;
+    std::int64_t cursor_created = 0;
+    std::int64_t cursor_id = 0;
     if (has_cursor) {
-        sql += " AND (created_at < ? OR (created_at = ? AND id < ?))";
+        // step2: 两种游标格式互斥：hot 的 `h...` 交给 hot 解码器；new 的
+        //        `<created>-<id>` 交给共用解码器。串用在这里就失败。
+        const bool decoded =
+            hot ? DecodeHotCommentCursor(cursor, &cursor_like, &cursor_created,
+                                         &cursor_id)
+                : DecodeCommentCursor(cursor, &cursor_created, &cursor_id);
+        if (!decoded) {
+            if (error != nullptr) {
+                *error = "cursor 非法";
+            }
+            return false;
+        }
     }
-    sql += " ORDER BY created_at DESC, id DESC LIMIT ?";
-
-    if (has_cursor && viewer_id > 0) {
-        auto rows = m_db->Query(sql, video_id, viewer_id, cursor_created,
-                                cursor_created, cursor_id, limit + 1);
+    // step3: 条件写成「?=0 关闭」，new 与 hot 各一条固定参数个数的 SQL，
+    //        避免 2(sort) × 2(cursor) × 2(blocked) 的八份拼接分支漂移。
+    const std::int64_t has_cursor_flag = has_cursor ? 1 : 0;
+    const std::int64_t want = limit + 1;
+    if (hot) {
+        // hot：点赞数降序，同点赞数按时间降序、id 降序。
+        std::string sql = std::string("SELECT ") + kHotCommentColumns +
+                          " FROM comments c"
+                          " WHERE c.video_id = ? AND c.parent_id = 0"
+                          " AND c.pinned_at = 0"
+                          " AND (? = 0 OR c.user_id NOT IN"
+                          " (SELECT blocked_id FROM blocks WHERE user_id = ?))"
+                          " AND (? = 0 OR ";
+        sql += kCommentLikeExpr;
+        sql += " < ? OR (";
+        sql += kCommentLikeExpr;
+        sql += " = ? AND (c.created_at < ? OR (c.created_at = ?"
+               " AND c.id < ?)))) ORDER BY ";
+        sql += kCommentLikeExpr;
+        sql += " DESC, c.created_at DESC, c.id DESC LIMIT ?";
+        auto rows = m_db->Query(
+            sql, video_id, (viewer_id > 0 ? 1 : 0), viewer_id,
+            has_cursor_flag, cursor_like, cursor_like, cursor_created,
+            cursor_created, cursor_id, want);
         if (!rows) {
             if (error != nullptr) {
                 *error = "查询评论失败: " + DescribeError(rows.Err());
             }
             return false;
         }
-        if (!ReadCommentPage(&rows.Value(), limit, next_cursor, out, error)) {
-            return false;
-        }
-        return true;
+        return ReadHotCommentPage(&rows.Value(), limit, next_cursor, out, error);
     }
-    auto rows = has_cursor
-                    ? m_db->Query(sql, video_id, cursor_created, cursor_created,
-                                  cursor_id, limit + 1)
-                    : (viewer_id > 0
-                           ? m_db->Query(sql, video_id, viewer_id, limit + 1)
-                           : m_db->Query(sql, video_id, limit + 1));
+    // new：时间倒序（与第 1 轮行为一致，索引 idx_comments_video 直接可用）。
+    std::string sql = std::string("SELECT ") + kCommentColumns +
+                      " FROM comments"
+                      " WHERE video_id = ? AND parent_id = 0"
+                      " AND pinned_at = 0"
+                      " AND (? = 0 OR user_id NOT IN"
+                      " (SELECT blocked_id FROM blocks WHERE user_id = ?))"
+                      " AND (? = 0 OR created_at < ?"
+                      " OR (created_at = ? AND id < ?))"
+                      " ORDER BY created_at DESC, id DESC LIMIT ?";
+    auto rows = m_db->Query(
+        sql, video_id, (viewer_id > 0 ? 1 : 0), viewer_id, has_cursor_flag,
+        cursor_created, cursor_created, cursor_id, want);
     if (!rows) {
         if (error != nullptr) {
             *error = "查询评论失败: " + DescribeError(rows.Err());
@@ -1567,6 +1771,48 @@ bool Store::ListComments(std::int64_t video_id, const std::string& cursor,
         return false;
     }
     return ReadCommentPage(&rows.Value(), limit, next_cursor, out, error);
+}
+
+bool Store::ListPinnedComments(std::int64_t video_id, std::int64_t viewer_id,
+                               std::vector<StoredComment>* out,
+                               std::string* error) {
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return false;
+    }
+    // 置顶条数按产品惯例给个上限（20），避免异常数据把首屏撑爆；
+    // 置顶评论不占分页 limit，第一页固定额外返回。
+    constexpr std::int64_t kMaxPinned = 20;
+    std::string sql = std::string("SELECT ") + kCommentColumns +
+                      " FROM comments WHERE video_id = ? AND pinned_at > 0";
+    if (viewer_id > 0) {
+        sql += " AND user_id NOT IN"
+               " (SELECT blocked_id FROM blocks WHERE user_id = ?)";
+    }
+    sql += " ORDER BY pinned_at DESC, id DESC LIMIT ?";
+    auto rows = viewer_id > 0
+                    ? m_db->Query(sql, video_id, viewer_id, kMaxPinned)
+                    : m_db->Query(sql, video_id, kMaxPinned);
+    if (!rows) {
+        if (error != nullptr) {
+            *error = "查询置顶评论失败: " + DescribeError(rows.Err());
+        }
+        return false;
+    }
+    while (rows.Value().Next()) {
+        StoredComment comment;
+        ReadCommentRow(&rows.Value(), &comment);
+        out->push_back(std::move(comment));
+    }
+    if (rows.Value().Err()) {
+        if (error != nullptr) {
+            *error = "遍历置顶评论失败: " + DescribeError(rows.Value().Err());
+        }
+        return false;
+    }
+    return true;
 }
 
 bool Store::ListReplies(std::int64_t video_id, std::int64_t parent_id,
@@ -1670,6 +1916,34 @@ int Store::DeleteComment(std::int64_t id, std::int64_t user_id,
         return -1;
     }
     return deleted.Value().changes;
+}
+
+int Store::SetCommentPinned(std::int64_t id, std::int64_t pinned_at,
+                            std::string* error) {
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return -1;
+    }
+    // step1: 参数闸门——负时间是脏数据，宁可不写。
+    if (id <= 0 || pinned_at < 0) {
+        if (error != nullptr) {
+            *error = "置顶参数非法";
+        }
+        return -1;
+    }
+    // step2: 单条 UPDATE；SQLite 的 changes 统计「匹配行」，同值重复置顶
+    //        也返回 1，正好对上「幂等」语义（0 只表示评论不存在）。
+    auto updated = m_db->Exec(
+        "UPDATE comments SET pinned_at = ? WHERE id = ?", pinned_at, id);
+    if (!updated) {
+        if (error != nullptr) {
+            *error = "更新置顶状态失败: " + DescribeError(updated.Err());
+        }
+        return -1;
+    }
+    return updated.Value().changes;
 }
 
 bool Store::UpdateVideoCounts(std::int64_t video_id, std::string* error) {

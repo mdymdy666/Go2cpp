@@ -840,6 +840,13 @@ int main(int argc, char** argv) {
     const bool routes_ok =
         AddRoute(gateway.get(), method_mask::kAll, "/api/user/**", kUserPort, false,
                  0, "user") &&
+        // 评论列表的新路径别名 /api/video/<id>/comments：参数路由优先于
+        // /api/video/** 通配，必须交给 interaction 服务（评论数据在那里），
+        // 否则会被 video 服务当未知路径 404。
+        // 全方法转发：非 GET 由 interaction 的别名分支回 405（若只注册
+        // kReadMask，POST 会落进 /api/video/** 通配路由被 video 服务 404）。
+        AddRoute(gateway.get(), method_mask::kAll, "/api/video/:id/comments",
+                 kInteractionPort, false, 0, "video-comments") &&
         AddRoute(gateway.get(), kReadMask, "/api/video/**", kVideoPort, false, 0,
                  "video-read") &&
         // 上传大文件需要更长超时（默认 1s 会让 10 MiB 上传在网关侧超时 -> 502）。

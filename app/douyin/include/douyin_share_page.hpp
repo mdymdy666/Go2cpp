@@ -41,6 +41,7 @@ struct ShareComment {
     std::int64_t created_at{0};    ///< Unix 秒；显示「N 分钟前」。
     std::int64_t like_count{0};    ///< 点赞数。
     bool liked{false};             ///< 当前查看者是否已赞；匿名恒 false。
+    bool pinned{false};            ///< 是否置顶（第 6 轮）；页面加「置顶」标签。
 };
 
 /// @brief 渲染落地页所需的全部数据（服务层一次查完，渲染层不碰数据库）。
@@ -193,7 +194,11 @@ inline std::string RenderCommentRow(const ShareComment& comment,
     html += "<div class=\"cavatar\" aria-hidden=\"true\">#";
     html += "</div><div class=\"cbody\"><div class=\"chead\"><b>";
     html += EscapeHtml(who);
-    html += "</b><time>";
+    html += "</b>";
+    if (comment.pinned) {
+        html += "<span class=\"cpin\">置顶</span>";
+    }
+    html += "<time>";
     html += EscapeHtml(TimeAgo(now, comment.created_at));
     html += "</time></div><p>";
     html += EscapeHtml(comment.content);
@@ -342,6 +347,7 @@ button{font:inherit;cursor:pointer;border:0;background:none;color:inherit}
 .chead{display:flex;align-items:baseline;gap:8px}
 .chead b{font-size:13px;font-weight:600}
 .chead time{font-size:11px;color:var(--muted)}
+.cpin{padding:1px 6px;border-radius:6px;font-size:10.5px;font-weight:700;color:#fff;background:linear-gradient(92deg,var(--pink),#ff5c7a)}
 .cbody p{margin:2px 0 4px;font-size:14px;word-break:break-word;white-space:pre-wrap}
 .clike{display:inline-flex;align-items:center;gap:4px;padding:2px 7px;border-radius:8px;font-size:12px;color:var(--muted)}
 .clike:hover{background:rgba(255,255,255,.05)}

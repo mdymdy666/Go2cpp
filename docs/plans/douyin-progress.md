@@ -403,12 +403,80 @@
   `(created_at DESC, video.id DESC)` 的全序，游标也要携带动作时间；
   想验证「后点的在前」得让两次动作落在不同秒（验收脚本里 sleep 1.1s）。
 
-## 八、下一轮建议
+## 八、第 6 轮交付：社交三件套（@mention / 评论排序 / 评论置顶）
+
+### 接口（interaction 服务 29104）
+
+| 方法 | 路径 | 鉴权 | 说明 |
+|---|---|---|---|
+| GET | `/api/comment/:video_id?sort=hot\|new&cursor=&limit=` | 公开 | 评论列表；`sort` 缺省 `new` |
+| GET | `/api/video/:id/comments?sort=&cursor=&limit=` | 公开 | 同一 handler 的路径别名（网关参数路由 → interaction） |
+| POST | `/api/comment/:id/pin` | 作者 | 置顶；非作者 403、不存在 404、回复 400 |
+| DELETE | `/api/comment/:id/pin` | 作者 | 取消置顶（幂等） |
+
+- **排序**：`new` = `created_at DESC, id DESC`；`hot` = 评论点赞数 DESC、
+  `created_at DESC, id DESC`；非法 sort 400。`new` 游标 `<created_at>-<id>`、
+  `hot` 游标 `h<赞>-<created_at>-<id>`，两种游标串用一律 400（不静默跳页）。
+- **置顶**：`comments` 新列 `pinned_at`（0=未置顶）；第一页固定把置顶评论排最前
+  （不分 sort），置顶评论**不占**分页 limit、翻页不重复返回；最多 20 条。
+- **@mention**：`POST /api/comment` 正文解析 `@昵称`（中文/英文/数字，1~20 码点），
+  精确匹配 `users.name`（重名取最早注册者），写 `mention` 通知：
+  `target_type=video`、`target_id=video_id`，点击跳视频；自己 @ 自己、同一条评论
+  重复 @ 同一人都不重复写；`a@b` 这类邮箱不误判；不存在的昵称静默跳过。
+
+### 存储层
+
+| 改动 | 说明 |
+|---|---|
+| `comments.pinned_at` + `idx_comments_pinned(video_id, pinned_at DESC, id DESC)` | 旧库 ALTER 迁移，新库建表即含 |
+| `idx_users_name(name)` | @mention 按昵称精确查人，避免每条评论全表扫 |
+| `ListPinnedComments` | 置顶区单独查询（上限 20），与普通列表解耦 |
+| `ListComments(..., sort, ...)` | hot 用相关子查询回算点赞数（评论点赞数不落列），new 走原索引 |
+| `SetCommentPinned` | `UPDATE ... WHERE id`；changes=0 表示评论不存在 |
+| `FindUserByName` | `WHERE name=? ORDER BY id ASC LIMIT 1` |
+
+### 前端
+
+- 评论面板头部「最新 / 最热」分段按钮，切换后按 `sort=` 重拉；
+- 置顶评论显示「置顶」标签；视频作者额外看到「置顶 / 取消置顶」按钮；
+- 评论输入框输入 `@` 弹用户补全下拉：160ms 防抖调
+  `GET /api/search?type=user&limit=5`，取前 5，支持 ↑↓ 选择、Enter/点击插入
+  `@昵称 `，Esc/失焦关闭；搜索响应按序号丢弃过期结果；
+- 通知中心 mention 文案改为「X 在评论中提到了你」，点击跳视频（沿用 target=video）；
+- 分享落地页 `/v/:id` 首屏同样把置顶评论排最前并显示「置顶」标签。
+
+### 验收
+
+- `bash app/douyin/build.sh` → 8 个二进制全 ok，`-Werror -Wpedantic` 零告警
+- `bash app/douyin/scripts/accept_social_cluster.sh` → **89 PASS / 0 FAIL**（9 组）
+- `bash app/douyin/scripts/accept_all.sh` → **70 PASS / 0 FAIL**
+- 历史回归：comment_like 33、notifications 92、report_block 79、
+  share_landing 88、profile_tabs 115，全部 0 FAIL
+- 性能（loopback，20 次串行）：`GET /api/comment/:id?sort=hot&limit=50`
+  TTFB avg **1.18 ms** / max **1.54 ms**（阈值 200 ms）
+- 覆盖：mention 解析/通知字段/自己@自己/重复@/邮箱/不存在昵称、new 与 hot 顺序、
+  hot limit=1 三页游标、非法 sort、游标串用、带 token 视角、置顶权限
+  （403/401/404/400）、置顶优先于 sort、置顶不占 limit、翻页不重复、
+  重复置顶/取消幂等、别名路径 200/400/405/404、前端元素、TTFB
+- 前端 JS 校验（无 node 环境）：抓 `GET /` 内联 JS，跳过字符串/注释/正则后
+  括号严格配平，本轮函数与页面元素齐全
+
+### 踩坑记录
+
+- **hot 游标被判 400**：`ReadCursor` 原用 new 游标解码器预校验，`h...` 开头直接
+  失败。修复：读取阶段只取值，格式校验下沉 `Store::ListComments` 按 sort 选解码器。
+- **SQL 参数顺序**：hot/new 的 `? = 0` 开关与 viewer_id 曾写反（匿名时恰好都为 0，
+  带 token 才会暴露）。修复：显式传 `(viewer_id > 0 ? 1 : 0)`。
+- **别名路径 POST 变 404**：网关只注册 `kReadMask` 时，POST 落进
+  `/api/video/**` 通配被 video 服务 404。修复：别名路由注册 `method_mask::kAll`，
+  由 interaction 统一回 405。
+
+## 九、下一轮建议
 
 1. 主页 tab 增强：喜欢列表「可见性设置」（公开 / 仅好友 / 私密）、
    他人主页的授权申请、收藏夹分组。
 2. 举报运营后台：`reports.status` 只有 pending，缺列表 / 处理接口与页面。
-3. 「待核实」三项：@mention / 草稿 / WS Resume / 压缩——要么补实现，要么从
-   已完成清单里移除；@mention 可直接复用通知中心的 `mention` 类型。
+3. 「待核实」三项：草稿 / WS Resume / 压缩——要么补实现，要么从
+   已完成清单里移除；@mention 已在第 6 轮落地（见第八节）。
 4. 落地页增强：评论回复折叠、作者其它作品、播放进度记忆；分享卡片的
    `og:image` 可选自动截帧（当前复用同名 jpg / demo 封面）。
