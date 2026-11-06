@@ -8,7 +8,8 @@
 #   4) 点赞两次幂等（经网关 → interaction 29104）
 #   5) 评论 2 条 + 评论列表（经网关 → interaction 29104）
 #   6) 搜索用户/视频（经网关 → search 29106）
-#   7) 创建直播间 / 开播 / 进房（经网关 → live 29105）
+#   7) 创建直播间 / 开播 / 进房（经网关 → live 29105）；
+#      第 10 轮追加聊天 / 礼物 / 贡献榜 / 余额 / 直播页
 #   8) 网关专项：6 条业务路由全 200、无 token 写接口 401、未知路径 404、
 #      /api/health/all 聚合 6 项 ok=true、/health 自身 200
 #   9) --bench：用 scripts/loadgen.cpp 压测 GET /api/feed 与 GET /api/video/:id
@@ -341,6 +342,34 @@ code=$(get "/api/live/rooms?status=1")
 check "GET /api/live/rooms?status=1（公开读）" 200 "$code"
 expect_eq "直播列表含房间" 1 \
   "$(grep -o "\"room\":{\"id\":$ROOM," "$TMP/body" | wc -l)"
+# 第 10 轮：直播间聊天 / 礼物 / 贡献榜（全部经网关 → live 29105）
+code=$(post "/api/live/$ROOM/messages" '{"content":"直播聊天验收"}' "$TOKEN_B")
+check "bob 发直播间消息" 200 "$code"
+expect_body "聊天消息回显" '直播聊天验收'
+code=$(get "/api/live/$ROOM/messages?after=0&limit=50")
+check "聊天增量拉取" 200 "$code"
+expect_body "聊天列表含消息" '直播聊天验收'
+code=$(get "/api/live/$ROOM/messages?after=999999")
+check "聊天 after 无新消息" 200 "$code"
+expect_body "增量空列表" '"count":0'
+code=$(post "/api/live/$ROOM/gift" '{"gift_id":2,"count":2}' "$TOKEN_B")
+check "bob 送棒棒糖 ×2" 200 "$code"
+expect_body "送礼扣款后余额 980" '"coins":980'
+code=$(get "/api/live/wallet" "$TOKEN_B")
+check "钱包余额" 200 "$code"
+expect_body "钱包 980" '"coins":980'
+code=$(get "/api/live/$ROOM/ranking?limit=10")
+check "贡献榜" 200 "$code"
+expect_body "榜单含 bob" 'bob'
+expect_body "榜单金额 20" '"coins":20'
+code=$(post "/api/live/$ROOM/gift" '{"gift_id":5,"count":99}' "$TOKEN_B")
+check "余额不足" 400 "$code"
+expect_body "余额不足提示" '余额不足'
+code=$(get "/live?room=$ROOM")
+check "GET /live 直播页" 200 "$code"
+expect_body "直播页聊天区" 'id="chatList"'
+expect_body "直播页礼物面板" 'id="giftPanel"'
+expect_body "直播页贡献榜" 'id="rankingPanel"'
 
 echo "[9/9] 网关专项：鉴权 / 未知路径 / 6 条路由全 200"
 code=$(post "/api/like" "{\"video_id\":$V1}")

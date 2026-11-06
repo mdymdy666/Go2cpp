@@ -213,6 +213,35 @@ struct StoredRoom {
     std::int64_t created_at{0};    ///< Unix 秒。
 };
 
+/// @brief `live_messages` 表里的一行直播间聊天/礼物消息（第 10 轮新增）。
+/// @note `user_name` 不是表列：查询时 `LEFT JOIN users` 回填，避免写入端
+///       冗余昵称、改名后不同步。
+struct StoredLiveMessage {
+    std::int64_t id{0};          ///< 自增主键（同时是增量拉取游标）。
+    std::int64_t room_id{0};     ///< 所属直播间。
+    std::int64_t user_id{0};     ///< 发送者 id。
+    std::string user_name;       ///< 发送者昵称（JOIN 回填；可能为空）。
+    std::string content;         ///< 正文（1~200 字）或礼物摘要。
+    std::string kind;            ///< `chat` 聊天 / `gift` 礼物特效。
+    std::int64_t created_at{0};  ///< Unix 秒。
+};
+
+/// @brief `gifts` 表里的一行礼物（第 10 轮新增，预置 5 个）。
+struct StoredGift {
+    std::int64_t id{0};          ///< 自增主键。
+    std::string name;            ///< 礼物名（小心心/火箭…）。
+    std::int64_t price_coins{0}; ///< 单价（金币，>0）。
+    std::string icon;            ///< 图标（emoji）。
+};
+
+/// @brief 贡献榜的一行：某个用户在本房间的送礼总额（GROUP BY 聚合结果）。
+struct StoredGiftRank {
+    std::int64_t user_id{0};     ///< 送礼者 id。
+    std::string user_name;       ///< 昵称（JOIN 回填；可能为空）。
+    std::int64_t coins{0};       ///< `SUM(price_coins * count)`。
+    std::int64_t gift_count{0};  ///< 礼物总件数（`SUM(count)`）。
+};
+
 /// @brief SQLite 连接 + 建表 + users/follows 访问器。
 /// @note 同一个 `Store` 由 HTTP 事件循环单线程调用；`DB`/`Session` 自身另有锁。
 class Store {
@@ -944,6 +973,74 @@ class Store {
      * @return 1=本次离开；0=本不在房间（不变）；-1=数据库错误。
      */
     int LeaveRoom(std::int64_t id, std::int64_t user_id, std::string* error);
+
+    // ---- 直播互动（第 10 轮）：聊天 / 礼物 / 贡献榜 ----
+
+    /**
+     * @brief 追加一条直播间消息。
+     * @param room_id [in] 房间 id（>0，调用方已确认房间存在）。
+     * @param user_id [in] 发送者 id（>0）。
+     * @param content [in] 正文（已校验 1~200 字，非空）。
+     * @param kind [in] `chat` 或 `gift`；其它值由调用方保证不出现。
+     * @param error [out] 失败时写错误文本。
+     * @return 新消息 id；失败返回 -1。
+     */
+    std::int64_t AppendLiveMessage(std::int64_t room_id, std::int64_t user_id,
+                                   const std::string& content,
+                                   const std::string& kind, std::string* error);
+
+    /**
+     * @brief 增量拉取直播间消息（`id > after_id`），升序返回。
+     * @param room_id [in] 房间 id。
+     * @param after_id [in] 游标：只返回 id 更大的消息；0 表示从头。
+     * @param limit [in] 最多返回条数（1~100，调用方已夹取）。
+     * @param owner_id [in] 房主 id：过滤「被房主拉黑者」的消息；<=0 不过滤。
+     * @param out [out] 追加到末尾。
+     * @param error [out] 失败时写错误文本。
+     * @return 成功返回 true（可能为空列表）。
+     */
+    bool ListLiveMessages(std::int64_t room_id, std::int64_t after_id,
+                          std::int64_t limit, std::int64_t owner_id,
+                          std::vector<StoredLiveMessage>* out,
+                          std::string* error);
+
+    /// @brief 全部礼物（按 id 升序，预置 5 个）。
+    bool ListGifts(std::vector<StoredGift>* out, std::string* error);
+
+    /// @brief 按 id 查礼物；未找到返回 false 且 error 为空。
+    bool FindGift(std::int64_t id, StoredGift* out, std::string* error);
+
+    /// @brief 查询用户金币余额；用户不存在返回 false 且 error 为空。
+    bool FindUserCoins(std::int64_t user_id, std::int64_t* out,
+                       std::string* error);
+
+    /**
+     * @brief 送礼：事务内扣余额 + 写 gift_records + 写一条 kind=gift 消息。
+     * @param room_id [in] 房间 id。
+     * @param sender_id [in] 送礼者 id。
+     * @param gift [in] 已查出的礼物（单价 >0）。
+     * @param count [in] 件数（1~99，调用方已校验）。
+     * @param content [in] 聊天区展示的摘要（例「送出 火箭 ×1」）。
+     * @param out_coins [out] 成功时写扣款后的余额；失败保持原值。
+     * @param out_message_id [out] 成功时写新增消息 id。
+     * @param error [out] 失败时写错误文本。
+     * @return 1=成功；0=余额不足（未扣款、未写记录）；-1=数据库错误。
+     */
+    int SendGift(std::int64_t room_id, std::int64_t sender_id,
+                 const StoredGift& gift, std::int64_t count,
+                 const std::string& content, std::int64_t* out_coins,
+                 std::int64_t* out_message_id, std::string* error);
+
+    /**
+     * @brief 贡献榜：单条 SQL 按送礼总额降序聚合（GROUP BY sender_id）。
+     * @param room_id [in] 房间 id。
+     * @param limit [in] 最多条数（1~50）。
+     * @param out [out] 追加到末尾，顺序即榜序。
+     * @param error [out] 失败时写错误文本。
+     * @return 成功返回 true（可能为空）。
+     */
+    bool ListGiftRanking(std::int64_t room_id, std::int64_t limit,
+                         std::vector<StoredGiftRank>* out, std::string* error);
 
     // ---- 分片上传（断点续传）：upload_sessions 持久化 ----
 

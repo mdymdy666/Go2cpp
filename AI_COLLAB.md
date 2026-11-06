@@ -1602,3 +1602,47 @@ latest（服务重启）→ `resume_gap`，客户端走 REST 全量刷新。
   - pwsh 双引号里反引号/中文/`$?` 会被 PowerShell 解析，脚本必须落盘再 `wsl cp`；
   - `kinds_all` 末尾多逗号导致 5 个分类断言误报，改函数去掉尾逗号。
 - **状态**：已提交（本轮 commit）。
+
+## 2026-11-06 第 10 轮：直播三件套（聊天 / 礼物 / 贡献榜）
+
+- **需求**：真树 WSL `/UserData/CodexWorkSpace/Go2cpp`（非 `E:\CodexWorkspace\Go2Cpp`）；
+  一轮 2–3 个内联功能；验收 = 功能齐全、无明显 bug、2C4G 下 TTFB < 200 ms。
+- **存储层**（`douyin_store.hpp` / `douyin_store.cpp`）：
+  - `live_messages(id, room_id, user_id, content, kind, created_at)` +
+    `idx_live_messages_room(room_id, id DESC)`；`kind=chat|gift` 共用增量游标；
+  - `gifts` 预置 5 个（小心心 1 / 棒棒糖 10 / 鲜花 30 / 火箭 100 / 城堡 500）；
+  - `gift_records` + `idx_gift_records_room(room_id, sender_id)`；
+    `users.coins` 默认 1000（旧库 ALTER 迁移）；
+  - `AppendLiveMessage` / `ListLiveMessages`（`id > after` + 拉黑 NOT IN）/
+    `ListGifts` / `FindGift` / `FindUserCoins` / `SendGift`（事务：条件扣款 +
+    记录 + gift 消息）/ `ListGiftRanking`（单条 GROUP BY）。
+- **服务层**（`live_service.cpp`）：
+  - `POST/GET /api/live/:id/messages`、`POST /api/live/:id/gift`、
+    `GET /api/live/:id/ranking`、`GET /api/live/gifts`、`GET /api/live/wallet`；
+    同时兼容 `/api/live/room/:id/...` 前缀；
+  - 发言 1~200 字（UTF-8 码点）、双向拉黑 403、礼物 count 1~99、榜单 limit 1~50；
+  - **每个请求入口 `store.ResetStatements()`**，修掉 ORM 游标旧快照导致的
+    拉黑判定错乱与 `SQLITE_BUSY_SNAPSHOT`；
+- **存储稳定性**：`Store::Open` 对 `SetJournalMode("WAL")` 做 40×50ms 重试，
+  消除多进程共库的启动竞态。
+- **网关**（`gateway.cpp`）：新增 `GET /live` 本地直出路由（`LivePageMatcher`）。
+- **前端**（新 `include/douyin_live_page.hpp` + 首页顶栏入口）：
+  - 聊天 2s 增量轮询（`after=last_id`）+ 自己发言乐观上屏 + 按 id 去重；
+  - 礼物面板（图标/名称/价格/数量/余额）+ 聊天区高亮与飘屏特效；
+  - 贡献榜弹层（头像/昵称/金额、前三奖牌、随聊天轮询刷新）；
+  - 房间选择器、页面隐藏暂停轮询、余额未加载不误判。
+- **验证**：
+  - `bash app/douyin/build.sh` → 8 个二进制 ok，`-Werror -Wpedantic` 零告警；
+  - 新增 `scripts/accept_live_cluster.sh` → **128 PASS / 0 FAIL**；
+  - 回归 `accept_all.sh` **89 PASS / 0 FAIL**、`accept_live.sh` **66 PASS / 0 FAIL**；
+  - TTFB（20 次）：聊天增量 0.52 ms、榜单 0.48 ms、直播页 0.46 ms（阈值 200 ms）；
+  - 查询计划命中 `idx_live_messages_room` / `idx_gift_records_room`；
+  - 内联 JS 括号平衡通过（环境无 node）。
+- **踩坑**：
+  - ORM 语句缓存把 SQLite 连接钉在旧快照：跨进程拉黑后判定反转 + 写
+    `SQLITE_BUSY_SNAPSHOT`，每请求 `ResetStatements()` 解决；
+  - WAL 并发启动 `PRAGMA journal_mode=WAL` 必现 `SQLITE_BUSY`，Open 加重试；
+  - Windows Python 写 WSL 文件默认 CRLF，脚本必须 `newline="\n"`；
+  - 验收脚本裸 `wait` 会等待服务子进程，改 `wait "${PIDS[@]}"`；
+  - 送礼响应里 `gift.id` 在前，取消息 id 要匹配 `"message":{"id":`。
+- **状态**：已提交（本轮 commit）。

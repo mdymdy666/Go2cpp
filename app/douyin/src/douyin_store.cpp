@@ -21,6 +21,7 @@
 #include <random>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -259,7 +260,9 @@ constexpr const char* kSchemaSql =
     "  email TEXT NOT NULL UNIQUE,"
     "  password_hash TEXT NOT NULL,"
     "  salt TEXT NOT NULL,"
-    "  created_at INTEGER NOT NULL"
+    "  created_at INTEGER NOT NULL,"
+    // 演示用金币余额：注册即送 1000，送礼当场扣减（事务见 SendGift）。
+    "  coins INTEGER NOT NULL DEFAULT 1000"
     ");"
     "CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);"
     // @mention 按昵称精确查人：没有索引就是每条评论一次全表扫。
@@ -390,7 +393,37 @@ constexpr const char* kSchemaSql =
     "  UNIQUE(user_id, blocked_id)"
     ");"
     "CREATE INDEX IF NOT EXISTS idx_blocks_user "
-    "ON blocks(user_id, created_at DESC);";
+    "ON blocks(user_id, created_at DESC);"
+    "CREATE TABLE IF NOT EXISTS live_messages ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  room_id INTEGER NOT NULL,"
+    "  user_id INTEGER NOT NULL,"
+    "  content TEXT NOT NULL,"
+    "  kind TEXT NOT NULL DEFAULT 'chat',"
+    "  created_at INTEGER NOT NULL"
+    ");"
+    // 增量拉取与首屏都按 (room_id, id DESC) 取：一条索引同时服务
+    // `id > after` 的区间扫描与 `ORDER BY id ASC LIMIT n`。
+    "CREATE INDEX IF NOT EXISTS idx_live_messages_room "
+    "ON live_messages(room_id, id DESC);"
+    "CREATE TABLE IF NOT EXISTS gifts ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  name TEXT NOT NULL,"
+    "  price_coins INTEGER NOT NULL,"
+    "  icon TEXT NOT NULL"
+    ");"
+    "CREATE TABLE IF NOT EXISTS gift_records ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  room_id INTEGER NOT NULL,"
+    "  sender_id INTEGER NOT NULL,"
+    "  gift_id INTEGER NOT NULL,"
+    "  count INTEGER NOT NULL,"
+    "  created_at INTEGER NOT NULL"
+    ");"
+    // 贡献榜按房间 GROUP BY sender_id：索引前缀 room_id 把扫描限制在本房间，
+    // 避免全表聚合。
+    "CREATE INDEX IF NOT EXISTS idx_gift_records_room "
+    "ON gift_records(room_id, sender_id);";
 
 /// @brief 把 `Error` 写成可读文本。
 std::string DescribeError(const go2cpp::storage::Error& error) {
@@ -648,10 +681,25 @@ bool Store::Open(const std::string& path, std::string* error) {
         }
         return false;
     }
-    if (auto wal = m_db->SetJournalMode("WAL"); wal) {
-        if (error != nullptr) {
-            *error = "设置 WAL 失败: " + DescribeError(wal);
+    // 多进程共用同一 SQLite 文件（六个服务都开同一个 db）时，另一个进程
+    // 可能正在初始化/持锁；PRAGMA journal_mode=WAL 不经过 busy handler，
+    // 会直接返回 SQLITE_BUSY。这里有限重试（最多 2 s），避免启动竞态把
+    // 整个服务打挂（实测 user+live 同时启动必现）。
+    bool wal_ready = false;
+    for (int attempt = 0; attempt < 40; ++attempt) {
+        auto wal = m_db->SetJournalMode("WAL");
+        if (!wal) {
+            wal_ready = true;
+            break;
         }
+        if (attempt == 39) {
+            if (error != nullptr) {
+                *error = "设置 WAL 失败: " + DescribeError(wal);
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    if (!wal_ready) {
         return false;
     }
     m_session = std::make_unique<go2cpp::storage::Session>(*m_db);
@@ -697,6 +745,19 @@ bool Store::EnsureSchema(std::string* error) {
     (void)m_db->Exec(
         "CREATE INDEX IF NOT EXISTS idx_comments_pinned "
         "ON comments(video_id, pinned_at DESC, id DESC)");
+    // step6: 第 10 轮直播互动——users 补 coins（旧库默认补 1000；列已存在时
+    //        ALTER 报 duplicate column，属预期）。
+    (void)m_db->Exec(
+        "ALTER TABLE users ADD COLUMN coins INTEGER NOT NULL DEFAULT 1000");
+    // 礼物价目表是静态字典：固定 id + INSERT OR IGNORE，重复启动不产生副本，
+    // 也不覆盖运营后来改过的价格。
+    (void)m_db->Exec(
+        "INSERT OR IGNORE INTO gifts(id, name, price_coins, icon) VALUES"
+        "(1, '小心心', 1, '\u2764\ufe0f'),"
+        "(2, '棒棒糖', 10, '\U0001F36D'),"
+        "(3, '鲜花', 30, '\U0001F339'),"
+        "(4, '火箭', 100, '\U0001F680'),"
+        "(5, '城堡', 500, '\U0001F3F0')");
     return true;
 }
 
@@ -3067,6 +3128,316 @@ int Store::LeaveRoom(std::int64_t id, std::int64_t user_id, std::string* error) 
 }
 
 // ---- 分片上传（断点续传）：upload_sessions 持久化 --------------------------
+
+
+std::int64_t Store::AppendLiveMessage(std::int64_t room_id,
+                                     std::int64_t user_id,
+                                     const std::string& content,
+                                     const std::string& kind,
+                                     std::string* error) {
+    // 写前清 ORM 语句缓存：任何未 finalize 的读游标都会让本连接停留在
+    // 旧快照，写时直接报 SQLITE_BUSY_SNAPSHOT（实测跨进程拉黑后必现）。
+    ResetStatements();
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return -1;
+    }
+    const std::int64_t now = static_cast<std::int64_t>(std::time(nullptr));
+    auto inserted = m_db->Exec(
+        "INSERT INTO live_messages(room_id, user_id, content, kind, created_at)"
+        " VALUES(?, ?, ?, ?, ?)",
+        room_id, user_id, content, kind, now);
+    if (!inserted) {
+        if (error != nullptr) {
+            *error = "写入直播消息失败: " + DescribeError(inserted.Err());
+        }
+        return -1;
+    }
+    return inserted.Value().last_insert_row_id;
+}
+
+bool Store::ListLiveMessages(std::int64_t room_id, std::int64_t after_id,
+                             std::int64_t limit, std::int64_t owner_id,
+                             std::vector<StoredLiveMessage>* out,
+                             std::string* error) {
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return false;
+    }
+    const std::string base =
+        "SELECT m.id, m.room_id, m.user_id, COALESCE(u.name, ''), m.content,"
+        " m.kind, m.created_at FROM live_messages m"
+        " LEFT JOIN users u ON u.id = m.user_id"
+        " WHERE m.room_id = ? AND m.id > ?";
+    auto rows = owner_id > 0
+                    ? m_db->Query(base +
+                                      " AND m.user_id NOT IN"
+                                      " (SELECT blocked_id FROM blocks"
+                                      " WHERE user_id = ?)"
+                                      " ORDER BY m.id ASC LIMIT ?",
+                                  room_id, after_id, owner_id, limit)
+                    : m_db->Query(base + " ORDER BY m.id ASC LIMIT ?", room_id,
+                                  after_id, limit);
+    if (!rows) {
+        if (error != nullptr) {
+            *error = "查询直播消息失败: " + DescribeError(rows.Err());
+        }
+        return false;
+    }
+    while (rows.Value().Next()) {
+        StoredLiveMessage message;
+        message.id = rows.Value().Int64(0);
+        message.room_id = rows.Value().Int64(1);
+        message.user_id = rows.Value().Int64(2);
+        message.user_name = rows.Value().Text(3);
+        message.content = rows.Value().Text(4);
+        message.kind = rows.Value().Text(5);
+        message.created_at = rows.Value().Int64(6);
+        out->push_back(std::move(message));
+    }
+    if (rows.Value().Err()) {
+        if (error != nullptr) {
+            *error = "遍历直播消息失败: " + DescribeError(rows.Value().Err());
+        }
+        return false;
+    }
+    return true;
+}
+
+bool Store::ListGifts(std::vector<StoredGift>* out, std::string* error) {
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return false;
+    }
+    auto rows = m_db->Query(
+        "SELECT id, name, price_coins, icon FROM gifts ORDER BY id ASC");
+    if (!rows) {
+        if (error != nullptr) {
+            *error = "查询礼物列表失败: " + DescribeError(rows.Err());
+        }
+        return false;
+    }
+    while (rows.Value().Next()) {
+        StoredGift gift;
+        gift.id = rows.Value().Int64(0);
+        gift.name = rows.Value().Text(1);
+        gift.price_coins = rows.Value().Int64(2);
+        gift.icon = rows.Value().Text(3);
+        out->push_back(std::move(gift));
+    }
+    if (rows.Value().Err()) {
+        if (error != nullptr) {
+            *error = "遍历礼物列表失败: " + DescribeError(rows.Value().Err());
+        }
+        return false;
+    }
+    return true;
+}
+
+bool Store::FindGift(std::int64_t id, StoredGift* out, std::string* error) {
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return false;
+    }
+    auto found = m_db->Query(
+        "SELECT id, name, price_coins, icon FROM gifts WHERE id = ?", id);
+    if (!found) {
+        if (error != nullptr) {
+            *error = "查询礼物失败: " + DescribeError(found.Err());
+        }
+        return false;
+    }
+    if (!found.Value().Next()) {
+        if (found.Value().Err()) {
+            if (error != nullptr) {
+                *error = "遍历礼物失败: " + DescribeError(found.Value().Err());
+            }
+        }
+        return false;
+    }
+    out->id = found.Value().Int64(0);
+    out->name = found.Value().Text(1);
+    out->price_coins = found.Value().Int64(2);
+    out->icon = found.Value().Text(3);
+    return true;
+}
+
+bool Store::FindUserCoins(std::int64_t user_id, std::int64_t* out,
+                          std::string* error) {
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return false;
+    }
+    auto rows = m_db->Query("SELECT coins FROM users WHERE id = ?", user_id);
+    if (!rows) {
+        if (error != nullptr) {
+            *error = "查询余额失败: " + DescribeError(rows.Err());
+        }
+        return false;
+    }
+    if (!rows.Value().Next()) {
+        if (rows.Value().Err()) {
+            if (error != nullptr) {
+                *error = "遍历余额失败: " + DescribeError(rows.Value().Err());
+            }
+        }
+        return false;
+    }
+    *out = rows.Value().Int64(0);
+    return true;
+}
+
+int Store::SendGift(std::int64_t room_id, std::int64_t sender_id,
+                    const StoredGift& gift, std::int64_t count,
+                    const std::string& content, std::int64_t* out_coins,
+                    std::int64_t* out_message_id, std::string* error) {
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return -1;
+    }
+    if (gift.id <= 0 || gift.price_coins <= 0 || count <= 0 || count > 99) {
+        if (error != nullptr) {
+            *error = "礼物参数非法";
+        }
+        return -1;
+    }
+    // 事务前清 ORM 游标：否则 BEGIN IMMEDIATE 会带着旧读快照升级，
+    // WAL 下返回 SQLITE_BUSY_SNAPSHOT，表现为「送礼偶发 500」。
+    ResetStatements();
+    const std::int64_t total = gift.price_coins * count;
+    const std::int64_t now = static_cast<std::int64_t>(std::time(nullptr));
+    // step1: 显式事务——扣款、记录、聊天消息必须同生共死；任何一步失败
+    //        都靠 Transaction 析构回滚，绝不允许「扣了钱没记录」。
+    go2cpp::storage::Transaction tx(*m_db);
+    if (auto begun = tx.Begin(); begun) {
+        if (error != nullptr) {
+            *error = "开始事务失败: " + DescribeError(begun);
+        }
+        return -1;
+    }
+    // step2: 条件扣款是余额校验的唯一依据：WHERE coins >= total 让
+    //        「查余额→再扣」的竞态窗口消失，同时省掉一次 SELECT。
+    auto debited = m_db->Exec(
+        "UPDATE users SET coins = coins - ? WHERE id = ? AND coins >= ?", total,
+        sender_id, total);
+    if (!debited) {
+        if (error != nullptr) {
+            *error = "扣减余额失败: " + DescribeError(debited.Err());
+        }
+        return -1;
+    }
+    if (debited.Value().changes == 0) {
+        (void)tx.Rollback();
+        if (error != nullptr) {
+            *error = "余额不足";
+        }
+        return 0;
+    }
+    // step3: 写礼物记录（榜单数据源）。
+    auto record = m_db->Exec(
+        "INSERT INTO gift_records(room_id, sender_id, gift_id, count, created_at)"
+        " VALUES(?, ?, ?, ?, ?)",
+        room_id, sender_id, gift.id, count, now);
+    if (!record) {
+        if (error != nullptr) {
+            *error = "写入礼物记录失败: " + DescribeError(record.Err());
+        }
+        return -1;
+    }
+    // step4: 聊天消息与礼物记录同一事务，轮询端看到一个原子事件。
+    auto message = m_db->Exec(
+        "INSERT INTO live_messages(room_id, user_id, content, kind, created_at)"
+        " VALUES(?, ?, ?, 'gift', ?)",
+        room_id, sender_id, content, now);
+    if (!message) {
+        if (error != nullptr) {
+            *error = "写入礼物消息失败: " + DescribeError(message.Err());
+        }
+        return -1;
+    }
+    // step5: 事务内读回余额，保证返回值与已提交状态一致。
+    auto coins = m_db->Query("SELECT coins FROM users WHERE id = ?", sender_id);
+    if (!coins) {
+        if (error != nullptr) {
+            *error = "查询余额失败: " + DescribeError(coins.Err());
+        }
+        return -1;
+    }
+    if (!coins.Value().Next()) {
+        if (error != nullptr) {
+            *error = "用户不存在";
+        }
+        return -1;
+    }
+    const std::int64_t left = coins.Value().Int64(0);
+    if (auto committed = tx.Commit(); committed) {
+        if (error != nullptr) {
+            *error = "提交事务失败: " + DescribeError(committed);
+        }
+        return -1;
+    }
+    if (out_coins != nullptr) {
+        *out_coins = left;
+    }
+    if (out_message_id != nullptr) {
+        *out_message_id = message.Value().last_insert_row_id;
+    }
+    return 1;
+}
+
+bool Store::ListGiftRanking(std::int64_t room_id, std::int64_t limit,
+                            std::vector<StoredGiftRank>* out,
+                            std::string* error) {
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return false;
+    }
+    // 单条 SQL：JOIN 礼物价目 + LEFT JOIN 昵称 + GROUP BY 聚合；
+    // 不在服务层做「先查记录再逐人查用户」的 N+1。
+    auto rows = m_db->Query(
+        "SELECT r.sender_id, COALESCE(u.name, ''),"
+        " SUM(g.price_coins * r.count) AS coins, SUM(r.count) AS gift_count"
+        " FROM gift_records r JOIN gifts g ON g.id = r.gift_id"
+        " LEFT JOIN users u ON u.id = r.sender_id"
+        " WHERE r.room_id = ? GROUP BY r.sender_id"
+        " ORDER BY coins DESC, r.sender_id ASC LIMIT ?",
+        room_id, limit);
+    if (!rows) {
+        if (error != nullptr) {
+            *error = "查询贡献榜失败: " + DescribeError(rows.Err());
+        }
+        return false;
+    }
+    while (rows.Value().Next()) {
+        StoredGiftRank rank;
+        rank.user_id = rows.Value().Int64(0);
+        rank.user_name = rows.Value().Text(1);
+        rank.coins = rows.Value().Int64(2);
+        rank.gift_count = rows.Value().Int64(3);
+        out->push_back(std::move(rank));
+    }
+    if (rows.Value().Err()) {
+        if (error != nullptr) {
+            *error = "遍历贡献榜失败: " + DescribeError(rows.Value().Err());
+        }
+        return false;
+    }
+    return true;
+}
 
 bool Store::CreateUploadSession(const StoredUpload& session, std::string* error) {
     if (!Ok()) {

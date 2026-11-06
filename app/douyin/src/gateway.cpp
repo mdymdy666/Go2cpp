@@ -11,7 +11,9 @@
  *          - 读方法（GET/HEAD）为公开读（详情、feed、评论列表、房间列表、
  *            搜索），不要求网关鉴权；
  *          - /health、/api/health/all 由组件内建，无需注册；
- *          - GET /videos/<name> 由本地 handler 直接返回 web/videos 下的 mp4。
+ *          - GET /videos/<name> 由本地 handler 直接返回 web/videos 下的 mp4；
+ *          - GET /live 由本地 handler 直出直播间单页（聊天/礼物/贡献榜，
+ *            数据走 live_service 的 /api/live/*）。
  *
  * @note 路由按「业务前缀」组织；读/写语义不同的前缀按方法掩码拆成两条
  *       RouteSpec（同一上游），避免把公开读误挡在 401 之后。
@@ -23,6 +25,7 @@
 
 #include "douyin_auth.hpp"
 #include "douyin_home_page.hpp"
+#include "douyin_live_page.hpp"
 #include "douyin_shutdown.hpp"
 #include "douyin_observability.hpp"
 #include "go2cpp/app/gateway.hpp"
@@ -205,6 +208,58 @@ Result<void> ServeHome(Request& /*request*/, Response& response) {
     response.header.set("Cache-Control", "no-store");
     response.body = douyin::kHomePageHtml;
     return Result<void>::Ok();
+}
+
+/**
+ * @brief 直播间页匹配器：只接管 GET / HEAD 的 `/live` 与 `/live.html`。
+ *
+ * ## 定位
+ * 与 HomeMatcher 一样注册为自定义 Matcher，优先级高于通配路由，保证
+ * `/live` 不会被 `/api/**` 或 404 兜底吞掉。房间 id 走 query
+ * （`/live?room=3`），页面脚本自己解析，不需要路径参数。
+ *
+ * ## 并发/失败语义
+ * - 无状态，worker 线程并发调用安全；
+ * - 只匹配 GET/HEAD；其它方法返回 false，由后续路由回 404。
+ */
+class LivePageMatcher final : public Matcher {
+public:
+    /// @brief 命中直播页路径；本路由无参数，不写入 params。
+    /// @param request [in] 入站请求——借用，调用期间有效。
+    /// @param params [out] 不写入。
+    /// @return true 表示由 ServeLivePage 接管。
+    bool Match(const Request& request, PathParams* /*params*/) const override {
+        if (request.method != Method::Get && request.method != Method::Head) {
+            return false;
+        }
+        const std::string_view path = request.path_view();
+        return path == "/live" || path == "/live.html";
+    }
+};
+
+/// @brief 直播间页 handler：本地填写 HTML，不产生上游请求。
+/// @param request [in] 入站请求——借用；页面与请求内容无关，未使用。
+/// @param response [out] 出站响应——成功时整体覆盖为 200 + HTML。
+/// @return 总是 Ok。
+Result<void> ServeLivePage(Request& /*request*/, Response& response) {
+    response.status = Status::OK;
+    response.header.set("Content-Type", "text/html; charset=utf-8");
+    response.header.set("Cache-Control", "no-store");
+    response.body = douyin::kLivePageHtml;
+    return Result<void>::Ok();
+}
+
+/// @brief 注册直播间页路由；失败时打印并返回 false。
+bool AddLiveRoute(Gateway* gateway) {
+    const auto result = gateway->AddRoute(
+        std::make_shared<LivePageMatcher>(),
+        std::make_shared<Handler>(&ServeLivePage));
+    if (!result.ok()) {
+        std::fprintf(stderr, "[%s] 注册直播页路由失败：%s\n", kServiceName,
+                     result.error().c_str());
+        return false;
+    }
+    return true;
 }
 
 /// @brief 健康探针路由的匹配器：只命中 `/health/live` 与 `/health/ready`。
@@ -832,7 +887,8 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    if (!AddHomeRoute(gateway.get()) || !AddVideoRoute(gateway.get()) ||
+    if (!AddHomeRoute(gateway.get()) || !AddLiveRoute(gateway.get()) ||
+        !AddVideoRoute(gateway.get()) ||
         !AddHealthRoutes(gateway.get())) {
         return 1;
     }

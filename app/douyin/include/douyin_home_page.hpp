@@ -1033,6 +1033,9 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     <button class="btn-primary" id="navSearchBtn" type="button">搜索</button>
   </div>
   <div class="auth">
+    <a class="btn-ghost live-entry" id="liveEntryBtn" href="/live"
+       title="进入直播间（聊天 / 礼物 / 贡献榜）"
+       style="text-decoration:none">🔴 直播</a>
     <button class="bell" id="notifBtn" type="button" title="消息通知"
             aria-label="消息通知" style="display:none">🔔<span class="bell-badge"
             id="notifBadge" hidden>0</span></button>

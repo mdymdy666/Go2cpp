@@ -2,10 +2,10 @@
 
 | 项 | 内容 |
 |---|---|
-| 盘点时间 | 2026-11-06（第 9 轮） |
+| 盘点时间 | 2026-11-06（第 10 轮） |
 | 盘点范围 | `app/douyin/` 全部源码（7 服务 + 网关 + 单页前端） |
 | 盘点方式 | 读 REQUIREMENTS.md、逐服务路由表、前端函数/元素清单、关键词扫描、跑既有验收 |
-| 基线 | `scripts/accept_all.sh` → 70 PASS / 0 FAIL；`scripts/accept_notifications.sh` → 92 PASS / 0 FAIL；`scripts/accept_report_block.sh` → 79 PASS / 0 FAIL；`scripts/accept_share_landing.sh` → 88 PASS / 0 FAIL；`scripts/accept_profile_tabs.sh` → **115 PASS / 0 FAIL**；`scripts/accept_player_cluster.sh` → **94 PASS / 0 FAIL**；`scripts/accept_notif_cluster.sh` → **111 PASS / 0 FAIL** |
+| 基线 | `scripts/accept_all.sh` → 70 PASS / 0 FAIL；`scripts/accept_notifications.sh` → 92 PASS / 0 FAIL；`scripts/accept_report_block.sh` → 79 PASS / 0 FAIL；`scripts/accept_share_landing.sh` → 88 PASS / 0 FAIL；`scripts/accept_profile_tabs.sh` → **115 PASS / 0 FAIL**；`scripts/accept_player_cluster.sh` → **94 PASS / 0 FAIL**；`scripts/accept_notif_cluster.sh` → **111 PASS / 0 FAIL**；`scripts/accept_live_cluster.sh` → **128 PASS / 0 FAIL** |
 
 > 说明：本文档只记录**代码里核实过**的能力。摘要里提到但代码未命中的项，
 > 统一标「待核实」，不当作已完成。
@@ -92,6 +92,11 @@
 ### 6. 直播与其它
 
 - [x] 直播间创建/开播/关播/进出房（viewer_count 幂等）
+- [x] **直播三件套（第 10 轮新增）**：直播间聊天（1~200 字、2s 增量
+      `after` 轮询、乐观上屏、双向拉黑过滤）/ 礼物（5 个价目、事务扣
+      余额、聊天区高亮 + 飘屏特效）/ 贡献榜（单条 `GROUP BY` 聚合、
+      头像 + 昵称 + 金额、前三奖牌、随聊天轮询刷新）；`GET /live` 直出
+      直播页，首页顶栏有入口
 - [x] 数据种子脚本（seed_demo / seed_comments / seed_cloud 等）
 - [x] 压测工具 `loadgen`、 soak / 可靠性 / 上传超时脚本
 
@@ -626,7 +631,74 @@
 - **括号检查的正则误判**：`/^https?:\/\//` 里的 `//` 会被当行注释，tokenizer
   必须先判正则字面量，否则整页括号「不平衡」。
 
-## 十一、下一轮建议
+## 十一、第 10 轮交付：直播三件套（聊天 / 礼物 / 贡献榜）
+
+### 存储（`live_messages` / `gifts` / `gift_records`）
+
+- `live_messages(id, room_id, user_id, content, kind, created_at)`，索引
+  `idx_live_messages_room(room_id, id DESC)`；`kind` 区分 `chat` / `gift`，
+  礼物消息与聊天共用同一个增量游标；
+- `gifts(id, name, price_coins, icon)` 预置 5 个（1 / 10 / 30 / 100 / 500 金币）；
+- `gift_records(id, room_id, sender_id, gift_id, count, created_at)`，索引
+  `idx_gift_records_room(room_id, sender_id)`；
+- `users` 增 `coins`（默认 1000；旧库 `ALTER TABLE` 迁移）。
+
+### 接口（live 29105，网关 `/api/live/**`）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/api/live/:id/messages` | 发言（1~200 字；需登录；双向拉黑 403） |
+| GET | `/api/live/:id/messages?after=&limit=` | 增量拉取（`id > after`，升序，1~100） |
+| GET | `/api/live/gifts` | 礼物价目（公开） |
+| POST | `/api/live/:id/gift` | 送礼（事务扣余额 + 写记录 + gift 消息；余额不足 400） |
+| GET | `/api/live/:id/ranking?limit=` | 贡献榜（单条 GROUP BY，1~50） |
+| GET | `/api/live/wallet` | 当前用户余额（需登录） |
+
+`/api/live/room/:id/messages|gift|ranking` 与短路径等价（兼容旧调用）。
+
+### 前端（`include/douyin_live_page.hpp`，网关 `GET /live`）
+
+- 直播间聊天：底部列表 + 输入框；2s 轮询 `after=last_id` 增量；自己发言
+  乐观上屏（`data-temp`），服务端回包按 id 去重并替换临时节点；
+- 礼物面板：5 个礼物（图标 / 名称 / 价格）+ 数量步进 + 余额；送出后聊天区
+  高亮「🎁 X 送出 火箭 ×1」并飘屏特效；余额不足前端提示 + 服务端 400 兜底；
+- 贡献榜：🏆 按钮弹层，头像（昵称首字）+ 昵称 + 金额，前三名奖牌；
+  与聊天同一轮询周期刷新；
+- 无 `room` 参数显示房间选择器；`document.hidden` 时暂停轮询，恢复立即拉取；
+- 首页顶栏新增「🔴 直播」入口。
+
+### 验收
+
+- `bash app/douyin/build.sh` → 8 个二进制 ok，`-Werror -Wpedantic` 零告警；
+- 新增 `scripts/accept_live_cluster.sh` → **128 PASS / 0 FAIL**（10 组）：
+  发送 / 长度 / 增量 / 分页 / 双向拉黑 / 礼物扣款 / 余额不足回滚 / 榜单排序 /
+  单条 SQL 索引命中 / 20 并发送礼恰好扣完 / 100 条并发消息无遗漏 / 前端元素 /
+  2s 轮询 / TTFB；
+- 回归：`accept_all.sh` **89 PASS / 0 FAIL**（原 70 + 新增 19）、
+  `accept_live.sh` **66 PASS / 0 FAIL**；
+- TTFB（20 次均值）：聊天增量 **0.52 ms**、榜单 **0.48 ms**、直播页
+  **0.46 ms**（阈值 200 ms）；聊天/榜单查询计划分别命中
+  `idx_live_messages_room` / `idx_gift_records_room`；
+- 内联 JS 括号平衡（环境无 node）通过。
+
+### 踩坑记录
+
+- **多进程共库 + ORM 游标 = 旧快照**：`live_service` 发言后调 `FindUserById`
+  （ORM）留下未 finalize 的读游标，连接被钉在旧快照；之后 `user_service`
+  写入的拉黑/取消拉黑延后一拍，出现「拉黑后能送礼、取消后仍 403」；写操作还
+  报 `SQLITE_BUSY_SNAPSHOT`。修复：每个请求入口 `store.ResetStatements()`，
+  写路径再清一次；
+- **WAL 并发启动**：`PRAGMA journal_mode=WAL` 不经过 busy handler，两进程同时
+  初始化必现 `SQLITE_BUSY`；`Store::Open` 改为最多 40×50 ms 重试；
+- **Windows Python 写 WSL 文件默认 CRLF**：`Path.write_text` 会把 `\n` 变成
+  `\r\n`，bash 脚本立刻 `$'\r'` 报错；统一 `newline="\n"` + `sed -i
+  's/\r$//'` 兜底；
+- **验收脚本裸 `wait`**：会等待 `start_service` 启动的服务子进程，脚本永久
+  卡死；改为 `wait "${PIDS[@]}"` 只等并发请求；
+- **`json_int id` 撞礼物 id**：送礼响应里 `gift.id` 在 `message.id` 前面，
+  取消息 id 必须匹配 `"message":{"id":`。
+
+## 十二、下一轮建议
 
 1. 举报运营后台：`reports.status` 只有 pending，缺列表 / 处理接口与页面。
 2. 服务端草稿：当前草稿只在 localStorage（换设备/清缓存即丢）；可加
