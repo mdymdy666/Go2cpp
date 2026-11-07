@@ -321,7 +321,13 @@ set_target_properties(go2cpp_hash PROPERTIES EXPORT_NAME hash)
 add_library(go2cpp::hash ALIAS go2cpp_hash)
 
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND GO2CPP_BUILD_HOOK)
-    add_library(go2cpp_hook SHARED ${CMAKE_CURRENT_SOURCE_DIR}/src/network/hook.cpp)
+    # Windows 上没有 LD_PRELOAD 等价物：用空实现 stub（enabled() 恒 false，
+    # 所有系统调用直通、不 fiber 化）。见 docs/reports/go-cross-platform-study.md
+    if(WIN32)
+        add_library(go2cpp_hook SHARED ${CMAKE_CURRENT_SOURCE_DIR}/src/network/hook_win32_stub.cpp)
+    else()
+        add_library(go2cpp_hook SHARED ${CMAKE_CURRENT_SOURCE_DIR}/src/network/hook.cpp)
+    endif()
     # hook 是 LD_PRELOAD 拦截器：拦截语义依赖「调用方经 PLT 走动态符号解析」。
     # LTO 可能把库内调用改写为直接调用/内联而绕过拦截点，所以它是全项目
     # 唯一显式关闭 IPO 的目标（见 cmake/Go2CppLto.cmake）。
