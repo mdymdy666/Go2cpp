@@ -34,6 +34,8 @@ go2cpp::detail::Transfer go2cpp_context_jump(
 }
 #endif
 
+#if !defined(_WIN32)
+
 namespace go2cpp::detail {
 
 Context MakeContext(void* stack_bottom, std::size_t stack_size,
@@ -59,3 +61,5 @@ Transfer JumpContext(Context target, const void* data) noexcept {
 }
 
 }  // namespace go2cpp::detail
+
+#endif  // !defined(_WIN32)：Windows 由 context_backend_win32.cpp 提供

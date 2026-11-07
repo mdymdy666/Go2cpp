@@ -42,7 +42,8 @@ add_library(go2cpp_scheduler
 add_library(go2cpp_fiber
     ${CMAKE_CURRENT_SOURCE_DIR}/src/concurrency/fiber.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/concurrency/fiber_local.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/concurrency/context_backend.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/concurrency/context_backend.cpp
+  $<$<PLATFORM_ID:Windows>:${CMAKE_CURRENT_SOURCE_DIR}/src/concurrency/context_backend_win32.cpp>)
 target_sources(go2cpp_fiber PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/concurrency/context_x64.S)
 add_library(go2cpp_sync ${CMAKE_CURRENT_SOURCE_DIR}/src/concurrency/sync.cpp)
 add_library(go2cpp_future ${CMAKE_CURRENT_SOURCE_DIR}/src/concurrency/future.cpp)
