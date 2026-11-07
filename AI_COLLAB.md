@@ -1780,3 +1780,24 @@ latest（服务重启）→ `resume_gap`，客户端走 REST 全量刷新。
 - 截图：`app/douyin/logs/ui_fixed.png`（已登录 + 实心 ♥ + 搜索下拉历史/热搜）。
 - 遗留：热搜靠 `search_history` 7 天聚合，空库时显示「暂无热搜」空态；
   演示环境无人搜索，需要的话可加「视频话题兜底」或运营配置。
+
+## 2026-11-07 跨平台第一步：系统调用契约差异调查（Linux → Windows）
+
+- 类型：**只调查、不改代码**（用户要求：先查清每个系统调用的契约差异，再开发）。
+- 改动内容：
+  - `docs/plans/cross-platform-plan.md` 新增 `### 1.3 本项目调查结果`
+    （48 类系统调用/内核接口，40 类需适配、8 类无需适配，每条带 `file:line`）。
+  - 新增 `docs/reports/cross-platform-syscall-audit.md`（76 行，TOP10 风险 +
+    代码位置/影响/适配方向）。
+- 两个硬阻断（当前 Windows 上直接编译/启动失败）：
+  - `src/network/hook.cpp:64` `#error "go2cpp hook interposition currently requires Linux"`；
+  - `src/network/io_backend.cpp:218-222` 非 Linux 的 `DefaultBackendName()` 返回空串 →
+    `src/network/io.cpp:697` `IOManager` 初始化失败。
+- TOP3 影响：
+  1. LD_PRELOAD 透明 IO 拦截层在 Windows 不存在 → 「阻塞调用自动 fiber 化」的契约整体失效；
+  2. `epoll`（就绪）→ IOCP（完成）语义不可平移，`IOBackend` 是就绪形状，需能力位 + 双后端；
+  3. `fork/execve/waitpid/kill` + `/proc` 依赖 → `os`/`debug`/`os::monitor` 三个模块整体不可移植。
+- 验证方式：调查结论全部可用 `grep -rn` 在 `src/` + `include/` 复现（无「待定」条目）。
+- 关键文件：`docs/plans/cross-platform-plan.md`、`docs/reports/cross-platform-syscall-audit.md`。
+- 后续状态：第二步（开发）前置条件已就绪——先补 `platform/` 三件基础件
+  （`WakeEvent` / `LastError` / `SteadyClock`），再按 P0→P2 逐项适配，每项带单测 + Linux 无回归。
