@@ -20,6 +20,16 @@ if (GO2CPP_BUILD_HOOK AND NOT BUILD_SHARED_LIBS)
 endif()
 
 add_library(go2cpp_error ${CMAKE_CURRENT_SOURCE_DIR}/src/tools/error.cpp)
+
+# 跨平台基础件（platform/ 三件：WakeEvent / LastError / SteadyClock）
+# 差异见 docs/plans/cross-platform-plan.md §1.3；Windows 需链接 ws2_32（WSAGetLastError）。
+add_library(go2cpp_platform
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/platform/wake_event.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/platform/last_error.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/platform/steady_clock.cpp)
+if(WIN32)
+  target_link_libraries(go2cpp_platform PRIVATE ws2_32)
+endif()
 add_library(go2cpp_control_flow ${CMAKE_CURRENT_SOURCE_DIR}/src/tools/control_flow.cpp)
 add_library(go2cpp_context ${CMAKE_CURRENT_SOURCE_DIR}/src/concurrency/context.cpp)
 add_library(go2cpp_channel ${CMAKE_CURRENT_SOURCE_DIR}/src/concurrency/channel.cpp)
