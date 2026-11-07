@@ -27,6 +27,7 @@ add_library(go2cpp_platform
   ${CMAKE_CURRENT_SOURCE_DIR}/src/platform/wake_event.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/platform/last_error.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/platform/steady_clock.cpp)
+target_include_directories(go2cpp_platform PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 if(WIN32)
   target_link_libraries(go2cpp_platform PRIVATE ws2_32)
 endif()
