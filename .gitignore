@@ -34,3 +34,7 @@ mcp/mcp.ini
 /Testing/
 .build-bento-wsl/
 /.build-*/
+
+# 垃圾/临时
+app/douyin/
+temp/
