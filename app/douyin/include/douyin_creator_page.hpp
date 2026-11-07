@@ -388,7 +388,11 @@ inline constexpr const char* kCreatorPageHtml = R"HTML(<!DOCTYPE html>
     state.loading = true;
     document.getElementById('gate').hidden = true;
     Promise.all([
-      api('overview').then(renderOverview),
+      /* 接口返回 `{ok, overview:{...}}`：不解这一层，4 个卡片与作品数
+         全部按 undefined→0 渲染，用户看到「数据全 0」而接口其实是好的。 */
+      api('overview').then(function (data) {
+        renderOverview((data && data.overview) || {});
+      }),
       api('trend?days=' + state.days).then(renderTrend),
       api('top-videos?limit=5').then(renderTopVideos)
     ]).catch(onError).then(function () {

@@ -599,6 +599,9 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     transition: transform .26s cubic-bezier(.4, 0, .2, 1);
   }
   .notif-panel.open { transform: translateX(0); }
+  /* 关注/粉丝抽屉是从个人主页（z-index:70）里打开的，必须盖在主页之上，
+     否则抽屉虽然可见，关闭按钮却被主页拦截、点不动。 */
+  #followPanel { z-index: 76; }
   .notif-tabs {
     display: flex; gap: 4px; padding: 8px 14px 6px; flex: none;
     overflow-x: auto; border-bottom: 1px solid var(--line);

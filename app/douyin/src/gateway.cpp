@@ -328,6 +328,32 @@ bool VerifyBearer(const Request& request, std::string* user_id, std::string* err
 }
 
 
+/// @brief 公网前缀（隧道 subdomain / 反向代理前缀）。
+constexpr std::string_view kPublicPrefix = "/douyin";
+
+/**
+ * @brief 剥离公网前缀后的路径视图，供路由匹配与文件解析使用。
+ *
+ * @details `/douyin` → `/`，`/douyin/api/feed` → `/api/feed`；无前缀原样返回。
+ *          匹配发生在中间件之前，所以 Matcher 必须自己感知前缀；handler
+ *          看到的 target 已由 StripPublicPrefix 归一化，重复调用是幂等的。
+ * @param path [in] 原始路径视图——借用，指向 request.target。
+ * @return 剥离后的视图；无前缀时返回同一个 path。
+ */
+std::string_view PublicPath(std::string_view path) noexcept {
+    if (path.size() < kPublicPrefix.size() ||
+        path.compare(0, kPublicPrefix.size(), kPublicPrefix) != 0) {
+        return path;
+    }
+    if (path.size() == kPublicPrefix.size()) {
+        return "/";
+    }
+    if (path[kPublicPrefix.size()] != '/') {
+        return path;
+    }
+    return path.substr(kPublicPrefix.size());
+}
+
 /**
  * @brief 首页匹配器：只接管 GET / HEAD 的 `/` 与 `/index.html`。
  *
@@ -352,7 +378,7 @@ public:
             return false;
         }
         // step2: 完全相等匹配——`/` 与 `/index.html` 两种入口都指向同一页面。
-        const std::string_view path = request.path_view();
+        const std::string_view path = PublicPath(request.path_view());
         if (path == "/" || path == "/index.html") {
             return true;
         }
@@ -397,7 +423,7 @@ public:
         if (request.method != Method::Get && request.method != Method::Head) {
             return false;
         }
-        const std::string_view path = request.path_view();
+        const std::string_view path = PublicPath(request.path_view());
         return path == "/live" || path == "/live.html";
     }
 };
@@ -449,7 +475,7 @@ public:
         if (request.method != Method::Get && request.method != Method::Head) {
             return false;
         }
-        const std::string_view path = request.path_view();
+        const std::string_view path = PublicPath(request.path_view());
         return path == "/messages" || path == "/messages.html";
     }
 };
@@ -490,7 +516,7 @@ public:
         if (request.method != Method::Get && request.method != Method::Head) {
             return false;
         }
-        const std::string_view path = request.path_view();
+        const std::string_view path = PublicPath(request.path_view());
         return path == "/health/live" || path == "/health/ready";
     }
 };
@@ -550,6 +576,74 @@ Result<void> ServeHealth(Request& request, Response& response) {
             "\"reason\":\"" + reason + "\"}";
     }
     return Result<void>::Ok();
+}
+
+/// @brief 浏览器自动请求的站点图标匹配器（GET/HEAD `/favicon.ico`）。
+class FaviconMatcher final : public Matcher {
+public:
+    /// @brief 只命中 `/favicon.ico` 的 GET/HEAD。
+    bool Match(const Request& request, PathParams* /*params*/) const override {
+        if (request.method != Method::Get && request.method != Method::Head) {
+            return false;
+        }
+        return PublicPath(request.path_view()) == "/favicon.ico";
+    }
+};
+
+/// @brief 站点图标 handler：204 空响应，避免浏览器在控制台报 404。
+Result<void> ServeFavicon(Request& /*request*/, Response& response) {
+    response.status = Status::NoContent;
+    response.header.set("Cache-Control", "public, max-age=86400");
+    return Result<void>::Ok();
+}
+
+/// @brief 注册站点图标路由；失败时打印并返回 false。
+bool AddFaviconRoute(Gateway* gateway) {
+    const auto result = gateway->AddRoute(
+        std::make_shared<FaviconMatcher>(),
+        std::make_shared<Handler>(&ServeFavicon));
+    if (!result.ok()) {
+        std::fprintf(stderr, "[%s] 注册 favicon 路由失败：%s\n", kServiceName,
+                     result.error().c_str());
+        return false;
+    }
+    return true;
+}
+
+/**
+ * @brief 公网前缀中间件：剥离反向代理/隧道保留的 `/douyin` 前缀。
+ *
+ * @param request [in,out] 入站请求——借用；命中前缀时改写 target（保留 query）。
+ * @param response [in] 出站响应——本中间件不写。
+ * @param next [in] 下一环——放行时调用且只调用一次。
+ * @return 总是 Ok。
+ *
+ * ## 定位
+ * 公网入口是 `http://<host>:8443/douyin/`；隧道若以 `--no-strip` 模式
+ * （或前面还有一层 nginx 不剥前缀）转发，上游看到的仍是 `/douyin/...`。
+ * 网关不认这个前缀就会 404，用户打开公网地址直接白屏。
+ *
+ * ## 并发/失败语义
+ * - 无共享状态，worker 线程并发安全；
+ * - 只改写 `request.target`，不改变 method/body/headers；
+ * - 前缀恰好是 `/douyin` 时补成 `/`，其余路径按 `/douyin/xxx` → `/xxx` 剥离。
+ */
+Result<void> StripPublicPrefix(Request& request, Response& /*response*/,
+                               const Next& next) {
+    const std::string_view path = request.path_view();
+    const bool exact = path == "/douyin";
+    const bool prefixed =
+        path.size() > 8 && path.compare(0, 8, "/douyin/") == 0;
+    if (exact || prefixed) {
+        std::string rewritten = exact ? std::string("/")
+                                      : std::string(path.substr(7));
+        const std::size_t query = request.target.find('?');
+        if (query != std::string::npos) {
+            rewritten += request.target.substr(query);
+        }
+        request.target = std::move(rewritten);
+    }
+    return next();
 }
 
 /// @brief 注册健康探针路由；失败时打印并返回 false。
@@ -718,7 +812,7 @@ public:
             return false;
         }
         std::string_view name;
-        return ExtractVideoName(request.path_view(), &name);
+        return ExtractVideoName(PublicPath(request.path_view()), &name);
     }
 };
 
@@ -996,7 +1090,7 @@ public:
         if (request.method != Method::Get && request.method != Method::Head) {
             return false;
         }
-        const std::string_view path = request.path_view();
+        const std::string_view path = PublicPath(request.path_view());
         return path == "/settings" || path == "/settings.html";
     }
 };
@@ -1064,7 +1158,7 @@ public:
             return false;
         }
         SiteStaticPath parsed;
-        return ExtractSiteStatic(request.path_view(), &parsed);
+        return ExtractSiteStatic(PublicPath(request.path_view()), &parsed);
     }
 };
 
@@ -1164,6 +1258,17 @@ bool AddRoute(Gateway* gateway, MethodMask methods, const char* pattern,
                      result.error().c_str());
         return false;
     }
+    // 公网前缀别名：隧道/反代保留 `/douyin` 前缀时，`/douyin/api/**` 必须与
+    // `/api/**` 等价。路由匹配发生在中间件之前，所以只能在注册期补别名。
+    RouteSpec prefixed = spec;
+    prefixed.path_pattern = std::string(kPublicPrefix) + pattern;
+    prefixed.name = std::string(name) + "-public";
+    const auto prefixed_result = gateway->AddRoute(prefixed);
+    if (!prefixed_result.ok()) {
+        std::fprintf(stderr, "[%s] 注册路由 %s 失败：%s\n", kServiceName,
+                     prefixed.path_pattern.c_str(), prefixed_result.error().c_str());
+        return false;
+    }
     return true;
 }
 
@@ -1224,6 +1329,8 @@ int main(int argc, char** argv) {
         const InflightGuard guard(&g_inflight);
         return next();
     });
+    // 公网前缀：`/douyin/...` 先剥成 `/...`，否则公网入口整体 404。
+    gateway->Use(StripPublicPrefix);
     // 上传体积闸门：放在路由/转发之前，超 32 MiB 的请求不产生上游连接。
     gateway->Use(LimitUploadSize);
     // 分享落地页：通用网关转发前会擦掉 Host 头（避免上游拿到错误的 vhost），
@@ -1263,7 +1370,8 @@ int main(int argc, char** argv) {
     if (!AddHomeRoute(gateway.get()) || !AddLiveRoute(gateway.get()) ||
         !AddDmRoute(gateway.get()) ||
         !AddSettingsRoute(gateway.get()) || !AddVideoRoute(gateway.get()) ||
-        !AddSiteStaticRoute(gateway.get()) || !AddHealthRoutes(gateway.get())) {
+        !AddSiteStaticRoute(gateway.get()) || !AddFaviconRoute(gateway.get()) ||
+        !AddHealthRoutes(gateway.get())) {
         return 1;
     }
 
