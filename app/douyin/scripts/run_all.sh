@@ -13,6 +13,7 @@ mkdir -p "$LOG"
 
 export LD_LIBRARY_PATH="$LIB:${LD_LIBRARY_PATH:-}"
 export DOUYIN_DB="$DB"
+export DOUYIN_ADMIN_USER_IDS="1,31"
 
 PORTS=(28080 29101 29102 29103 29104 29105 29106 29107 29108 29109)
 NAMES=(gateway user_service video_service feed_service interaction_service live_service search_service admin_service creator_service dm_service)
