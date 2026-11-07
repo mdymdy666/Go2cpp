@@ -19,6 +19,13 @@
  */
 #include "go2cpp/os/proc.hpp"
 
+#if defined(_WIN32)
+#include <windows.h>
+#include <io.h>
+#include <fcntl.h>
+#include <cstdint>
+#endif
+
 #include "go2cpp/config/config.hpp"
 #include "go2cpp/logging/log.hpp"
 #include "go2cpp/os/channel.hpp"
@@ -889,13 +896,201 @@ private:
  */
 Result<SpawnedProcess> RealBackend::Spawn(const ProcessOptions& options) {
 #if defined(_WIN32)
-    // Windows：fork/execve 没有对应（COW 无法模拟），本实现需改用 CreateProcess。
-    // 见 docs/reports/cross-platform-syscall-audit.md（fork/execve/waitpid/kill 无对应）。
-    // 当前返回 kUnsupported，让调用方明确失败，而不是在运行时踩未实现路径。
-    (void)options;
-    return MakeError(ProcErrorCode::kUnsupported, ENOSYS,
-                     "Windows 上 Process::Spawn 尚未实现（需 CreateProcess）",
+namespace {
+
+/// @brief 把一个 Win32 管道句柄转成 CRT fd（失败返回 -1）。
+int HandleToFd(HANDLE handle, int flags) noexcept {
+  if (handle == nullptr || handle == INVALID_HANDLE_VALUE) {
+    return -1;
+  }
+  const int fd = ::_open_osfhandle(reinterpret_cast<intptr_t>(handle), flags);
+  if (fd < 0) {
+    ::CloseHandle(handle);
+  }
+  return fd;
+}
+
+/// @brief 按 Windows 命令行规则给单个参数加引号（含空格/制表/引号时）。
+std::wstring QuoteArg(const std::wstring& arg) {
+  if (arg.find_first_of(L" \t\"") == std::wstring::npos) {
+    return arg;
+  }
+  std::wstring out;
+  out.push_back(L'"');
+  for (wchar_t ch : arg) {
+    if (ch == L'"') {
+      out.push_back(L'\\');
+    }
+    out.push_back(ch);
+  }
+  out.push_back(L'"');
+  return out;
+}
+
+/// @brief UTF-8 → UTF-16。
+std::wstring ToWide(const std::string& s) {
+  if (s.empty()) {
+    return {};
+  }
+  const int need = ::MultiByteToWideChar(CP_UTF8, 0, s.data(),
+                                         static_cast<int>(s.size()), nullptr, 0);
+  if (need <= 0) {
+    return {};
+  }
+  std::wstring out(static_cast<std::size_t>(need), L'\0');
+  ::MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()),
+                        out.data(), need);
+  return out;
+}
+
+}  // namespace
+
+Result<SpawnedProcess> RealBackend::Spawn(const ProcessOptions& options) {
+  if (options.argv.empty() || options.argv[0].empty()) {
+    return MakeError(ProcErrorCode::kInvalidArgument, EINVAL, "argv 不能为空",
                      "Process::Spawn");
+  }
+  // step1: 拒绝不支持的选项（明确报错，不静默忽略）
+  if (!options.cpu_affinity.empty() || options.sched_policy != -1 ||
+      options.nice != 0) {
+    return MakeError(ProcErrorCode::kUnsupported, ENOSYS,
+                     "Windows 不支持 nice/cpu_affinity/sched_policy",
+                     "Process::Spawn");
+  }
+  if (options.new_session || options.set_umask ||
+      options.oom_score_adj != -2147483647 - 1 || options.uid.has_value() ||
+      options.gid.has_value() || options.set_groups ||
+      !options.rlimits.empty()) {
+    return MakeError(ProcErrorCode::kUnsupported, ENOSYS,
+                     "Windows 不支持 new_session/umask/oom/uid/gid/rlimits",
+                     "Process::Spawn");
+  }
+  if (options.stdin_mode == StdioMode::kPty ||
+      options.stdout_mode == StdioMode::kPty ||
+      options.stderr_mode == StdioMode::kPty) {
+    return MakeError(ProcErrorCode::kUnsupported, ENOSYS,
+                     "Windows 无 PTY（posix_openpt）", "Process::Spawn");
+  }
+
+  // step2: 构造命令行（argv[0] 作为 lpApplicationName，整串作为 lpCommandLine）
+  std::wstring cmdline;
+  for (std::size_t i = 0; i < options.argv.size(); ++i) {
+    if (i != 0) cmdline.push_back(L' ');
+    cmdline += QuoteArg(ToWide(options.argv[i]));
+  }
+  const std::wstring app = ToWide(options.argv[0]);
+
+  // step3: 构造环境块（\0 分隔 + \0\0 结尾）
+  std::wstring env_block;
+  if (!options.env_clear) {
+    // 继承父环境：GetEnvironmentStringsW 已带结尾双 \0
+    LPWCH parent = ::GetEnvironmentStringsW();
+    if (parent != nullptr) {
+      env_block.assign(parent);
+      ::FreeEnvironmentStringsW(parent);
+      if (!env_block.empty() && env_block.back() == L'\0') {
+        env_block.pop_back();  // 去掉一个 \0，下面统一补
+      }
+    }
+  }
+  for (const auto& kv : options.env) {
+    env_block += ToWide(kv);
+    env_block.push_back(L'\0');
+  }
+  if (env_block.empty() || env_block.back() != L'\0') {
+    env_block.push_back(L'\0');
+  }
+  env_block.push_back(L'\0');
+
+  // step4: 建三条标准流（kPipe: CreatePipe；kInherit: 用父句柄；kNull: NUL）
+  SECURITY_ATTRIBUTES sa{};
+  sa.nLength = sizeof(sa);
+  sa.bInheritHandle = TRUE;
+  sa.lpSecurityDescriptor = nullptr;
+
+  HANDLE child_in = nullptr, child_out = nullptr, child_err = nullptr;
+  HANDLE parent_in = nullptr, parent_out = nullptr, parent_err = nullptr;
+  auto make_pipe = [&](HANDLE* read_end, HANDLE* write_end) -> bool {
+    if (!::CreatePipe(read_end, write_end, &sa, 0)) return false;
+    ::SetHandleInformation(*write_end, HANDLE_FLAG_INHERIT, 0);
+    return true;
+  };
+
+  if (options.stdin_mode == StdioMode::kPipe) {
+    if (!make_pipe(&child_in, &parent_in)) {
+      return MakeError(ProcErrorCode::kSpawn, static_cast<int>(::GetLastError()),
+                       "CreatePipe(stdin) 失败", "Process::Spawn");
+    }
+  } else if (options.stdin_mode == StdioMode::kNull) {
+    child_in = ::CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ, &sa,
+                             OPEN_EXISTING, 0, nullptr);
+  } else {
+    child_in = ::GetStdHandle(STD_INPUT_HANDLE);
+  }
+  if (options.stdout_mode == StdioMode::kPipe) {
+    if (!make_pipe(&parent_out, &child_out)) {
+      return MakeError(ProcErrorCode::kSpawn, static_cast<int>(::GetLastError()),
+                       "CreatePipe(stdout) 失败", "Process::Spawn");
+    }
+  } else if (options.stdout_mode == StdioMode::kNull) {
+    child_out = ::CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_WRITE, &sa,
+                              OPEN_EXISTING, 0, nullptr);
+  } else {
+    child_out = ::GetStdHandle(STD_OUTPUT_HANDLE);
+  }
+  if (options.stderr_mode == StdioMode::kPipe) {
+    if (!make_pipe(&parent_err, &child_err)) {
+      return MakeError(ProcErrorCode::kSpawn, static_cast<int>(::GetLastError()),
+                       "CreatePipe(stderr) 失败", "Process::Spawn");
+    }
+  } else if (options.stderr_mode == StdioMode::kNull) {
+    child_err = ::CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_WRITE, &sa,
+                              OPEN_EXISTING, 0, nullptr);
+  } else {
+    child_err = ::GetStdHandle(STD_ERROR_HANDLE);
+  }
+
+  // step5: CreateProcessW
+  STARTUPINFOW si{};
+  si.cb = sizeof(si);
+  si.dwFlags = STARTF_USESTDHANDLES;
+  si.hStdInput = child_in;
+  si.hStdOutput = child_out;
+  si.hStdError = child_err;
+  PROCESS_INFORMATION pi{};
+  const std::wstring cwd = ToWide(options.cwd);
+  const DWORD flags = options.use_path_search ? 0 : 0;  // lpApplicationName 已给出路径
+  const BOOL ok = ::CreateProcessW(
+      app.c_str(), cmdline.data(), nullptr, nullptr, TRUE, flags,
+      env_block.empty() ? nullptr : env_block.data(),
+      cwd.empty() ? nullptr : cwd.c_str(), &si, &pi);
+  if (!ok) {
+    const int err = static_cast<int>(::GetLastError());
+    if (parent_in) ::CloseHandle(parent_in);
+    if (parent_out) ::CloseHandle(parent_out);
+    if (parent_err) ::CloseHandle(parent_err);
+    return MakeError(ProcErrorCode::kSpawn, err, "CreateProcessW 失败",
+                     "Process::Spawn");
+  }
+  ::CloseHandle(pi.hThread);
+  ::CloseHandle(pi.hProcess);  // Wait/Kill 用 OpenProcess(pid) 重新打开
+
+  // step6: 组装 SpawnedProcess（父侧管道转 fd）
+  SpawnedProcess out{};
+  out.pid = static_cast<pid_t>(pi.dwProcessId);
+  out.ppid = static_cast<pid_t>(::GetCurrentProcessId());
+  out.pgid = out.pid;  // Windows 无进程组；用 pid 占位
+  out.stdin_fd = parent_in ? HandleToFd(parent_in, _O_WRONLY | _O_BINARY) : -1;
+  out.stdout_fd = parent_out ? HandleToFd(parent_out, _O_RDONLY | _O_BINARY) : -1;
+  out.stderr_fd = parent_err ? HandleToFd(parent_err, _O_RDONLY | _O_BINARY) : -1;
+  out.pty = false;
+  out.started_monotonic = std::chrono::steady_clock::now();
+  out.started_wall = std::chrono::system_clock::now();
+  // /proc/<pid>/stat 快照：Windows 无 /proc，has_stat=false
+  out.has_stat = false;
+  return out;
+}
+
 #else
     if (options.argv.empty() || options.argv[0].empty()) {
         return MakeError(ProcErrorCode::kInvalidArgument, EINVAL, "argv 不能为空",
