@@ -50,6 +50,7 @@
 #include <string_view>
 #include <thread>
 
+#include "go2cpp/platform/atomic_file.hpp"
 namespace go2cpp::config {
 namespace {
 
@@ -1370,7 +1371,7 @@ bool Config::SaveToFile(const std::string& path, std::string* error) const {
             return false;
         }
     }
-    if (std::rename(tmp_path.c_str(), path.c_str()) != 0) {
+    if (platform::AtomicRename(tmp_path.c_str(), path.c_str()) != 0) {
         if (error) {
             *error = "重命名失败: " + tmp_path + " -> " + path;
         }

@@ -780,3 +780,6 @@ if (GO2CPP_WITH_BENTO)
 else()
     message(STATUS "Bento transport: OFF (set GO2CPP_WITH_BENTO=ON to enable)")
 endif()
+
+# AtomicRename/DeleteFileIfExists（platform/ 跨平台文件操作）
+target_link_libraries(go2cpp_bento_app PRIVATE go2cpp_platform)

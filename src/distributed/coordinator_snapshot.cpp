@@ -61,6 +61,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "go2cpp/platform/atomic_file.hpp"
 namespace go2cpp::distributed {
 namespace {
 
@@ -182,7 +183,7 @@ bool WriteWholeFileAtomic(const std::string &path, const std::string &blob,
         (void)::unlink(tmp.c_str());
         return false;
     }
-    if (::rename(tmp.c_str(), path.c_str()) != 0) {
+    if (platform::AtomicRename(tmp.c_str(), path.c_str()) != 0) {
         *error = DescribeErrno("rename snapshot");
         (void)::unlink(tmp.c_str());
         return false;

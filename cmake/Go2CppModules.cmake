@@ -31,8 +31,11 @@ add_library(go2cpp_error ${CMAKE_CURRENT_SOURCE_DIR}/src/tools/error.cpp)
 add_library(go2cpp_platform
   ${CMAKE_CURRENT_SOURCE_DIR}/src/platform/wake_event.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/platform/last_error.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/platform/steady_clock.cpp)
-target_include_directories(go2cpp_platform PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/platform/steady_clock.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/platform/atomic_file.cpp)
+target_include_directories(go2cpp_platform PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 if(WIN32)
   target_link_libraries(go2cpp_platform PRIVATE ws2_32)
 endif()
@@ -434,6 +437,7 @@ add_library(go2cpp::debug ALIAS go2cpp_debug)
 
 set(GO2CPP_MODULE_TARGETS
     go2cpp_error
+    go2cpp_platform
     go2cpp_control_flow
     go2cpp_context
     go2cpp_channel
@@ -461,6 +465,7 @@ set(GO2CPP_MODULE_TARGETS
     go2cpp_debug_event
     go2cpp_debug
 )
+target_link_libraries(go2cpp_config PRIVATE go2cpp_platform)
 if (TARGET go2cpp_hook)
     list(APPEND GO2CPP_MODULE_TARGETS go2cpp_hook)
 endif()

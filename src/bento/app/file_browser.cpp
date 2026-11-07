@@ -55,6 +55,7 @@
 #include <utility>
 #include <vector>
 
+#include "go2cpp/platform/atomic_file.hpp"
 namespace go2cpp::bento::app {
 namespace {
 
@@ -294,7 +295,7 @@ bool CopyFileContent(int source_fd, int target_fd, std::uint64_t expected_bytes)
 FileBrowserStatus PublishTempFile(const std::string& temp_path, const std::string& target,
                                   bool overwrite) {
     if (overwrite) {
-        if (::rename(temp_path.c_str(), target.c_str()) == 0) {
+        if (platform::AtomicRename(temp_path.c_str(), target.c_str()) == 0) {
             return FileBrowserStatus::kOk;
         }
         const int error = errno;
