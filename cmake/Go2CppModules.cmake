@@ -3,9 +3,14 @@ find_package(Threads REQUIRED)
 # 自研上下文后端（context_x64.S + FiberStack）只覆盖 Linux x86_64，
 # 且不再有 Boost.Context 后备；其它平台在配置阶段直接拒绝，避免
 # 生成一个运行时必然失败的目标。
-if (NOT CMAKE_SYSTEM_NAME STREQUAL Linux OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8 OR
+if (WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8)
+    # Windows x64：用原生 Fiber API（CreateFiber/SwitchToFiber）替代 context_x64.S。
+    # 契约差异（栈由系统分配、TLS 传参）见
+    # docs/reports/cross-platform-syscall-audit.md 与 src/concurrency/context_backend_win32.cpp
+    message(STATUS "Go2Cpp fiber backend: Windows x64 uses native Fiber API (CreateFiber)")
+elseif (NOT CMAKE_SYSTEM_NAME STREQUAL Linux OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8 OR
     CMAKE_SYSTEM_PROCESSOR MATCHES [=[aarch64|arm64|riscv|ppc|s390]=])
-    message(FATAL_ERROR [=[Go2Cpp fiber backend requires Linux x86_64 (context_x64.S); other platforms are not supported after removing Boost.Context]=])
+    message(FATAL_ERROR [=[Go2Cpp fiber backend requires Linux x86_64 (context_x64.S) or Windows x64 (CreateFiber); other platforms are not supported]=])
 endif()
 # 仍保留该变量供安装包配置使用（go2cpp_runtimeConfig.cmake.in 据此跳过
 # find_dependency(Boost)）；后端已无条件为自研实现。

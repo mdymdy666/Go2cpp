@@ -767,6 +767,7 @@ private:
      * 要付 2~3 次跨核行迁移（每次 40~100 ns）；合并后只要 1 次。
      */
     struct alignas(64) Hot {
+        /// @brief 节点代表单个并发单元当前的状态，有等待，被通知，被取消三个状态
         std::atomic<WaitResult> result{WaitResult::kWaiting};
         /// @brief 饥饿模式所有权交接标记；普通唤醒保持 false。
         std::atomic<bool> granted{false};
