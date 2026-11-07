@@ -685,6 +685,11 @@ std::string EmptyTabBody(ProfileTab tab, std::int64_t owner_id,
 bool HandleProfileTab(douyin::Store& store, const douyin::HttpRequest& request,
                       std::int64_t owner_id, ProfileTab tab,
                       douyin::HttpResponse* response) {
+    // step0: 每请求重置语句缓存 + 结束可能残留的只读事务。
+    //        多进程共库时 WAL 读游标会钉住旧快照——表现为「收藏/点赞在别的服务里
+    //        已写入，但这里永远读到空」，ClearStatementCache 不足以释放读事务，
+    //        必须显式 Rollback（无活动事务时返回错误，忽略即可）。
+    store.ResetStatements();
     // step1: 主人必须存在，否则 404（与 /api/user/:id 一致）。
     douyin::StoredUser owner;
     std::string error;

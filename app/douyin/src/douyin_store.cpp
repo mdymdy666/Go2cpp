@@ -1833,6 +1833,13 @@ bool QueryTimeline(go2cpp::storage::DB* db, TimelineKind kind,
             return false;
         }
         *total = counted.Value().Int64(0);
+        // 临时诊断：打印 SQL 与参数（定位「收藏页有、主页空」）
+        std::fprintf(stderr,
+                     "[timeline-diag] kind=%d owner=%lld viewer=%lld total=%lld from=%s\n",
+                     static_cast<int>(kind),
+                     static_cast<long long>(owner_id),
+                     static_cast<long long>(viewer_id),
+                     static_cast<long long>(*total), from.c_str());
     }
     // step3: 游标解码——前缀必须与 kind 匹配，防止三个 tab 的游标串用。
     const bool has_cursor = !cursor.empty();

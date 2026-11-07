@@ -26,7 +26,7 @@
  *          - 进度条支持 60ms 节流 seek、上方悬浮时间预览与 buffered 高亮，
  *            松手后恢复原播放状态；
  *          - 「推荐 / 关注」双 tab（`GET api/feed` / `GET api/feed/following`），
- *            自动连播默认**关**（用户反馈无用）：需要时手动开，到底提示并刷新推荐流；
+ *            **不自动连播**：单条循环播放，播完不切下一条；
  *          - `preload="none"` + 同名 `videos/<name>.jpg` 封面：首屏只拉缩略图，
  *            视频字节等真正播放/拖动时才加载；
  *          - 评论图标打开右侧抽屉，`GET api/comment/<id>?limit=50&sort=` 拉列表
@@ -1164,8 +1164,6 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     <input class="login-only" id="password" type="password" value="123456"
            placeholder="密码" autocomplete="current-password">
     <button class="btn-primary login-only" id="loginBtn" type="button">登录</button>
-    <button class="btn-ghost" id="autoplayBtn" type="button"
-            title="自动连播：一条播完自动切下一条" aria-pressed="false">连播：关</button>
     <button class="btn-ghost" id="rateBtn" type="button"
             title="播放倍速（长按视频可临时 2×）">倍速：1×</button>
     <span class="vol" title="视频音量">
@@ -1448,7 +1446,7 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
   var MUTE_KEY = 'douyin_muted';
   var VOL_KEY = 'douyin_volume';
 
-  var AUTOPLAY_KEY = 'douyin_autoplay';
+  var AUTOPLAY_KEY = 'douyin_autoplay';  // 已废弃（连播移除），保留常量避免旧引用报错
   var RATE_KEY = 'douyin_rate';
 
   var state = {
@@ -1468,7 +1466,7 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     fit: 'contain',
     muted: true,
     volume: 1,
-    autoplay: false,
+    autoplay: false,  // 已废弃：自动连播功能移除，字段保留仅为兼容旧引用
     rate: 1,
     feedTab: 'recommend',
     deepLink: ''
@@ -1488,7 +1486,7 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
   state.volume = isFinite(savedVol) && savedVol >= 0 ? Math.min(savedVol, 1) : 1;
 
   /* 自动连播默认开；关掉后单条循环。倍速持久化，长按只做临时 2×。 */
-  state.autoplay = localStorage.getItem(AUTOPLAY_KEY) === '1';
+  state.autoplay = false;  // 自动连播已移除
   state.rate = normalizeRate(Number(localStorage.getItem(RATE_KEY)) || 1);
   /* 直达链接：/v/<id> 或 ?video=<id> */
   var deepPath = location.pathname.match(/\/v\/(\d+)\/?$/);
@@ -3135,8 +3133,8 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     var now = Date.now();
     if (slide.dataset.endedAt && now - Number(slide.dataset.endedAt) < 1200) return;
     slide.dataset.endedAt = String(now);
-    if (!state.autoplay) {
-      /* 关连播：裁剪到点就停住；自然播完由 loop=true 单条循环。 */
+    if (true) {
+      /* 自动连播已移除：裁剪到点就停住；自然播完由 loop=true 单条循环。 */
       if (!clipEnded) {
         video.loop = true;
         var p = video.play();
@@ -3190,23 +3188,11 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     setRate(RATE_STEPS[(i + 1) % RATE_STEPS.length]);
   }
 
-  /* 连播开 → loop=false（否则 ended 永远不触发）；关 → 单条无限循环。 */
+  /* 自动连播已移除：所有视频单条循环，播完不切下一条。 */
   function applyAutoplay() {
     feedEl.querySelectorAll('video').forEach(function (v) {
-      v.loop = !state.autoplay;
+      v.loop = true;
     });
-    var btn = document.getElementById('autoplayBtn');
-    if (btn) {
-      btn.textContent = '连播：' + (state.autoplay ? '开' : '关');
-      btn.setAttribute('aria-pressed', state.autoplay ? 'true' : 'false');
-    }
-  }
-
-  function setAutoplay(on) {
-    state.autoplay = !!on;
-    try { localStorage.setItem(AUTOPLAY_KEY, state.autoplay ? '1' : '0'); } catch (e) {}
-    applyAutoplay();
-    toast(state.autoplay ? '已开启自动连播' : '已关闭自动连播（单条循环）');
   }
   /* ---------- 播放控制 ---------- */
 
@@ -3643,7 +3629,7 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     video.muted = state.muted;
     video.volume = state.volume;
     /* 自动连播开时必须 loop=false，否则 ended 不触发；关时单条循环。 */
-    video.loop = !state.autoplay;
+    video.loop = true;  // 自动连播已移除：单条循环
     try { video.playbackRate = state.rate; } catch (e) {}
     video.playsInline = true;
     /* 首屏不预加载视频本体：只拉同名封面 jpg，真正字节等 play()/拖动时才请求。 */
@@ -6175,9 +6161,6 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     var btn = e.target && e.target.closest ? e.target.closest('.feed-tab') : null;
     if (!btn) return;
     switchFeedTab(btn.dataset.tab);
-  });
-  document.getElementById('autoplayBtn').addEventListener('click', function () {
-    setAutoplay(!state.autoplay);
   });
   document.getElementById('rateBtn').addEventListener('click', cycleRate);
   paintFeedTabs();

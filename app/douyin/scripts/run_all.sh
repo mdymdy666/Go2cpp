@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 常驻启动 douyin 全部服务（10 个进程），不自动退出。
-# 用法：scripts/run_all.sh           启动（若已在跑会跳过）
-#       scripts/run_all.sh stop      停止
+# 用法：scripts/run_all.sh           启动（已在跑且二进制未变则跳过；二进制更新则重启）
+#       scripts/run_all.sh stop      停止（按端口精确杀，不依赖 pid 文件）
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="$ROOT/build"
@@ -14,38 +14,41 @@ mkdir -p "$LOG"
 export LD_LIBRARY_PATH="$LIB:${LD_LIBRARY_PATH:-}"
 export DOUYIN_DB="$DB"
 
-# 管理员白名单：按 DB 里 admin 账号的 id 解析，而不是写死 1。
-# 背景（2026-11-06 用户视角审查）：admin_service 缺省白名单是 user_id=1，
-# 而 seed_cloud.sh 先注册 30 个普通用户、最后才注册 admin（id=31），
-# 结果 admin@douyin.local 进 /admin 被 403，反倒是首个普通用户 user0001
-# 拿到了举报后台的全部权限——既不能用也越权。
-admin_ids() {
-  python3 - "$DB" <<'PY' 2>/dev/null || printf '1'
-import sqlite3
-import sys
-try:
-    con = sqlite3.connect(sys.argv[1])
-    row = con.execute(
-        "select id from users where email = 'admin@douyin.local' limit 1"
-    ).fetchone()
-    print(row[0] if row else 1)
-except Exception:
-    print(1)
-PY
+PORTS=(28080 29101 29102 29103 29104 29105 29106 29107 29108 29109)
+NAMES=(gateway user_service video_service feed_service interaction_service live_service search_service admin_service creator_service dm_service)
+
+# 查某端口上的监听进程 pid（优先 ss，回退 /proc）
+port_pid() {
+  local port="$1"
+  local pid=""
+  if command -v ss >/dev/null 2>&1; then
+    pid=$(ss -ltnp 2>/dev/null | awk -v p=":$port" '$4 ~ p {print}' | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2)
+  fi
+  if [[ -z "$pid" ]]; then
+    pid=$(ps -eo pid,args 2>/dev/null | grep -E "(gateway|user_service|video_service|feed_service|interaction_service|live_service|search_service|admin_service|creator_service|dm_service) $port$" | grep -v grep | awk '{print $1}' | head -1)
+  fi
+  printf '%s' "$pid"
 }
-export DOUYIN_ADMIN_USER_IDS="${DOUYIN_ADMIN_USER_IDS:-$(admin_ids)}"
 
 stop_all() {
-  [[ -f "$PIDF" ]] || return 0
-  while read -r name pid; do
-    [[ -n "${name:-}" && -n "${pid:-}" ]] || continue
-    if kill -0 "$pid" 2>/dev/null; then
-      kill "$pid" 2>/dev/null || true
-      printf '[stop] %s pid=%s\n' "$name" "$pid"
+  local port pid killed=0
+  for port in "${PORTS[@]}"; do
+    pid=$(port_pid "$port")
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      kill -9 "$pid" 2>/dev/null && killed=$((killed + 1))
+      printf '[stop] port=%-5s pid=%s\n' "$port" "$pid"
     fi
-  done <"$PIDF"
+  done
+  # 兜底：pid 文件里的残留
+  if [[ -f "$PIDF" ]]; then
+    while read -r name pid; do
+      [[ -n "${pid:-}" ]] || continue
+      kill -9 "$pid" 2>/dev/null && killed=$((killed + 1))
+    done <"$PIDF"
+  fi
   : >"$PIDF"
   sleep 1
+  printf '[stop] 共停止 %d 个\n' "$killed"
 }
 
 if [[ "${1:-}" == "stop" ]]; then
@@ -54,13 +57,33 @@ if [[ "${1:-}" == "stop" ]]; then
 fi
 
 : >"$PIDF"
+
 start() { # name port
   local name="$1" port="$2"
-  if curl -fsS --max-time 1 "http://127.0.0.1:$port/health" >/dev/null 2>&1; then
-    printf '[skip] %-18s port=%-5s 已在运行\n' "$name" "$port"
-    return 0
+  local bin="$BIN/$name"
+  local existing
+  existing=$(port_pid "$port")
+  if [[ -n "$existing" ]]; then
+    # 端口在监听：比对进程 exe mtime 与二进制 mtime
+    local exe="/proc/$existing/exe"
+    if [[ -e "$exe" && -e "$bin" ]]; then
+      local exe_m bin_m
+      exe_m=$(stat -L -c %Y "$exe" 2>/dev/null || echo 0)
+      bin_m=$(stat -c %Y "$bin" 2>/dev/null || echo 0)
+      if (( bin_m > exe_m )); then
+        printf '[restart] %-18s port=%-5s 二进制比进程新，强制重启（旧 pid=%s）\n' "$name" "$port" "$existing"
+        kill -9 "$existing" 2>/dev/null
+        sleep 0.5
+      else
+        printf '[skip] %-18s port=%-5s 已在运行且二进制未变\n' "$name" "$port"
+        return 0
+      fi
+    else
+      printf '[skip] %-18s port=%-5s 已在运行\n' "$name" "$port"
+      return 0
+    fi
   fi
-  setsid nohup "$BIN/$name" "$port" >>"$LOG/run_${name}.log" 2>&1 &
+  setsid nohup "$bin" "$port" >>"$LOG/run_${name}.log" 2>&1 &
   local pid=$!
   echo "$name $pid" >>"$PIDF"
   for _ in $(seq 1 100); do
@@ -74,36 +97,18 @@ start() { # name port
   fi
 }
 
-# 素材自检：仓库 .gitignore 忽略 *.mp4，demo1-5.mp4 必须由 orig 现场生成；
-# 缺了就补，避免 seed 出来的记录指向不存在的文件（2026-11-06 事故）。
-if ! bash "$ROOT/scripts/gen_demo_videos.sh" -q; then
-  echo "[warn] demo 视频生成失败：首页会出现无法播放的条目（见 scripts/gen_demo_videos.sh）"
-fi
-
 echo "=== 启动 douyin 服务（DB=$DB）==="
-start user_service        29101
-start video_service       29102
-start feed_service        29103
-start interaction_service 29104
-start live_service        29105
-start search_service      29106
-start admin_service       29107
-start creator_service     29108
-start dm_service          29109
-start gateway             28080
+for i in "${!PORTS[@]}"; do
+  start "${NAMES[$i]}" "${PORTS[$i]}"
+done
 
 echo
 echo "=== 状态 ==="
-for p in 28080 29101 29102 29103 29104 29105 29106 29107 29108 29109; do
+for p in "${PORTS[@]}"; do
   code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:$p/health" 2>/dev/null)
   printf '  %-6s %s\n' "$p" "$code"
 done
 echo
-echo "首页： http://127.0.0.1:28080/"
-echo "直播： http://127.0.0.1:28080/live"
-echo "设置： http://127.0.0.1:28080/settings"
-echo "创作： http://127.0.0.1:28080/creator"
-echo "消息： http://127.0.0.1:28080/messages"
-echo "举报： http://127.0.0.1:28080/admin"
-echo
-echo "停止： scripts/run_all.sh stop（或 kill \$(cat $PIDF | awk '{print \$2}')）"
+echo "首页： http://127.0.0.1:28080/   直播： /live   设置： /settings"
+echo "创作： /creator   消息： /messages   举报： /admin"
+echo "停止： scripts/run_all.sh stop"
