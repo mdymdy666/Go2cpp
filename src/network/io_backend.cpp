@@ -218,6 +218,10 @@ IOBackendPtr CreateBackend(const std::string& name) {
 std::string DefaultBackendName() {
 #ifdef __linux__
     return "epoll";
+#elif defined(_WIN32)
+    // Windows：短期用 WSAPoll（语义最接近 poll）；长期替换为 IOCP completion 后端。
+    // 见 docs/reports/cross-platform-syscall-audit.md TOP2 / go-cross-platform-study.md §2 Q2
+    return "wsa_poll";
 #else
     return {};
 #endif

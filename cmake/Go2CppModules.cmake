@@ -204,7 +204,8 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND GO2CPP_TLS_INITIAL_EXEC)
 endif()
 add_library(go2cpp_io
     ${CMAKE_CURRENT_SOURCE_DIR}/src/network/io.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/network/io_backend.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/network/io_backend.cpp
+  $<$<PLATFORM_ID:Windows>:${CMAKE_CURRENT_SOURCE_DIR}/src/network/io_backend_wsa_poll.cpp>)
 add_library(go2cpp_log ${CMAKE_CURRENT_SOURCE_DIR}/src/logging/log.cpp)
 # TLS（TlsTransport）可选：GO2CPP_WITH_TLS=ON 时才 find_package(OpenSSL)
 # 并链接；OFF 时 tls_transport.cpp 只编译 stub，不引入 libssl/libcrypto。
