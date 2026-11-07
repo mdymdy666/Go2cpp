@@ -888,6 +888,15 @@ private:
  * - 不变量：成功返回的句柄中 pid 有效且 stdio 通道已就绪。
  */
 Result<SpawnedProcess> RealBackend::Spawn(const ProcessOptions& options) {
+#if defined(_WIN32)
+    // Windows：fork/execve 没有对应（COW 无法模拟），本实现需改用 CreateProcess。
+    // 见 docs/reports/cross-platform-syscall-audit.md（fork/execve/waitpid/kill 无对应）。
+    // 当前返回 kUnsupported，让调用方明确失败，而不是在运行时踩未实现路径。
+    (void)options;
+    return MakeError(ProcErrorCode::kUnsupported, ENOSYS,
+                     "Windows 上 Process::Spawn 尚未实现（需 CreateProcess）",
+                     "Process::Spawn");
+#else
     if (options.argv.empty() || options.argv[0].empty()) {
         return MakeError(ProcErrorCode::kInvalidArgument, EINVAL, "argv 不能为空",
                          "Process::Spawn");
@@ -1218,6 +1227,7 @@ Result<SpawnedProcess> RealBackend::Spawn(const ProcessOptions& options) {
     }
     return spawned;
 }
+#endif  // !defined(_WIN32)
 
 /**
  * @brief 等待指定子进程退出，支持超时与 pidfd 事件驱动。
