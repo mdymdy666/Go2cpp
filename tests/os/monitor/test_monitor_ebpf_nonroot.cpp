@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <string>
 
+#include "go2cpp/json.hpp"
 #include "go2cpp/os/monitor/aggregator.hpp"
 #include "go2cpp/os/monitor/fileio_monitor.hpp"
 #include "go2cpp/os/monitor/futex_monitor.hpp"
@@ -181,8 +182,8 @@ void CheckAggregator() {
            "连续 20 次采集应全部稳定，实际 " + std::to_string(stable));
 
     // 4) JSON 透传：Manager/工具层看到的是 active=false + 非空 reason。
-    const nlohmann::json parsed =
-        nlohmann::json::parse(go2cpp::os::monitor::SnapshotToJson(snapshot));
+    const go2cpp::Json parsed =
+        go2cpp::Json::parse(go2cpp::os::monitor::SnapshotToJson(snapshot));
     Expect(parsed["ebpf_active"].get<bool>() == false,
            "Snapshot JSON 的 ebpf_active 应为 false");
     Expect(!parsed["ebpf_reason"].get<std::string>().empty(),

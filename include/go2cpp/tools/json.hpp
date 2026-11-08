@@ -1,195 +1,774 @@
 /**
  * @file json.hpp
- * @brief nlohmann/json 的 Go2Cpp 薄封装：入口处做深度栅栏，超限即拒。
+ * @brief JSON 的 Go2Cpp 边界层：深度栅栏 + 自研 JSON 引擎之上的有序值类型。
  *
- * @details 为什么需要这一层，而不是直接用 nlohmann/json：
+ * @details 历史上本文件是第三方 JSON 单头的薄封装（`using Json = 上游类型`）。
+ *          现已迁移到项目自研引擎（`include/go2cpp/json/`）：
  *
- *   1. **上游的"深度风险"不在解析，而在解析之后的递归操作。**
- *      实测（nlohmann/json v3.11.3，128 KiB Fiber 栈，本仓库实测数据）：
+ *          - **解析**：`go2cpp::json::Parser`（扁平池 + 显式栈，深文档不爆栈）；
+ *          - **序列化**：`go2cpp::json::JsonBuilder`（转义 / 数字格式的唯一实现）；
+ *          - **值容器**：本文件的 `Json`——对象用 `std::map`（**键按字典序**，
+ *            与迁移前的上游默认行为一致，保证输出可逐字节对比），
+ *            数组用 `std::vector`，标量用 `std::variant`。
  *
- *        - **解析是迭代的**：`parse()` 走 `sax_parse_internal`，用堆上的
- *          `std::vector<bool> states` 作显式栈，而不是递归下降。实测 20 万层
- *          嵌套可正常解析，50 万层也安全。
- *        - **`dump()`（序列化）仍然是递归的**：128 KiB 栈上约 **1162 层**
- *          （Release/-O2）或 **609 层**（无优化）就触碰 guard page。
- *        - **拷贝一份 `json` 值同样递归**，且临界更低：约 **816 层**
- *          （Release）或 **185 层**（无优化）。
+ *          `Json` 只保留 debug / CLI / bench 实际用到的 DOM 子集（构造、下标、
+ *          `value` / `get` / `contains` / 数组遍历 / `dump`），不追求上游完整性。
  *
- *      | 操作（128 KiB Fiber 栈） | Release/-O2 | 无优化 |
- *      |---|---|---|
- *      | 解析（`ParseJson` 内部） | ≥ 524288 层 | ≥ 524288 层 |
- *      | `dump()` | 1162 层 | 609 层 |
- *      | 拷贝 | 816 层 | 185 层 |
+ * ## 为什么仍需要入口栅栏
  *
- *   2. **爆栈不可恢复**。Fiber 栈固定 128 KiB 且不增长，栈底只有 1 页
- *      `PROT_NONE` guard page；全项目没有 SIGSEGV handler、也没有
- *      sigaltstack，越界即内核默认动作 —— **进程被立即终止（退出码 139）**。
- *      所以"解析成功"**不等于**"安全"：深文档一旦进入程序，之后任意一次
- *      `dump()` 或拷贝都可能让进程消失，而且崩点离入口很远、极难定位。
- *      把校验放在入口，是把"不可捕获的崩溃"换成"可处理的错误"的唯一位置。
+ * 1. **解析之后的递归操作才是风险点。** 自研解析器本身用显式栈，但
+ *    `Json` 的 `dump()`（本文件）与 `Json` 的拷贝是递归的；Fiber 栈固定
+ *    128 KiB、栈底只有一页 guard page，越界即进程被杀（退出码 139）。
+ *    因此深度上限必须挡在「外部不可信文本」进入程序之前。
+ * 2. **深嵌套是资源放大器。** 解析所需堆内存与时间 O(嵌套深度)，不设上限
+ *    等于把成本交给输入方（DoS 面）。
  *
- *   3. **深嵌套还是资源放大器**。解析所需的堆内存与时间是 O(嵌套深度)，
- *      不设上限就等于把这个成本交给输入方（典型的 DoS 面）。
+ * `ParseJson` 正是针对这两点：先用**迭代**扫描器（不递归、不分配）量出
+ * 嵌套深度，超限立即返回可处理的 `ErrorPtr`，未超限才进入自研解析器。
  *
- *   `ParseJson` 正是针对这三点：在**进入上游之前**先用一个**迭代**扫描器
- *   （不递归、不分配）量出嵌套深度，超限立即返回可处理的 `ErrorPtr`。
- *   默认上限 64 相对最坏实测（无优化下拷贝临界 185 层）仍留有约 3 倍余量。
- *
- * 上游来源（第三方，未做任何修改）：
- *   - 项目：https://github.com/nlohmann/json
- *   - 版本：v3.11.3（单头文件 `single_include/nlohmann/json.hpp`）
- *   - 许可证：MIT（见文件头 SPDX-License-Identifier: MIT）
- *   - 本地位置：`third_party/nlohmann/json.hpp`，由 CMake 的 third_party
- *     包含路径暴露为 `#include "nlohmann/json.hpp"`。
- *
- * ## 依赖治理状态（2026-11-02 更新：Reflect JSON 已交付，迁移仍未做）
- *
- * 2026-10-30 的判断是「Reflect 目录还没有 JSON 后端，无法替换」，**这一条
- * 已过时**：`include/go2cpp/reflect/json.hpp`（实现 `src/reflect/json.cpp`）
- * 已交付 `JsonValue` / `JsonWriter` / `JsonParser`，随 `ReflectCodec` 的文本
- * 模式一起使用。但它与 `go2cpp::Json` 不是同一个东西，不能直接顶替：
- *
- *   - `Json` 在本文件里是 `nlohmann::json` 的**直接别名**，调用方用的是
- *     nlohmann 的 DOM API（迭代器、`operator[]`、隐式类型转换、异常）；
- *   - `reflect::JsonValue` 是反射编解码专用子集：数字保留**原文**、对象成员
- *     是 `vector<pair>`、错误走 `bool` + 错误串，不提供 nlohmann 的 DOM API；
- *   - 两套实现对数字精度 / NaN / 非法输入的处理不同（见
- *     `docs/reports/reuse-audit.md`「四、风险清单」第 8 条），静默替换会让
- *     配置与调试输出漂移。
- *
- * 现存调用方集中在 debug 模块（`src/debug/debug_dump.cpp`、
- * `src/debug/debug_server.cpp`、`src/debug/diagnostic_agent.cpp`），另有
- * `tests/debug/test_debug_*.cpp` 与 `example/concurrency/fiber_stack_limit*`
- * 示例；它们都依赖 nlohmann 的 DOM 操作（例如 `debug_dump.cpp` 用
- * `ViewJson` 构造事件视图并 `dump()`）。因此继续保留 vendored 的 nlohmann
- * 单头（header-only，不参与链接，不进入 `go2cpp_runtime` 的链接依赖）。
- *
- * TODO(deps-cleanup, 重定于 2026-11-02): 迁移的前置条件不再是「等 Reflect
- * 交付」，而是先把 debug 模块与示例的用法收敛到窄接口（查字段、取标量、
- * 序列化），再让 `reflect::JsonValue` 覆盖这些接口；迁移时保持
- * `Json` / `ParseJson` / `JsonScanDepth` 的调用面与
- * `JsonDepthExceededError()` 的身份语义不变，最后把 `third_party/nlohmann`
- * 从默认包含路径中移除。
- *
- * @note 本头文件**不进入** `go2cpp/runtime.hpp` 聚合头：引入 900+ KB 的单头
- *       文件会显著增加所有使用者的编译时间，而 JSON 并非运行时语义的一部分。
- *       需要 JSON 的翻译单元显式包含 `go2cpp/json.hpp` 即可。
- * @note 本文件是 header-only 的薄封装：没有对应 .cpp，也不需要新增 CMake target。
+ * @note 本头文件**不进入** `go2cpp/runtime.hpp` 聚合头：JSON 并非运行时语义
+ *       的一部分，需要 JSON 的翻译单元显式包含 `go2cpp/json.hpp` 即可。
+ * @note 本文件是 header-only：没有对应 .cpp，也不需要新增 CMake target
+ *       （它依赖的 `go2cpp_json` 由使用方链接）。
  */
 
 #pragma once
 
-#include "nlohmann/json.hpp"
-
-#include "go2cpp/error.hpp"
-// 解析内部改走自研 go2cpp::json，nlohmann 只保留对外 Json 类型（下一轮
-// debug/CLI/bench 迁移完成后可一并删除）。
-#include "go2cpp/json/parser.hpp"
-
+#include <charconv>
+#include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
-#include <exception>
+#include <initializer_list>
+#include <map>
+#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
+#include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
-/**
- * ## 模块定位
- *
- * JSON 的**边界层 / 防爆栈栅栏**，位于「外部不可信文本」与「进程内值」之间。上游是
- * nlohmann/json v3.11.3（未修改），下游是 `example/concurrency/fiber_stack_limit_demo.cpp`
- * 与 `fiber_stack_limit_full.cpp`（两者都用它演示/压测深度攻击），以及
- * `tests/debug/test_debug_*.cpp`（通过 `go2cpp/json.hpp` 使用 nlohmann 类型）。
- * 本模块不进入 `go2cpp/runtime.hpp` 聚合头，也不参与运行时语义。
- *
- * ## 本文件定义什么
- *
- * - `Json`：直接别名到 `nlohmann::json`，不做二次包装；
- * - `kDefaultJsonMaxDepth` / `kJsonDepthUnlimited`：默认深度上限（64）与扫描哨兵；
- * - `JsonDepthExceededError()`：深度超限的**身份锚点**（用 `Is()` 判定，不比较文本）；
- * - `JsonScanDepth`：迭代式深度扫描器（3 状态，见状态机文档）；
- * - `JsonParseResult` / `ParseJson`：结构化结果的解析入口（扫描 → 解析）。
- *
- * ## 阅读建议
- *
- * 先读上面「为什么需要这一层」的三条论据与实测表，理解栅栏拦的不是解析而是解析**之后**
- * 的递归操作；再看 `JsonScanDepth`（一个循环 + 3 个状态，字符串里跳过括号）；
- * 最后看 `ParseJson` 的两步顺序 —— 顺序反过来就失去保护意义。
- *
- * ## 边界与陷阱
- *
- * - **限深栅栏必须保留**：`parse()` 在上游是迭代的（显式栈），然而 `dump()` 与拷贝
- *   都是递归的，128 KiB Fiber 栈上分别约 1162 / 816 层（无优化下 609 / 185 层）就会
- *   踩 guard page；项目没有 SIGSEGV handler 与 sigaltstack，越界即进程被内核杀掉
- *   （退出码 139）。深文档一旦进程序，崩点可能在很远之后的某次日志序列化里，
- *   届时无法定位来源。入口是唯一能把「不可捕获的崩溃」换成「可处理的 ErrorPtr」的位置。
- * - 栅栏**只限深度**，不限总大小与节点数：宽而浅的文档仍能按 O(n) 放大内存/时间。
- *   需要对体积设限时应在调用前检查 `text.size()`，本模块不替调用方决定。
- * - `JsonScanDepth` 不做语法校验：括号不匹配、非法 UTF-8 都不会在这里报错，合法性
- *   由上游客忍解析器判断；带 `stop_at` 时的返回值只是真实深度的**下界**。
- * - 判定解析成功只能用 `result.ok()`：合法输入 `null` 解析成功后 `value` 同样是 null。
- * - 放宽 `max_depth` 等于放弃这层保护；放大后必须自行确认目标执行流的栈容量。
- */
+#include "go2cpp/error.hpp"
+#include "go2cpp/json/core/decimal.hpp"
+#include "go2cpp/json/document.hpp"
+#include "go2cpp/json/json_build.hpp"
+#include "go2cpp/json/parser.hpp"
+#include "go2cpp/json/value.hpp"
 
 namespace go2cpp {
 
-namespace detail {
+/**
+ * @brief `Json::parse` 失败时抛出的异常。
+ *
+ * @details 与旧实现（上游的 `parse_error`）一样派生自 `std::exception`，
+ *          调用方用 `catch (const std::exception&)` 即可；`what()` 带上
+ *          「第几个字节」等定位信息，便于 CLI 报错。
+ */
+class JsonParseError : public std::runtime_error {
+public:
+    explicit JsonParseError(const std::string& message)
+        : std::runtime_error(message) {}
+};
 
-/// @brief 把一个自研 JSON 标量转成 nlohmann 值。
-inline ::nlohmann::json ScalarToNlohmann(const go2cpp::json::Value& value) {
-    if (value.IsNull()) {
+/**
+ * @brief 有序 JSON 值（对象键按字典序，与迁移前的输出字节一致）。
+ *
+ * ## 定位
+ * debug 视图 / DebugServer 响应 / CLI 输出的**唯一**值容器；解析入口是
+ * `ParseJson`（自研解析器），序列化出口是 `Json::dump`（内部用
+ * `go2cpp::json::JsonBuilder` 完成转义与数字格式化）。
+ *
+ * ## 并发/失败语义
+ * - 值语义：可拷贝、可移动；拷贝是深拷贝（递归，深度受入口栅栏约束）；
+ * - 非 const `operator[]` 在 key 不存在时**插入 null**（与上游一致），
+ *   因此不要拿它做只读查询——用 `find` / `contains` / `value`；
+ * - const `operator[]` 不插入，缺失返回全局 null 引用；
+ * - `parse` 失败抛 `JsonParseError`；`dump` 不做错误处理（见 JsonBuilder 的
+ *   数值契约：只可能因 NaN/Inf 失败，而这类值无法从解析产生）。
+ */
+class Json {
+public:
+    using array_t = std::vector<Json>;
+    using object_t = std::map<std::string, Json, std::less<>>;
+    using initializer_list_t = std::initializer_list<std::pair<const std::string, Json>>;
+
+    Json() noexcept : m_value(nullptr) {}
+    Json(std::nullptr_t) noexcept : m_value(nullptr) {}
+    Json(bool value) : m_value(value) {}
+    Json(double value) : m_value(value) {}
+    Json(const char* value) : m_value(std::string(value == nullptr ? "" : value)) {}
+    Json(std::string value) : m_value(std::move(value)) {}
+    Json(std::string_view value) : m_value(std::string(value)) {}
+    Json(const array_t& value) : m_value(value) {}
+    Json(array_t&& value) : m_value(std::move(value)) {}
+    Json(const object_t& value) : m_value(value) {}
+    Json(object_t&& value) : m_value(std::move(value)) {}
+    /// @brief 对象字面量构造：`Json m = {{"k", v}, ...}`（与旧实现一致）。
+    Json(initializer_list_t init) : m_value(object_t{}) {
+        auto& object = std::get<object_t>(m_value);
+        for (const auto& entry : init) {
+            object.emplace(entry.first, entry.second);
+        }
+    }
+    /// @brief 任意可转 JSON 的数组 → 数组（`std::vector<std::string>` 等）。
+    template <typename T, typename = std::enable_if_t<!std::is_same_v<T, Json>>>
+    Json(const std::vector<T>& value) : m_value(array_t{}) {
+        auto& array = std::get<array_t>(m_value);
+        array.reserve(value.size());
+        for (const auto& item : value) {
+            array.push_back(Json(item));
+        }
+    }
+    /// @brief 简单字符串表 → 对象（CLI 的 `status` 键值对常用）。
+    Json(const std::map<std::string, std::string>& value) : m_value(object_t{}) {
+        auto& object = std::get<object_t>(m_value);
+        for (const auto& entry : value) {
+            object.emplace(entry.first, Json(entry.second));
+        }
+    }
+
+    /// @brief 整型构造：有符号进 int64 节点，无符号进 uint64 节点（与旧实现一致）。
+    template <typename T,
+              typename = std::enable_if_t<std::is_integral_v<T> &&
+                                          !std::is_same_v<T, bool> &&
+                                          !std::is_same_v<T, char>>,
+              typename = void>
+    Json(T value)  // NOLINT(google-explicit-constructor)：DOM 写法需要隐式转换
+        : m_value(std::is_signed_v<T>
+                      ? Storage{static_cast<std::int64_t>(value)}
+                      : Storage{static_cast<std::uint64_t>(value)}) {}
+
+    // -----------------------------------------------------------------
+    // 工厂与解析
+    // -----------------------------------------------------------------
+
+    /// @brief 空对象 `{}`。
+    static Json object(initializer_list_t init = {}) {
+        Json out(object_t{});
+        for (const auto& entry : init) {
+            std::get<object_t>(out.m_value).emplace(entry.first, entry.second);
+        }
+        return out;
+    }
+
+    /// @brief 空数组 `[]`。
+    static Json array(std::initializer_list<Json> init = {}) {
+        Json out(array_t{});
+        for (const auto& item : init) {
+            std::get<array_t>(out.m_value).push_back(item);
+        }
+        return out;
+    }
+
+    /// @brief 解析 JSON 文本；失败抛 `JsonParseError`（不带深度栅栏，见 `ParseJson`）。
+    static Json parse(std::string_view text) {
+        go2cpp::json::Document document;
+        go2cpp::json::Parser parser;
+        go2cpp::json::ParserConfig config;
+        go2cpp::ErrorPtr error;
+        if (!parser.Parse(text, document, error, config)) {
+            throw JsonParseError("JSON 解析失败: " + go2cpp::ErrorMessage(error));
+        }
+        return detail_from_value(document.Root());
+    }
+
+    /// @brief 不抛异常的解析重载（兼容旧的 `parse(text, nullptr, false)` 写法）。
+    /// @note `allow_exceptions == false` 时失败返回 null；调用方用 `is_object()` 等判断。
+    static Json parse(std::string_view text, std::nullptr_t /*unused*/, bool allow_exceptions) {
+        go2cpp::json::Document document;
+        go2cpp::json::Parser parser;
+        go2cpp::json::ParserConfig config;
+        go2cpp::ErrorPtr error;
+        if (!parser.Parse(text, document, error, config)) {
+            if (allow_exceptions) {
+                throw JsonParseError("JSON 解析失败: " + go2cpp::ErrorMessage(error));
+            }
+            return Json();
+        }
+        return detail_from_value(document.Root());
+    }
+
+    /// @brief 解析失败在旧接口里用 discard 值表示；本实现用 null 表示，恒为 false。
+    bool is_discarded() const noexcept { return false; }
+
+    // -----------------------------------------------------------------
+    // 类型判定
+    // -----------------------------------------------------------------
+
+    bool is_null() const noexcept { return std::holds_alternative<std::nullptr_t>(m_value); }
+    bool is_boolean() const noexcept { return std::holds_alternative<bool>(m_value); }
+    bool is_number_integer() const noexcept {
+        return std::holds_alternative<std::int64_t>(m_value) ||
+               std::holds_alternative<std::uint64_t>(m_value);
+    }
+    bool is_number_unsigned() const noexcept {
+        return std::holds_alternative<std::uint64_t>(m_value);
+    }
+    bool is_number_float() const noexcept { return std::holds_alternative<double>(m_value); }
+    bool is_number() const noexcept { return is_number_integer() || is_number_float(); }
+    bool is_string() const noexcept { return std::holds_alternative<std::string>(m_value); }
+    bool is_array() const noexcept { return std::holds_alternative<array_t>(m_value); }
+    bool is_object() const noexcept { return std::holds_alternative<object_t>(m_value); }
+
+    // -----------------------------------------------------------------
+    // 容器 / 字符串尺寸
+    // -----------------------------------------------------------------
+
+    /// @brief 元素个数：数组/对象返回 size，字符串返回字节数，其余返回 0。
+    std::size_t size() const noexcept {
+        if (const auto* array = std::get_if<array_t>(&m_value)) {
+            return array->size();
+        }
+        if (const auto* object = std::get_if<object_t>(&m_value)) {
+            return object->size();
+        }
+        if (const auto* text = std::get_if<std::string>(&m_value)) {
+            return text->size();
+        }
+        return 0;
+    }
+
+    /// @brief `size() == 0`（标量恒为 true）。
+    bool empty() const noexcept { return size() == 0; }
+
+    // -----------------------------------------------------------------
+    // 访问
+    // -----------------------------------------------------------------
+
+    /// @brief 读写的对象下标：不存在则插入 null；非对象调用会把它变成对象。
+    Json& operator[](std::string_view key) {
+        if (!is_object()) {
+            m_value = object_t{};
+        }
+        return std::get<object_t>(m_value)[std::string(key)];
+    }
+
+    /// @brief 只读下标：缺失或非对象返回全局 null 引用（不插入）。
+    const Json& operator[](std::string_view key) const noexcept {
+        if (const auto* object = std::get_if<object_t>(&m_value)) {
+            const auto found = object->find(key);
+            if (found != object->end()) {
+                return found->second;
+            }
+        }
+        return null_json();
+    }
+
+    /// @brief 数组下标（越界时读写语义不同：写会扩容，读返回 null）。
+    Json& operator[](std::size_t index) {
+        if (!is_array()) {
+            m_value = array_t{};
+        }
+        auto& array = std::get<array_t>(m_value);
+        if (index >= array.size()) {
+            array.resize(index + 1);
+        }
+        return array[index];
+    }
+
+    /// @brief 只读数组下标；越界返回 null 引用。
+    const Json& operator[](std::size_t index) const noexcept {
+        if (const auto* array = std::get_if<array_t>(&m_value)) {
+            if (index < array->size()) {
+                return (*array)[index];
+            }
+        }
+        return null_json();
+    }
+
+    /// @brief 查成员；不存在返回 nullptr（不插入）。
+    const Json* find(std::string_view key) const noexcept {
+        if (const auto* object = std::get_if<object_t>(&m_value)) {
+            const auto found = object->find(key);
+            if (found != object->end()) {
+                return &found->second;
+            }
+        }
         return nullptr;
     }
-    if (value.IsBool()) {
-        bool parsed = false;
-        value.As(parsed);
-        return parsed;
-    }
-    if (value.IsInt()) {
-        std::int64_t parsed = 0;
-        value.As(parsed);
-        return parsed;
-    }
-    if (value.IsDouble()) {
-        double parsed = 0.0;
-        value.As(parsed);
-        return parsed;
-    }
-    if (value.IsDecimal()) {
-        // 自研库用 Decimal 表示超出 int64/double 的数值；nlohmann 没有任意
-        // 精度类型，退化成 double（与 nlohmann 自身对超大数的处理一致）。
-        go2cpp::json::core::Decimal decimal;
-        if (!value.As(decimal)) {
-            return nullptr;
+
+    /// @brief 对象是否含 key（非对象一律 false）。
+    bool contains(std::string_view key) const noexcept { return find(key) != nullptr; }
+
+    /// @brief 取成员，缺失/类型不符时返回 `default_value`。
+    /// @note `T = Json` 时直接返回值（`value("k", Json::object())` 这种用法）。
+    template <typename T>
+    T value(std::string_view key, T default_value) const {
+        const Json* const item = find(key);
+        if (item == nullptr) {
+            return default_value;
         }
-        return std::strtod(decimal.ToString().c_str(), nullptr);
+        if constexpr (std::is_same_v<T, Json>) {
+            return *item;
+        } else {
+            T out{};
+            if (!item->get(out)) {
+                return default_value;
+            }
+            return out;
+        }
     }
-    if (value.IsString()) {
-        return std::string(value.AsText());
+
+    /// @brief 追加元素（非数组调用会先变成数组）。
+    void push_back(Json item) {
+        if (!is_array()) {
+            m_value = array_t{};
+        }
+        std::get<array_t>(m_value).push_back(std::move(item));
     }
-    return nullptr;
+
+    /// @brief 取字符串：成功返回 true 并写 `out`；失败保持 `out` 原值。
+    bool get(std::string& out) const {
+        if (const auto* text = std::get_if<std::string>(&m_value)) {
+            out = *text;
+            return true;
+        }
+        return false;
+    }
+    bool get(std::string_view& out) const {
+        if (const auto* text = std::get_if<std::string>(&m_value)) {
+            out = *text;
+            return true;
+        }
+        return false;
+    }
+    bool get(bool& out) const {
+        if (const auto* flag = std::get_if<bool>(&m_value)) {
+            out = *flag;
+            return true;
+        }
+        return false;
+    }
+    bool get(double& out) const {
+        if (const auto* number = std::get_if<double>(&m_value)) {
+            out = *number;
+            return true;
+        }
+        if (const auto* number = std::get_if<std::int64_t>(&m_value)) {
+            out = static_cast<double>(*number);
+            return true;
+        }
+        if (const auto* number = std::get_if<std::uint64_t>(&m_value)) {
+            out = static_cast<double>(*number);
+            return true;
+        }
+        return false;
+    }
+    template <typename T,
+              typename = std::enable_if_t<std::is_integral_v<T> && !std::is_same_v<T, bool>>,
+              typename = void>
+    bool get(T& out) const {
+        if (const auto* number = std::get_if<std::int64_t>(&m_value)) {
+            out = static_cast<T>(*number);
+            return true;
+        }
+        if (const auto* number = std::get_if<std::uint64_t>(&m_value)) {
+            out = static_cast<T>(*number);
+            return true;
+        }
+        if (const auto* number = std::get_if<double>(&m_value)) {
+            out = static_cast<T>(*number);
+            return true;
+        }
+        return false;
+    }
+
+    /// @brief `get(T&)` 的取回版本；失败返回 `T{}`。
+    template <typename T>
+    T get() const {
+        T out{};
+        (void)get(out);
+        return out;
+    }
+
+    /// @brief 取字符串内容；非字符串返回序列化文本（显式，避免与比较运算二义）。
+    std::string as_string() const {
+        if (const auto* text = std::get_if<std::string>(&m_value)) {
+            return *text;
+        }
+        return dump();
+    }
+
+    /// @brief 值相等：数值按数值比较，其它按类型 + 内容比较。
+    friend bool operator==(const Json& lhs, const Json& rhs) { return lhs.equals(rhs); }
+    friend bool operator!=(const Json& lhs, const Json& rhs) { return !lhs.equals(rhs); }
+
+    bool equals(const Json& other) const {
+        if (is_number() && other.is_number()) {
+            if (is_number_float() || other.is_number_float()) {
+                return as_double() == other.as_double();
+            }
+            if (is_number_unsigned() || other.is_number_unsigned()) {
+                // 一负一正必然不等；同为非负时按 uint64 比较。
+                const bool lhs_negative = std::get_if<std::int64_t>(&m_value) != nullptr &&
+                                          std::get<std::int64_t>(m_value) < 0;
+                const bool rhs_negative = std::get_if<std::int64_t>(&other.m_value) != nullptr &&
+                                          std::get<std::int64_t>(other.m_value) < 0;
+                if (lhs_negative || rhs_negative) {
+                    return lhs_negative && rhs_negative &&
+                           std::get<std::int64_t>(m_value) ==
+                               std::get<std::int64_t>(other.m_value);
+                }
+                return as_uint64() == other.as_uint64();
+            }
+            return std::get<std::int64_t>(m_value) == std::get<std::int64_t>(other.m_value);
+        }
+        return m_value == other.m_value;
+    }
+
+    // -----------------------------------------------------------------
+    // 遍历：数组给元素，对象给成员（`it.key()` / `it.value()`）
+    // -----------------------------------------------------------------
+
+    /**
+     * @brief 统一迭代器：数组迭代元素，对象迭代成员。
+     *
+     * @details 只为「遍历」这一用途设计：`*it` / `it.value()` 返回成员值，
+     *          `it.key()` 返回对象键（数组返回空串）。写操作请走下标。
+     */
+    class iterator {
+    public:
+        using array_iterator = array_t::const_iterator;
+        using object_iterator = object_t::const_iterator;
+
+        iterator() noexcept = default;
+
+        const Json& operator*() const noexcept {
+            return m_kind == Kind::kArray ? *m_array : m_object->second;
+        }
+        const Json* operator->() const noexcept { return &operator*(); }
+
+        iterator& operator++() noexcept {
+            if (m_kind == Kind::kArray) {
+                ++m_array;
+            } else {
+                ++m_object;
+            }
+            return *this;
+        }
+
+        bool operator==(const iterator& other) const noexcept {
+            if (m_kind != other.m_kind) {
+                return false;
+            }
+            return m_kind == Kind::kArray ? m_array == other.m_array
+                                          : m_object == other.m_object;
+        }
+        bool operator!=(const iterator& other) const noexcept { return !(*this == other); }
+
+        /// @brief 对象键；数组迭代返回空串。
+        const std::string& key() const noexcept {
+            return m_kind == Kind::kObject ? m_object->first : empty_key();
+        }
+        /// @brief 当前值（同 `operator*`）。
+        const Json& value() const noexcept { return *m_array; }
+
+    private:
+        friend class Json;
+        enum class Kind : unsigned char { kArray, kObject };
+
+        iterator(array_iterator position) noexcept : m_kind(Kind::kArray) {
+            m_array = position;
+        }
+        iterator(object_iterator position) noexcept : m_kind(Kind::kObject) {
+            m_array = array_iterator{};
+            m_object = position;
+        }
+        static const std::string& empty_key() {
+            static const std::string kEmpty;
+            return kEmpty;
+        }
+
+        Kind m_kind{Kind::kArray};
+        array_iterator m_array{};
+        object_iterator m_object{};
+    };
+
+    /// @brief 对象键值对遍历用的轻量代理（`for (auto& [k, v] : j.items())` 的替代）。
+    class items_proxy {
+    public:
+        explicit items_proxy(const object_t* object) noexcept : m_object(object) {}
+
+        /// @brief 一个成员：`key()` 取键、`value()` 取值。
+        class item {
+        public:
+            explicit item(object_t::const_iterator position) noexcept : m_it(position) {}
+            const std::string& key() const noexcept { return m_it->first; }
+            const Json& value() const noexcept { return m_it->second; }
+
+        private:
+            object_t::const_iterator m_it;
+        };
+
+        class iterator {
+        public:
+            explicit iterator(object_t::const_iterator position) noexcept : m_it(position) {}
+            item operator*() const noexcept { return item(m_it); }
+            iterator& operator++() noexcept {
+                ++m_it;
+                return *this;
+            }
+            bool operator==(const iterator& other) const noexcept { return m_it == other.m_it; }
+            bool operator!=(const iterator& other) const noexcept { return m_it != other.m_it; }
+
+        private:
+            object_t::const_iterator m_it;
+        };
+
+        iterator begin() const noexcept { return iterator(m_object->begin()); }
+        iterator end() const noexcept { return iterator(m_object->end()); }
+
+    private:
+        const object_t* m_object;
+    };
+
+    /// @brief 遍历对象成员（非对象返回空范围）。
+    items_proxy items() const noexcept {
+        static const object_t kEmpty;
+        const auto* object = std::get_if<object_t>(&m_value);
+        return items_proxy(object == nullptr ? &kEmpty : object);
+    }
+
+    using const_iterator = iterator;
+
+    const_iterator begin() const noexcept {
+        if (const auto* array = std::get_if<array_t>(&m_value)) {
+            return iterator(array->begin());
+        }
+        if (const auto* object = std::get_if<object_t>(&m_value)) {
+            return iterator(object->begin());
+        }
+        return iterator(empty_array().begin());
+    }
+    const_iterator end() const noexcept {
+        if (const auto* array = std::get_if<array_t>(&m_value)) {
+            return iterator(array->end());
+        }
+        if (const auto* object = std::get_if<object_t>(&m_value)) {
+            return iterator(object->end());
+        }
+        return iterator(empty_array().end());
+    }
+
+    // -----------------------------------------------------------------
+    // 序列化
+    // -----------------------------------------------------------------
+
+    /**
+     * @brief 序列化为 JSON 文本。
+     * @param indent [in] `<0` 紧凑单行（默认）；`>0` 每层缩进字节数。
+     * @return JSON 文本；对象键按字典序输出。
+     * @note 字符串转义与数字格式全部交给 `go2cpp::json::JsonBuilder`，本类
+     *       只负责拼结构和缩进 —— 保证与解析器共享同一份格式契约。
+     */
+    std::string dump(int indent = -1) const {
+        std::string out;
+        append_to(out, indent, 0);
+        return out;
+    }
+
+    /// @brief 自研 `Document`/`Value` → `Json`（显式栈迭代，深文档不爆栈）。
+    static Json detail_from_value(const go2cpp::json::Value& root);
+
+private:
+    using Storage = std::variant<std::nullptr_t, bool, std::int64_t, std::uint64_t,
+                                 double, std::string, array_t, object_t>;
+
+    static const Json& null_json() {
+        static const Json kNull;
+        return kNull;
+    }
+    static const array_t& empty_array() {
+        static const array_t kEmpty;
+        return kEmpty;
+    }
+
+    void append_to(std::string& out, int indent, int depth) const;
+
+    double as_double() const noexcept {
+        if (const auto* number = std::get_if<double>(&m_value)) {
+            return *number;
+        }
+        if (const auto* number = std::get_if<std::int64_t>(&m_value)) {
+            return static_cast<double>(*number);
+        }
+        return static_cast<double>(std::get<std::uint64_t>(m_value));
+    }
+    std::uint64_t as_uint64() const noexcept {
+        if (const auto* number = std::get_if<std::uint64_t>(&m_value)) {
+            return *number;
+        }
+        if (const auto* number = std::get_if<std::int64_t>(&m_value)) {
+            return static_cast<std::uint64_t>(*number);
+        }
+        return static_cast<std::uint64_t>(std::get<double>(m_value));
+    }
+
+    Storage m_value;
+};
+
+namespace detail {
+
+/// @brief 写一个 JSON 标量的文本（转义/数字格式都走 JsonBuilder）。
+inline std::string EncodeScalar(std::string_view text) {
+    go2cpp::json::JsonBuilder builder;
+    builder.String(text);
+    return builder.str();
+}
+inline std::string EncodeScalar(bool value) {
+    return value ? "true" : "false";
+}
+inline std::string EncodeScalar(std::int64_t value) {
+    go2cpp::json::JsonBuilder builder;
+    builder.Int(value);
+    return builder.str();
+}
+inline std::string EncodeScalar(std::uint64_t value) {
+    go2cpp::json::JsonBuilder builder;
+    builder.Uint(value);
+    return builder.str();
+}
+inline std::string EncodeScalar(double value) {
+    go2cpp::json::JsonBuilder builder;
+    builder.Double(value);
+    return builder.str();
 }
 
-/// @brief 把自研 Value 转成 nlohmann::json；显式栈迭代，深文档不爆栈。
-inline ::nlohmann::json ToNlohmann(const go2cpp::json::Value& root) {
+/// @brief 追加缩进（`indent` 空格 × `depth` 层）。
+inline void AppendIndent(std::string& out, int indent, int depth) {
+    if (indent <= 0) {
+        return;
+    }
+    out.append(static_cast<std::size_t>(indent) * static_cast<std::size_t>(depth), ' ');
+}
+
+}  // namespace detail
+
+inline void Json::append_to(std::string& out, int indent, int depth) const {
+    // step1: 标量直接编码（null/bool/整型/浮点/字符串）。
+    if (std::holds_alternative<std::nullptr_t>(m_value)) {
+        out.append("null");
+        return;
+    }
+    if (const auto* flag = std::get_if<bool>(&m_value)) {
+        out.append(detail::EncodeScalar(*flag));
+        return;
+    }
+    if (const auto* number = std::get_if<std::int64_t>(&m_value)) {
+        out.append(detail::EncodeScalar(*number));
+        return;
+    }
+    if (const auto* number = std::get_if<std::uint64_t>(&m_value)) {
+        out.append(detail::EncodeScalar(*number));
+        return;
+    }
+    if (const auto* number = std::get_if<double>(&m_value)) {
+        out.append(detail::EncodeScalar(*number));
+        return;
+    }
+    if (const auto* text = std::get_if<std::string>(&m_value)) {
+        out.append(detail::EncodeScalar(std::string_view(*text)));
+        return;
+    }
+    // step2: 空容器保持紧凑（与旧实现 dump 一致）。
+    if (const auto* array = std::get_if<array_t>(&m_value)) {
+        if (array->empty()) {
+            out.append("[]");
+            return;
+        }
+        out.push_back('[');
+        for (std::size_t index = 0; index < array->size(); ++index) {
+            if (index != 0) {
+                out.push_back(',');
+            }
+            if (indent > 0) {
+                out.push_back('\n');
+                detail::AppendIndent(out, indent, depth + 1);
+            }
+            (*array)[index].append_to(out, indent, depth + 1);
+        }
+        if (indent > 0) {
+            out.push_back('\n');
+            detail::AppendIndent(out, indent, depth);
+        }
+        out.push_back(']');
+        return;
+    }
+    // step3: 对象按键（std::map 已排序）逐个输出。
+    const auto& object = std::get<object_t>(m_value);
+    if (object.empty()) {
+        out.append("{}");
+        return;
+    }
+    out.push_back('{');
+    bool first = true;
+    for (const auto& entry : object) {
+        if (!first) {
+            out.push_back(',');
+        }
+        first = false;
+        if (indent > 0) {
+            out.push_back('\n');
+            detail::AppendIndent(out, indent, depth + 1);
+        }
+        out.append(detail::EncodeScalar(std::string_view(entry.first)));
+        out.push_back(':');
+        if (indent > 0) {
+            out.push_back(' ');
+        }
+        entry.second.append_to(out, indent, depth + 1);
+    }
+    if (indent > 0) {
+        out.push_back('\n');
+        detail::AppendIndent(out, indent, depth);
+    }
+    out.push_back('}');
+}
+
+inline Json Json::detail_from_value(const go2cpp::json::Value& root) {
+    // 标量直接转换；容器用显式栈展开（与旧实现的 ToNlohmann 同一思路）。
     if (!root.IsArray() && !root.IsObject()) {
-        return ScalarToNlohmann(root);
+        if (root.IsNull()) {
+            return Json(nullptr);
+        }
+        if (root.IsBool()) {
+            bool parsed = false;
+            root.As(parsed);
+            return Json(parsed);
+        }
+        if (root.IsInt()) {
+            std::int64_t parsed = 0;
+            root.As(parsed);
+            return Json(parsed);
+        }
+        if (root.IsDouble()) {
+            double parsed = 0.0;
+            root.As(parsed);
+            return Json(parsed);
+        }
+        if (root.IsDecimal()) {
+            go2cpp::json::core::Decimal decimal;
+            if (!root.As(decimal)) {
+                return Json(nullptr);
+            }
+            return Json(std::strtod(decimal.ToString().c_str(), nullptr));
+        }
+        if (root.IsString()) {
+            return Json(std::string(root.AsText()));
+        }
+        return Json(nullptr);
     }
 
     struct Frame {
         go2cpp::json::Value source;
-        ::nlohmann::json local;
-        std::size_t next = 0;
-        std::string parent_key;  ///< 在对象父容器中的键；数组父容器为空。
+        Json local;
+        std::size_t next{0};
+        std::string parent_key;
     };
-
     std::vector<Frame> stack;
-    stack.push_back(Frame{root,
-                          root.IsArray() ? ::nlohmann::json::array()
-                                         : ::nlohmann::json::object(),
-                          0,
-                          std::string{}});
+    stack.push_back(Frame{root, root.IsArray() ? Json::array() : Json::object(), 0, {}});
     while (!stack.empty()) {
         Frame& frame = stack.back();
         if (frame.next < frame.source.Size()) {
@@ -200,22 +779,18 @@ inline ::nlohmann::json ToNlohmann(const go2cpp::json::Value& root) {
                 key.assign(frame.source.MemberName(index));
             }
             if (child.IsArray() || child.IsObject()) {
-                Frame next_frame;
-                next_frame.source = child;
-                next_frame.local = child.IsArray()
-                                       ? ::nlohmann::json::array()
-                                       : ::nlohmann::json::object();
-                next_frame.parent_key = std::move(key);
-                stack.push_back(std::move(next_frame));
+                stack.push_back(Frame{child,
+                                      child.IsArray() ? Json::array() : Json::object(),
+                                      0,
+                                      std::move(key)});
             } else if (frame.local.is_array()) {
-                frame.local.push_back(ScalarToNlohmann(child));
+                frame.local.push_back(Json::detail_from_value(child));
             } else {
-                frame.local[key] = ScalarToNlohmann(child);
+                frame.local[key] = Json::detail_from_value(child);
             }
             continue;
         }
-        // 当前容器处理完：move 到父容器（或作为根返回），再弹帧。
-        ::nlohmann::json finished = std::move(frame.local);
+        Json finished = std::move(frame.local);
         std::string key = std::move(frame.parent_key);
         const bool is_root = stack.size() == 1;
         stack.pop_back();
@@ -229,30 +804,19 @@ inline ::nlohmann::json ToNlohmann(const go2cpp::json::Value& root) {
             parent.local[key] = std::move(finished);
         }
     }
-    return nullptr;
+    return Json(nullptr);
 }
-
-}  // namespace detail
-
-/**
- * @brief JSON 值类型。
- * @details 直接沿用上游类型，不做二次包装 —— 这样调用方可以完整使用
- *          nlohmann 的 API，本模块只负责「进得来、不炸栈」这一步。
- */
-using Json = ::nlohmann::json;
 
 /**
  * @brief `ParseJson` 默认接受的嵌套深度上限。
- * @details 依据是本文件顶部表格里的实测数据：无优化构建下拷贝临界约 185 层、
- *          dump 临界约 609 层，取 64 留约 3 倍余量。
- *          需要更深的文档时显式传入更大的 `max_depth`，并自行确认该执行流的
- *          栈容量能承受后续的 dump/拷贝。
+ * @details 自研解析器本身是迭代的；这里限制的是**解析之后**的递归操作
+ *          （`Json` 的拷贝 / `dump`）与 O(深度) 的资源放大。取 64 对
+ *          128 KiB Fiber 栈留出足够余量。
  */
 inline constexpr std::size_t kDefaultJsonMaxDepth = 64U;
 
 /**
  * @brief `JsonScanDepth` 的「不早退」哨兵：完整扫描整段文本。
- * @details 取 `std::size_t` 最大值，任何真实深度都不会超过它。
  */
 inline constexpr std::size_t kJsonDepthUnlimited = static_cast<std::size_t>(-1);
 
@@ -263,11 +827,6 @@ inline constexpr std::size_t kJsonDepthUnlimited = static_cast<std::size_t>(-1);
  *          `Wrap(JsonDepthExceededError(), 具体说明)`，因此判断错误种类必须用
  *          **身份比较**（`Is(error, JsonDepthExceededError())`），
  *          不能用文本比较 —— 文本里带着具体的上限与扫描层数，每次都不同。
- *
- * @return 共享的、不可变的错误对象；同一进程内地址恒定。
- * @note 故意泄漏（`new` 后不析构）：与 `go.hpp` 的默认调度器同理，若使用函数
- *       局部 static 对象，程序退出阶段的静态析构会让这里的身份比较退化为
- *       「与空指针比较」，从而把「深度超限」静默误判成「没有错误」。
  */
 inline ErrorPtr JsonDepthExceededError() {
     static const ErrorPtr* const kError = new ErrorPtr(
@@ -278,33 +837,18 @@ inline ErrorPtr JsonDepthExceededError() {
 /**
  * @brief 迭代扫描 JSON 文本，返回观测到的最大嵌套深度。
  *
- * @details 实现是**单层循环 + 显式计数**，不递归、不分配，
- *          因此扫描本身与输入深度无关地安全（100 万层嵌套也没有额外栈开销）。
- *          扫描器跳过字符串字面量内部（包括 `\"` 转义），所以
- *          `"[[[["` 这样的字符串内容不会被计入深度。
+ * @details 实现是**单层循环 + 显式计数**，不递归、不分配，因此扫描本身与
+ *          输入深度无关地安全（100 万层嵌套也没有额外栈开销）。扫描器跳过
+ *          字符串字面量内部（包括 `\"` 转义），所以 `"[[[["` 这样的字符串
+ *          内容不会被计入深度。
  *
- *          扫描器**不做语法校验**：括号不匹配、非法字符都不会报错，只按字面
- *          计数（`}`/`]` 在深度为 0 时被忽略）。合法性交给 `ParseJson` 里的
- *          上游解析器判断 —— 这里只回答「嵌套有多深」。
+ *          扫描器**不做语法校验**：括号不匹配、非法 UTF-8 都不会在这里报错，
+ *          合法性交给自研解析器判断 —— 这里只回答「嵌套有多深」。
  *
  * @param text 待扫描文本（可以是任意字节串，不要求是合法 JSON）。
- * @param stop_at 早退阈值：一旦观测深度**超过**该值就立即返回。
- *        此时返回值只是「已观测到的层数」，是真实深度的**下界**，
- *        **不是**全局最大值；默认 `kJsonDepthUnlimited`（完整扫描）。
+ * @param stop_at 早退阈值：一旦观测深度**超过**该值就立即返回（返回值只是
+ *        已观测到的层数，是真实深度的**下界**）。
  * @return 观测到的最大嵌套深度；空输入或纯标量返回 0。
- * @note 该函数是 `noexcept` 且无分配：可以安全地用在「必须先判断再决定是否
- *       解析」的栅栏位置。
- *
- * ## 步骤
- * step1. 逐字符扫描，维护 `depth`（未闭合容器数）与 `deepest`（历史最大值）；
- * step2. 处于字符串内部时只处理 `\` 转义与结束引号，内容里的括号一律不计深度；
- * step3. 遇到 `{`/`[` 增加深度，刷新 `deepest`；一旦超过 `stop_at` 立即早退；
- * step4. 遇到 `}`/`]` 且深度大于 0 时减少深度（多余的右括号被忽略，不做校验）；
- * step5. 扫描结束返回 `deepest`。
- *
- * ## 状态机
- * 扫描器有 Normal / InString / Escaped 三个状态，由输入字符驱动；
- * 完整转化表见 `docs/state-machines/JsonDepthScanner.md`。
  */
 inline std::size_t JsonScanDepth(std::string_view text,
                                  std::size_t stop_at = kJsonDepthUnlimited) noexcept {
@@ -351,21 +895,10 @@ inline std::size_t JsonScanDepth(std::string_view text,
 
 /**
  * @brief `ParseJson` 的结果：值 + 可检查的错误。
- * @details 与 `ChannelRecvResult<T>`、`FutureResult<T>` 同一种「结构化结果」风格：
- *          不使用异常表达解析失败。
+ * @details 与 `ChannelRecvResult<T>`、`FutureResult<T>` 同一种「结构化结果」
+ *          风格：不使用异常表达解析失败。
  * @note 判定成功请用 `ok()`，**不要**用 `value.is_null()` —— 合法输入 `"null"`
  *       解析成功后 `value` 同样是 null。
- *
- * ## 定位
- *
- * `ParseJson` 的返回值载体，供示例与测试做「不抛异常」的错误处理；与
- * `ChannelRecvResult<T>` / `FutureResult<T>` 是同一种结构化结果风格。
- *
- * ## 不变量
- *
- * - `error == nullptr` ⟺ `ok()` 为真；
- * - 成功时 `value` 可能是任意 JSON 值，**包括 null**；
- * - 失败时 `value` 保持默认构造的 null，调用方不应读取。
  */
 struct JsonParseResult {
     /** @brief 成功时的解析结果；失败时为 null。 */
@@ -383,32 +916,11 @@ struct JsonParseResult {
  *
  * @details 执行两步，顺序不可交换：
  *          1. `JsonScanDepth(text, max_depth)` 迭代求深度，超限即早退；
- *          2. 仅当未超限时才调用 `nlohmann::json::parse`。
+ *          2. 仅当未超限时才调用自研解析器。
  *
- * @note 上游的解析器本身是迭代的（见文件头实测表），所以这道栅栏**不是**
- *       为了让解析不爆栈 —— 它拦的是「深文档进入程序之后」的递归操作
- *       （`dump()`、拷贝等）与 O(深度) 的资源放大。放大 `max_depth` 就等于
- *       放弃这层保护，请自行确认目标执行流的栈容量。
- *
- * @param text 待解析文本；允许为空（空输入会走上游报错路径，不抛异常）。
+ * @param text 待解析文本；允许为空（空输入会走解析器报错路径，不抛异常）。
  * @param max_depth 允许的最大嵌套深度，默认 `kDefaultJsonMaxDepth`（64）。
  * @return 结构化结果；失败信息在 `result.error`，不抛异常。
- * @note 上游的所有异常（`json::parse_error` 等）都在这里被转换成 `ErrorPtr`，
- *       与项目「不用异常做控制流」的约定一致。
- *
- * ## 步骤
- * step1. 用 `JsonScanDepth(text, max_depth)` 迭代扫描深度，超限立即返回
- *        `Wrap(JsonDepthExceededError(), ...)`，**不进入**上游解析器；
- * step2. 只有未超限才调用 `nlohmann::json::parse`，并把它可能抛出的所有异常
- *        转换成 `ErrorPtr`。
- *
- * ## 为什么顺序不可交换
- * 先解析再检查深度没有意义：深文档一旦解析成功就已经在堆上，随后任意一次 `dump()`
- * 或拷贝都可能踩爆 Fiber 栈；而栈溢出不可捕获，进程会直接被杀。栅栏必须挡在入口。
- *
- * ## 状态机
- * 第一步所用扫描器的 Normal / InString / Escaped 转化表见
- * `docs/state-machines/JsonDepthScanner.md`。
  */
 inline JsonParseResult ParseJson(std::string_view text,
                                  std::size_t max_depth = kDefaultJsonMaxDepth) {
@@ -434,7 +946,7 @@ inline JsonParseResult ParseJson(std::string_view text,
             NewError(std::string("JSON 解析失败: ") + ErrorMessage(parse_error));
         return result;
     }
-    result.value = detail::ToNlohmann(document.Root());
+    result.value = Json::detail_from_value(document.Root());
     return result;
 }
 

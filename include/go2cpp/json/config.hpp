@@ -34,7 +34,7 @@ namespace go2cpp::json {
  *
  * @details RFC 8259 不要求成员名唯一，但业务配置/API 响应通常假定唯一，
  *          不同上游库的默认行为也不一致（rapidjson 保留全部、首个生效；
- *          nlohmann/Python json 后者覆盖前者）。因此把选择权交给调用方：
+ *          多数 JSON 实现（如 Python json）后者覆盖前者）。因此把选择权交给调用方：
  *
  *          - `kFirst`（默认）：**首个生效**。重复成员全部保留在成员表中
  *            （与历史行为逐字节一致），`Find` / `operator[]` 返回第一个匹配。

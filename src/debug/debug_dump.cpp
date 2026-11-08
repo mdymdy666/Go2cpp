@@ -1430,7 +1430,7 @@ ViewJson GmpView(const ViewJson& scheduler,
             item["cancellation_requested"] =
                 task.value("cancellation_requested", false);
             globals.push_back(item);
-            const std::string state = item["state"];
+            const std::string state = item["state"].get<std::string>();
             by_state[state] = by_state.value(state, std::uint64_t{0}) + 1;
         }
     }

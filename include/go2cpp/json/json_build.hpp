@@ -1,13 +1,13 @@
 /**
  * @file json_build.hpp
- * @brief 极简 JSON 构建器——替代 nlohmann 的 `to_json` 写法。
+ * @brief 极简 JSON 构建器——替代「对象树 + `to_json`」的写法。
  *
  * ## 为什么需要它
  * `go2cpp/json` 的 `Value` 是**只读句柄**（解析产物），没有 `j["k"] = v` 这种写入 API。
  * `os/monitor` 的 18 个 `to_json` 需要**从零构建** JSON，所以补一个最小 builder。
  *
- * ## 与 nlohmann 的差异（**刻意保持极简**）
- * | nlohmann | 本类 |
+ * ## 与通用 JSON DOM 的差异（**刻意保持极简**）
+ * | 通用 DOM | 本类 |
  * |---|---|
  * | `json j; j["k"] = v;` | `JsonBuilder b; b.Key("k").Int(v);` |
  * | 自动转义 | `String()` 内部转义（`"` `\` 控制字符 + 非 ASCII 原样） |
