@@ -45,7 +45,8 @@ add_library(go2cpp_platform
   ${CMAKE_CURRENT_SOURCE_DIR}/src/platform/wake_event.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/platform/last_error.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/platform/steady_clock.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/platform/atomic_file.cpp)
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/platform/atomic_file.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/platform/socket_option.cpp)
 target_include_directories(go2cpp_platform PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)

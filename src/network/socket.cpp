@@ -29,6 +29,7 @@
 #include <optional>
 #include <vector>
 
+#include "go2cpp/platform/socket_option.hpp"
 namespace go2cpp::net {
 
 namespace {
@@ -1349,7 +1350,7 @@ Socket::Ptr DialUDP(const std::string& host, std::uint16_t port, Socket::Duratio
 Socket::Ptr ListenTCP(const std::string& host, std::uint16_t port, int backlog) {
     auto address = ResolveTCPAddr(host, port); if (!address) return {};
     auto socket = Socket::CreateTCP(address->family()); if (!socket) return {};
-    int reuse = 1; socket->set_option(SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    (void)go2cpp::platform::SetReuseAddr(socket->fd());  // 跨平台：Windows 用 SO_EXCLUSIVEADDRUSE
     return socket->bind(*address) && socket->listen(backlog) ? socket : Socket::Ptr{};
 }
 Socket::Ptr ListenUDP(const std::string& host, std::uint16_t port) {

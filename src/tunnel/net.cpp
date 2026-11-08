@@ -35,6 +35,7 @@
 #include <chrono>
 #include <string>
 
+#include "go2cpp/platform/socket_option.hpp"
 namespace go2cpp {
 namespace tunnel {
 namespace {
@@ -526,7 +527,7 @@ TcpListener::Ptr TcpListener::Listen(const std::string& host,
         return nullptr;
     }
     int enable = 1;
-    (void)::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(enable));
+    (void)::go2cpp::platform::SetReuseAddr(fd);  // 跨平台：Windows 用 SO_EXCLUSIVEADDRUSE
     if (!ConfigureFd(fd) ||
         ::bind(fd, reinterpret_cast<const sockaddr*>(&storage), storage_length) !=
             0 ||
