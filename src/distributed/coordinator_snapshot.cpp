@@ -183,7 +183,7 @@ bool WriteWholeFileAtomic(const std::string &path, const std::string &blob,
         (void)::unlink(tmp.c_str());
         return false;
     }
-    if (platform::AtomicRename(tmp.c_str(), path.c_str()) != 0) {
+    if (!platform::AtomicRename(tmp.c_str(), path.c_str())) {
         *error = DescribeErrno("rename snapshot");
         (void)::unlink(tmp.c_str());
         return false;

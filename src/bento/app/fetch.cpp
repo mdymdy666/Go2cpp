@@ -1416,7 +1416,7 @@ FetchStatus PromoteHttpsOutput(const TempOutputDir& output, const std::string& t
         return FetchStatus::kIoError;
     }
     // rename 不跟随符号链接；配合上面的 O_NOFOLLOW，写入路径的链接攻击失效。
-    if (platform::AtomicRename(payload.c_str(), temp_path.c_str()) != 0) {
+    if (!platform::AtomicRename(payload.c_str(), temp_path.c_str())) {
         result->message = std::string("临时文件 rename 失败: ") + std::strerror(errno);
         return FetchStatus::kIoError;
     }
