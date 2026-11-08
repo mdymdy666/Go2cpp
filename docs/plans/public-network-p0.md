@@ -64,35 +64,40 @@
 
 ---
 
-## 三、Go2Cpp 的现状（对比上面的差距）
+## 三、Go2Cpp 的现状（**2026-11-08 按源码核实，纠正早期误判**）
 
-| 能力 | 现状 | 差距 |
-|---|---|---|
-| **拥塞控制** | 无（固定速率/无速率） | 🚩 **最大差距** |
-| **Pacing** | 无（直接写 socket） | 🚩 突发打爆队列 |
-| **抗丢包** | 无（TCP 重传 / UDP 不管） | 🚩 弱网不可用 |
-| **Jitter Buffer** | 无 | 🚩 音视频不可用 |
-| **NAT 穿透** | 有 `tunnel`（**单跳**，不是 P2P） | 🚩 无 ICE |
-| **连接迁移** | 有 `WS Resume`（**断线重连**，非迁移） | 🚩 切换要重连 |
-| **多路复用** | 有 `mux`（HTTP/2 风格） | ✅ 已有 |
-| **QoS 分级** | 无 | 🚩 关键流会被大包阻塞 |
+> ⚠️ **本节曾误写「Go2Cpp 这些都没有」**——`docs/research/webrtc-public-network.md` 的作者**查了源码**，事实如下。
 
----
-
-## 四、任务分解（按优先级）
-
-| # | 任务 | 参考 | 验收 |
+| 能力 | 早期误判 | **源码事实** | 结论 |
 |---|---|---|---|
-| **P0-1** | **`PacedSender`（平滑发送）** | WebRTC `pacing/` | 发送间隔抖动 < 20%；burst 消除 |
-| **P0-2** | **带宽估计（GCC 简化版）** | WebRTC `congestion_controller/` | 在 1–20% 丢包下**吞吐不塌** |
-| **P0-3** | **`NACK` 重传（UDP 层）** | WebRTC `rtp_rtcp/` | 5% 丢包下**有效吞吐 ≥ 90%** |
-| **P0-4** | **QoS 分级（快慢脑模型）** | 具身智能 | 关键流 P99 延迟**不受大包影响** |
-| **P1-1** | **Jitter Buffer** | WebRTC | 抖动 50ms 下**不丢帧** |
-| **P1-2** | **连接迁移（ICE restart 简化版）** | WebRTC | WiFi→4G **不断连**（<1s 恢复） |
-| **P1-3** | **快照插值（游戏框架）** | Unity | 10Hz 快照下**视觉平滑** |
-| **P2** | **ICE / STUN / TURN** | WebRTC | P2P 穿透率 > 80% |
+| **拥塞控制** | ❌ 无 | ✅ **`src/bento/net` 已有 BBR / NewReno** | **有，但无「延迟梯度」** |
+| **Pacer** | ❌ 无 | ✅ **已有 Pacer**（debt 模型） | **已有** |
+| **FEC** | ❌ 无 | ✅ **已有 XOR / Cauchy-RS FEC** | **有，但无「按丢包率闭环调冗余度」** |
+| **Jitter Buffer** | ❌ 无 | ✅ **`src/media` 已有自适应**（`target = clamp(base + J×factor)`） | **已有** |
+| **NAT 穿透** | ❌ 无 | ✅ **`src/p2p` 已有 STUN/TURN/打洞** | **已有** |
+| **多路复用** | ✅ 已有 | ✅ `mux`（HTTP/2 风格） | 已有 |
+| **QoS 分级** | ❌ 无 | ❌ **仍无**（`http2/connection.hpp:37` 解析 PRIORITY 但不调度；`mux.hpp:24-27` 队列满即关流，应改丢旧保新） | **缺** |
 
----
+**真正缺的只有 4 个**：
+
+| # | 缺口 | 为什么重要 |
+|---|---|---|
+| **G1** | **延迟梯度（GCC / trendline）** | 现有 BBR 是**基于丢包**的；**延迟上升时无法提前降速**（丢包才降 = 已经卡了） |
+| **G2** | **重排直方图**（NACK 误重传抑制） | 无它 → **乱序被当丢包** → 重传风暴 |
+| **G3** | **ICE restart / 候选对热切换** | 无它 → **WiFi→4G 必须断连重连**（当前 `WS Resume` 是重连，不是迁移） |
+| **G4** | **自适应 FEC 冗余度** | 有 FEC 但**固定冗余** → 好网浪费带宽、差网保护不足 |
+
+## 四、任务分解（**2026-11-08 按源码事实重排**）
+
+| # | 任务 | 参考 | 验收 | 前置 |
+|---|---|---|---|---|
+| **P0-1** | **延迟梯度 BWE（GCC / trendline）** | WebRTC `delay_based_bwe.cc` + `trendline_estimator.cc`；AIMD `α=1.08/s, β=0.85, 降后 hold` | 在「延迟上升但未丢包」时**提前降速**（对比 BBR 的「丢包才降」） | 复用已有 Pacer 的发送记录 |
+| **P0-2** | **重排直方图（NACK 抑制）** | WebRTC `nack_requester.cc` 的 **50% 分位** | 乱序场景下**重传率 < 5%**（当前会把乱序当丢包） | 需要 seq 记录 |
+| **P0-3** | **QoS 分级（三档）** | `docs/research/embodied-ai-qos.md`（`P0 control` <64B/20-50Hz/可靠但丢旧；`P1 state`；`P2 bulk`） | 关键流 **P99 不受大包影响** | 需要帧头加 `class`+`sent_at` |
+| **P0-4** | **自适应 FEC 冗余度** | WebRTC `fec_controller_default.cc`（按滤波丢包率闭环，**总开销 ≤50%**） | 1%/10% 丢包下**冗余度自动匹配** | 复用已有 FEC |
+| **P1-1** | **ICE restart / 候选对热切换** | WebRTC `basic_ice_controller.cc` | WiFi→4G **<1s 恢复**（当前要重连） | 复用已有 `src/p2p` |
+| **P1-2** | **快照插值** | `docs/research/game-framework-public-network.md`（**2 tick ≈ 33ms，不外推**） | 10Hz 快照视觉平滑 | — |
+| **P2** | **action chunking（批量预取）** | `docs/research/embodied-ai-qos.md`（π0 的 H=50） | 公网 >100ms 时**有效吞吐不塌** | — |
 
 ## 五、验收方法（**公网，不是内网**）
 
