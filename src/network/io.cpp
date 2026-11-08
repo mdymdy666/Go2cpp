@@ -62,7 +62,7 @@ std::unordered_map<IOBackend*, const void*>& backend_owners() {
     return owners;
 }
 
-bool descriptor_is_open(int fd) noexcept {
+bool descriptor_is_open(std::intptr_t fd) noexcept {
     if (fd < 0) {
         errno = EBADF;
         return false;
@@ -71,9 +71,9 @@ bool descriptor_is_open(int fd) noexcept {
     // 错误误判为“仍打开”会把无效 fd 注册到 epoll，最终造成永久等待。
     for (;;) {
 #ifdef SYS_fcntl
-        const long result = ::syscall(SYS_fcntl, fd, F_GETFD);
+        const long result = ::syscall(SYS_fcntl, static_cast<int>(fd), F_GETFD);
 #else
-        const int result = ::fcntl(fd, F_GETFD);
+        const int result = ::fcntl(static_cast<int>(fd), F_GETFD);
 #endif
         if (result >= 0) return true;
         if (errno == EINTR) continue;
@@ -98,7 +98,7 @@ std::uint32_t event_mask(IOEvent event) noexcept {
 /// @param[in] event 读或写事件。
 /// @param[in] expected_descriptor 可选的 fd 代际令牌。
 /// @return 返回 ready、timeout 或错误状态。
-WaitResult probe_immediate(int fd, IOEvent event,
+WaitResult probe_immediate(std::intptr_t fd, IOEvent event,
                            const DescriptorTokenPtr& expected_descriptor) {
     if (event_mask(event) == 0) return {WaitStatus::kError, EINVAL};
     if ((expected_descriptor &&
@@ -107,7 +107,8 @@ WaitResult probe_immediate(int fd, IOEvent event,
         return {WaitStatus::kError, EBADF};
     }
     pollfd descriptor{};
-    descriptor.fd = fd;
+    // Linux poll(2) 的 fd 字段是 int；Linux 句柄必在 int 范围，显式收窄。
+    descriptor.fd = static_cast<int>(fd);
     descriptor.events = event == IOEvent::kRead
                             ? static_cast<short>(POLLIN | POLLPRI)
                             : POLLOUT;
@@ -179,13 +180,14 @@ struct DescriptorRegistryState {
         /// @brief 保护 tokens 与 next_generation；Capture/Invalidate/close hook 竞争它。
         std::recursive_mutex mutex;
         /// @brief fd → 令牌弱引用；`expired()` 的条目在 token 析构时被顺手清理。
-        std::unordered_map<int, std::weak_ptr<DescriptorToken>> tokens;
+        std::unordered_map<std::intptr_t, std::weak_ptr<DescriptorToken>> tokens;
         /// @brief 本条带的下一个代际号；fd 复用（close 后同号重开）时递增。
         std::uint64_t next_generation{0};
     };
-    Stripe& stripe_for(int fd) noexcept {
+    Stripe& stripe_for(std::intptr_t fd) noexcept {
+        // 条带只需低位分布，不要求唯一：按句柄位模式的低位取模。
         return stripes[static_cast<std::size_t>(
-                           static_cast<unsigned int>(fd)) &
+                           static_cast<std::uintptr_t>(fd)) &
                        (kStripeCount - 1)];
     }
     /// @brief 64 个条带；`fd & 63` 定位（掩码避免除法），同一 fd 永远落同一条带。
@@ -198,7 +200,7 @@ std::shared_ptr<DescriptorRegistryState> descriptor_registry() {
     return s_registry;
 }
 
-using CloseCallback = std::function<void(int)>;
+using CloseCallback = std::function<void(std::intptr_t)>;
 std::unordered_map<Scheduler*, CloseCallback>& close_registry() {
     static std::unordered_map<Scheduler*, CloseCallback> s_registry;
     return s_registry;
@@ -206,7 +208,7 @@ std::unordered_map<Scheduler*, CloseCallback>& close_registry() {
 }  // namespace
 
 DescriptorToken::DescriptorToken(
-    int fd, std::uint64_t generation,
+    std::intptr_t fd, std::uint64_t generation,
     std::weak_ptr<DescriptorRegistryState> registry)
     : m_fd(fd), m_generation(generation), m_registry(std::move(registry)) {}
 
@@ -221,12 +223,12 @@ DescriptorToken::~DescriptorToken() {
     }
 }
 
-DescriptorGuard::DescriptorGuard(int fd)
+DescriptorGuard::DescriptorGuard(std::intptr_t fd)
     : m_state(descriptor_registry()),
       m_lock(m_state->stripe_for(fd).mutex) {}
 DescriptorGuard::~DescriptorGuard() = default;
 
-DescriptorTokenPtr DescriptorGuard::Capture(int fd) {
+DescriptorTokenPtr DescriptorGuard::Capture(std::intptr_t fd) {
     DescriptorGuard guard(fd);
     auto& stripe = guard.m_state->stripe_for(fd);
     if (!descriptor_is_open(fd)) {
@@ -249,7 +251,7 @@ DescriptorTokenPtr DescriptorGuard::Capture(int fd) {
     return token;
 }
 
-void DescriptorGuard::Invalidate(int fd) noexcept {
+void DescriptorGuard::Invalidate(std::intptr_t fd) noexcept {
     DescriptorGuard guard(fd);
     auto& stripe = guard.m_state->stripe_for(fd);
     const auto found = stripe.tokens.find(fd);
@@ -307,16 +309,21 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
     // 队列迟到的旧事件；fd 仍在 State::m_mutex 下重新查找，关闭后复用
     // 时不会解引用悬空指针。token=0 保留给内部 eventfd。
     static constexpr std::uint64_t kRegistrationSequenceMask = 0xffffffffULL;
-    static std::uint64_t make_registration_token(int fd,
+    /// @warning token 只有 64 位：高 32 位编码 fd、低 32 位编码注册序号。
+    ///          Linux 的 fd 必然是 int 范围，因此无损；**Windows 的 `SOCKET` 是
+    ///          64 位，无法塞进 32 位** —— 该平台的 IOManager 事件路由需要改成
+    ///          「节点 id / 指针」载荷（后端已经把 token 原样回传，改法是局部的，
+    ///          但与句柄类型无关，尚未在本轮完成）。这里保留 Linux 语义不变。
+    static std::uint64_t make_registration_token(std::intptr_t fd,
                                                   std::uint64_t sequence) noexcept {
         const auto fd_bits = static_cast<std::uint64_t>(
             static_cast<std::uint32_t>(fd) + 1U);
         const auto sequence_bits = sequence & kRegistrationSequenceMask;
         return (fd_bits << 32U) | (sequence_bits == 0 ? 1U : sequence_bits);
     }
-    static int token_fd(std::uint64_t token) noexcept {
+    static std::intptr_t token_fd(std::uint64_t token) noexcept {
         const auto fd_bits = static_cast<std::uint32_t>(token >> 32U);
-        return fd_bits == 0 ? -1 : static_cast<int>(fd_bits - 1U);
+        return fd_bits == 0 ? -1 : static_cast<std::intptr_t>(fd_bits - 1U);
     }
     /**
      * @brief 一个 fd 等待请求（挂在 `FdSlot::readers` / `writers` 队列里）。
@@ -349,7 +356,7 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
         /// @brief 全局单调节点 id；同时作为 `m_deadline_index` 的键。
         std::uint64_t id{0};
         /// @brief 等待的 fd（-1 表示已失效）。
-        int fd{-1};
+        std::intptr_t fd{-1};
         /// @brief 注册时的 fd 代际；与 slot/descriptor 对不上就丢弃事件。
         std::uint64_t generation{0};
         /// @brief 等读还是等写（决定挂 readers 还是 writers 队列）。
@@ -618,7 +625,7 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
      */
     struct FdSlot {
         /// @brief 该槽位对应的 fd（-1 表示空）。
-        int fd{-1};
+        std::intptr_t fd{-1};
         /// @brief 代际号；与 `DescriptorToken` 对齐，用于拒绝 close/dup2 后的迟到事件。
         std::uint64_t generation{0};
         // 强引用跨越同一 fd 的多轮等待，避免每次注册重新分配
@@ -837,7 +844,7 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
      * - 失败语义：不抛异常（新节点分配失败经 error 回 ENOMEM）；失败时节点未入队，容器保持原状。
      * - 不变量：返回非空节点时该节点在对应读写队列中恰好出现一次；返回 nullptr 时队列与 epoll 注册均无变化。
      */
-    NodePtr register_wait(int fd, IOEvent event,
+    NodePtr register_wait(std::intptr_t fd, IOEvent event,
                           std::optional<TimePoint> deadline, int* error,
                           DescriptorTokenPtr expected_descriptor) {
         // Hook 调用通常已经捕获了代际 token。此路径不再重复取得全局
@@ -1225,17 +1232,17 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
         return true;
     }
 
-    bool cancel(int fd, IOEvent event) noexcept {
+    bool cancel(std::intptr_t fd, IOEvent event) noexcept {
         return finish_fd(fd, event, false, WaitStatus::kCancelled,
                          ECANCELED);
     }
 
-    bool cancel_all(int fd) noexcept {
+    bool cancel_all(std::intptr_t fd) noexcept {
         return finish_fd(fd, IOEvent::kRead, true, WaitStatus::kCancelled,
                          ECANCELED);
     }
 
-    bool notify_close(int fd) noexcept {
+    bool notify_close(std::intptr_t fd) noexcept {
         WakeList wake;
         bool found_slot = false;
         {
@@ -1532,7 +1539,7 @@ private:
     void process_event_locked(std::uint64_t registration_id,
                               std::uint32_t events,
                               WakeList& wake) noexcept {
-            const int fd = token_fd(registration_id);
+            const std::intptr_t fd = token_fd(registration_id);
             SlotStripe& stripe = stripe_for(fd);
             const auto registration = stripe.slots.find(fd);
             if (registration == stripe.slots.end()) {
@@ -1608,7 +1615,7 @@ private:
                        std::uint32_t events) noexcept {
         WakeList wake;
         {
-            const int fd = token_fd(registration_id);
+            const std::intptr_t fd = token_fd(registration_id);
             SlotStripe& stripe = stripe_for(fd);
             std::lock_guard<std::mutex> lock(stripe.mutex);
             process_event_locked(registration_id, events, wake);
@@ -1666,7 +1673,7 @@ private:
             if (events[index].token == kWakeRegistration) {
                 continue;
             }
-            const int event_fd = token_fd(events[index].token);
+            const std::intptr_t event_fd = token_fd(events[index].token);
             SlotStripe& stripe = stripe_for(event_fd);
             std::lock_guard<std::mutex> lock(stripe.mutex);
             process_event_locked(events[index].token, events[index].events,
@@ -2237,7 +2244,7 @@ private:
         }
     }
 
-    bool finish_fd(int fd, IOEvent event, bool both, WaitStatus status,
+    bool finish_fd(std::intptr_t fd, IOEvent event, bool both, WaitStatus status,
                    int system_error) noexcept {
         WakeList wake;
         bool had_waiter = false;
@@ -2321,14 +2328,14 @@ private:
         /// @brief 保护本条带的 slots 与 next_generation；register_wait/complete/notify_close 竞争它。
         mutable std::mutex mutex;
         /// @brief fd → 等待状态；没有条目表示该 fd 当前没有等待者（或槽位已被回收）。
-        std::unordered_map<int, std::unique_ptr<FdSlot>> slots;
+        std::unordered_map<std::intptr_t, std::unique_ptr<FdSlot>> slots;
         /// @brief 本条带的下一个代际号；close/dup2 时递增，用于拒绝迟到事件。
         std::uint64_t next_generation{0};
     };
     /// @brief 取 fd 所属条带（`fd & 63`）；同一 fd 永远落在同一条带，取模用掩码避免除法。
-    SlotStripe& stripe_for(int fd) noexcept {
+    SlotStripe& stripe_for(std::intptr_t fd) noexcept {
         return m_stripes[static_cast<std::size_t>(
-                             static_cast<unsigned int>(fd)) &
+                             static_cast<std::uintptr_t>(fd)) &
                          (kSlotStripeCount - 1)];
     }
     std::array<SlotStripe, kSlotStripeCount> m_stripes;
@@ -2382,7 +2389,7 @@ private:
 
     /// 当前 fd/方向上排队等待的 G 数（资源事件的 waiters 字段）。
     /// 只在 GO2CPP_DEBUG_RESOURCES 打开时被事件宏求值；OFF 构建返回 0。
-    std::uint32_t waiter_depth(int fd, IOEvent event) noexcept {
+    std::uint32_t waiter_depth(std::intptr_t fd, IOEvent event) noexcept {
 #if GO2CPP_DEBUG_RESOURCES
         SlotStripe& stripe = stripe_for(fd);
         std::lock_guard<std::mutex> lock(stripe.mutex);
@@ -2432,7 +2439,7 @@ IOManager::IOManager(SchedulerConfig config, IOBackendPtr backend)
     std::lock_guard<std::mutex> lock(manager_registry_mutex());
     manager_registry()[&m_scheduler] = this;
     const std::weak_ptr<State> weak_state(m_state);
-    close_registry()[&m_scheduler] = [weak_state](int fd) {
+    close_registry()[&m_scheduler] = [weak_state](std::intptr_t fd) {
         if (const auto state = weak_state.lock()) {
             (void)state->notify_close(fd);
         }
@@ -2542,7 +2549,7 @@ std::shared_ptr<Task> IOManager::go(Task::Function function) {
  * - 失败语义：不抛异常（内部 catch 全部转错误码）；失败后节点已回收，fd 上不留注册残留。
  * - 不变量：返回 kReady 时该 fd 在返回瞬间是就绪的（可能被其它线程抢先消费）；返回后本函数不再持有节点所有权。
  */
-WaitResult IOManager::wait(int fd, IOEvent event,
+WaitResult IOManager::wait(std::intptr_t fd, IOEvent event,
                            std::optional<TimePoint> deadline,
                            ContextPtr context,
                            DescriptorTokenPtr expected_descriptor) {
@@ -2696,7 +2703,7 @@ WaitResult IOManager::wait(int fd, IOEvent event,
     return result;
 }
 
-WaitResult IOManager::wait_for(int fd, IOEvent event, Duration timeout,
+WaitResult IOManager::wait_for(std::intptr_t fd, IOEvent event, Duration timeout,
                                ContextPtr context) {
     const auto now = Clock::now();
     const auto remaining = TimePoint::max() - now;
@@ -3198,21 +3205,21 @@ WaitManyResult IOManager::wait_many_for(
     return wait_many(requests, deadline, std::move(context));
 }
 
-bool IOManager::cancel(int fd, IOEvent event) {
+bool IOManager::cancel(std::intptr_t fd, IOEvent event) {
     return event_mask(event) != 0 && m_state && m_state->cancel(fd, event);
 }
 
-bool IOManager::cancel_all(int fd) {
+bool IOManager::cancel_all(std::intptr_t fd) {
     return m_state && m_state->cancel_all(fd);
 }
 
-bool IOManager::notify_close(int fd) {
+bool IOManager::notify_close(std::intptr_t fd) {
     DescriptorGuard guard(fd);
     DescriptorGuard::Invalidate(fd);
     return m_state && m_state->notify_close(fd);
 }
 
-void IOManager::NotifyCloseAll(int fd) noexcept {
+void IOManager::NotifyCloseAll(std::intptr_t fd) noexcept {
     DescriptorGuard guard(fd);
     DescriptorGuard::Invalidate(fd);
     std::vector<CloseCallback> callbacks;

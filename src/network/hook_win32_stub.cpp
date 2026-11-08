@@ -33,7 +33,7 @@ bool enabled() noexcept { return false; }
 void bind_io_manager(IOManager* /*manager*/) noexcept {}
 IOManager* bound_io_manager() noexcept { return nullptr; }
 
-void mark_system_nonblocking(int /*fd*/) noexcept {}
+void mark_system_nonblocking(std::intptr_t /*fd*/) noexcept {}
 
 void set_connect_timeout(std::chrono::milliseconds /*timeout*/) noexcept {}
 std::chrono::milliseconds connect_timeout() noexcept {

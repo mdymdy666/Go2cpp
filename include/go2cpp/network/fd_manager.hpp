@@ -25,8 +25,8 @@ namespace go2cpp::net {
  */
 class FdContext final {
 public:
-    explicit FdContext(int fd) noexcept : m_fd(fd) {}
-    int fd() const noexcept { return m_fd; }
+    explicit FdContext(std::intptr_t fd) noexcept : m_fd(fd) {}
+    std::intptr_t fd() const noexcept { return m_fd; }
     bool initialized() const noexcept { return m_initialized; }
     bool closed() const noexcept { return m_closed; }
     bool user_nonblock() const noexcept { return m_user_nonblock; }
@@ -35,7 +35,7 @@ public:
     std::chrono::milliseconds send_timeout() const noexcept { return m_send_timeout; }
 
 private:
-    int m_fd;
+    std::intptr_t m_fd;
     bool m_initialized{false};
     bool m_closed{false};
     bool m_user_nonblock{false};
@@ -52,19 +52,19 @@ public:
     static FdManager& instance() noexcept;
 
     /** @brief 获取 fd 元数据，auto_create 为真时首次自动创建。 */
-    ContextPtr get(int fd, bool auto_create = true);
+    ContextPtr get(std::intptr_t fd, bool auto_create = true);
     /** @brief 删除 fd 元数据并标记旧对象关闭。 */
-    void erase(int fd) noexcept;
+    void erase(std::intptr_t fd) noexcept;
     /** @brief 将 old_fd 的用户状态复制给 new_fd。 */
-    ContextPtr duplicate(int old_fd, int new_fd);
+    ContextPtr duplicate(std::intptr_t old_fd, std::intptr_t new_fd);
     /** @brief 更新非阻塞和超时状态。 */
-    bool set_nonblock(int fd, bool user, bool system);
-    bool set_timeout(int fd, bool receive, std::chrono::milliseconds timeout);
+    bool set_nonblock(std::intptr_t fd, bool user, bool system);
+    bool set_timeout(std::intptr_t fd, bool receive, std::chrono::milliseconds timeout);
 
 private:
     FdManager() = default;
     std::mutex m_mutex;
-    std::unordered_map<int, ContextPtr> m_contexts;
+    std::unordered_map<std::intptr_t, ContextPtr> m_contexts;
 };
 
 }  // namespace go2cpp::net

@@ -49,10 +49,10 @@ public:
      * @param token 一次性代际令牌。 @param modify 是否修改已有注册。
      * @return 成功 0，否则 errno 风格错误码。
      */
-    virtual int add_or_modify(int fd, std::uint32_t interest,
+    virtual int add_or_modify(std::intptr_t fd, std::uint32_t interest,
                               std::uint64_t token, bool modify) noexcept = 0;
     /** @brief 移除 fd 注册；目标已不存在时也返回 0。 */
-    virtual int remove(int fd) noexcept = 0;
+    virtual int remove(std::intptr_t fd) noexcept = 0;
     /**
      * @brief 等待就绪事件。
      * @param output 输出数组（容量必须大于 0）。 @param capacity 数组容量。

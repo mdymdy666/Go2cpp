@@ -60,7 +60,7 @@ struct SocketEvent {
     std::uint64_t seq{0};         ///< 本 fd 内的事件序号，从 1 开始。
     std::uint64_t ts_ns{0};       ///< steady_clock 纳秒时间戳。
     SocketEventKind kind{SocketEventKind::kError};
-    int fd{-1};                   ///< 事件归属的 fd（关闭后归档仍保留原值）。
+    std::intptr_t fd{-1};         ///< 事件归属的 fd（关闭后归档仍保留原值）。
     int error{0};                 ///< 失败时的 errno；成功为 0。
     std::uint64_t bytes{0};       ///< 本次成功收发的字节数（accept/close 为 0）。
     std::uint64_t elapsed_ns{0};  ///< 仅 connect 事件填写：连接耗时。
@@ -68,7 +68,7 @@ struct SocketEvent {
 
 /** @brief 一个 fd 的累计账本，`Snapshot(fd)` 返回它的副本。 */
 struct SocketStats {
-    int fd{-1};                    ///< 归档/活条目对应的 fd；未知 fd 时为 -1。
+    std::intptr_t fd{-1};          ///< 归档/活条目对应的 fd；未知 fd 时为 -1。
     bool tracked{false};           ///< false 表示该 fd 从未被记录过。
     bool closed{false};            ///< true 表示已 close 并进入归档窗口。
     std::uint64_t bytes_sent{0};
@@ -122,10 +122,11 @@ public:
 
     /// @brief 取某 fd 的账本副本；未知 fd 返回默认值（`fd == -1`）。
     /// @note 已关闭但在归档窗口内的 fd 仍可查到，`closed == true`。
-    static SocketStats Snapshot(int fd) noexcept;
+    static SocketStats Snapshot(std::intptr_t fd) noexcept;
     /// @brief 取某 fd 最近的事件（按 seq/时间升序）。
     /// @param max_events 0 表示最多 256 条；大于 256 时按 256 截断。
-    static std::vector<SocketEvent> Events(int fd, std::size_t max_events = 0);
+    static std::vector<SocketEvent> Events(std::intptr_t fd,
+                                           std::size_t max_events = 0);
     /// @brief 把当前账本渲染成多行文本（dump 路径允许分配）。
     static void DumpTo(std::string& out);
     /// @brief `DumpTo` 的返回值版本，便于测试与日志直接使用。
@@ -137,15 +138,16 @@ public:
 
     // ---- 内部记账接口：只允许 src/network/socket.cpp 调用 ----
     /// @brief accept 成功：登记新连接 fd 并记一条 kAccept。
-    static void RecordAccept(int fd) noexcept;
+    static void RecordAccept(std::intptr_t fd) noexcept;
     /// @brief connect 返回：`error == 0` 记成功，否则按 errno 记 kError/kTimeout。
-    static void RecordConnect(int fd, int error, std::uint64_t elapsed_ns) noexcept;
+    static void RecordConnect(std::intptr_t fd, int error,
+                              std::uint64_t elapsed_ns) noexcept;
     /// @brief recv 返回：`bytes` 为本次实际收到的字节数。
-    static void RecordRead(int fd, std::uint64_t bytes, int error) noexcept;
+    static void RecordRead(std::intptr_t fd, std::uint64_t bytes, int error) noexcept;
     /// @brief send 返回：`bytes` 为本次实际发出的字节数。
-    static void RecordWrite(int fd, std::uint64_t bytes, int error) noexcept;
+    static void RecordWrite(std::intptr_t fd, std::uint64_t bytes, int error) noexcept;
     /// @brief close 完成：活条目转入归档窗口并记一条 kClose。
-    static void RecordClose(int fd) noexcept;
+    static void RecordClose(std::intptr_t fd) noexcept;
 };
 
 /**
@@ -180,8 +182,8 @@ public:
     static bool Enabled() noexcept { return false; }
     static constexpr bool Available() noexcept { return false; }
 
-    static SocketStats Snapshot(int) noexcept { return {}; }
-    static std::vector<SocketEvent> Events(int, std::size_t = 0) { return {}; }
+    static SocketStats Snapshot(std::intptr_t) noexcept { return {}; }
+    static std::vector<SocketEvent> Events(std::intptr_t, std::size_t = 0) { return {}; }
     static void DumpTo(std::string& out) {
         out.assign("socket_debug: unavailable (GO2CPP_DEBUG_SOCKET=OFF)\n");
     }
@@ -191,11 +193,11 @@ public:
     static std::size_t TrackedCount() noexcept { return 0; }
     static void Reset() noexcept {}
 
-    static void RecordAccept(int) noexcept {}
-    static void RecordConnect(int, int, std::uint64_t) noexcept {}
-    static void RecordRead(int, std::uint64_t, int) noexcept {}
-    static void RecordWrite(int, std::uint64_t, int) noexcept {}
-    static void RecordClose(int) noexcept {}
+    static void RecordAccept(std::intptr_t) noexcept {}
+    static void RecordConnect(std::intptr_t, int, std::uint64_t) noexcept {}
+    static void RecordRead(std::intptr_t, std::uint64_t, int) noexcept {}
+    static void RecordWrite(std::intptr_t, std::uint64_t, int) noexcept {}
+    static void RecordClose(std::intptr_t) noexcept {}
 };
 
 #define GO2CPP_SOCKET_DEBUG_RECORD(statement) \

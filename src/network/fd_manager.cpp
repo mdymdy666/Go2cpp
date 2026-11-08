@@ -13,7 +13,7 @@ FdManager& FdManager::instance() noexcept {
     return manager;
 }
 
-FdManager::ContextPtr FdManager::get(int fd, bool auto_create) {
+FdManager::ContextPtr FdManager::get(std::intptr_t fd, bool auto_create) {
     if (fd < 0) return {};
     std::lock_guard<std::mutex> lock(m_mutex);
     auto found = m_contexts.find(fd);
@@ -25,7 +25,7 @@ FdManager::ContextPtr FdManager::get(int fd, bool auto_create) {
     return result;
 }
 
-void FdManager::erase(int fd) noexcept {
+void FdManager::erase(std::intptr_t fd) noexcept {
     std::lock_guard<std::mutex> lock(m_mutex);
     auto found = m_contexts.find(fd);
     if (found != m_contexts.end()) {
@@ -34,7 +34,8 @@ void FdManager::erase(int fd) noexcept {
     }
 }
 
-FdManager::ContextPtr FdManager::duplicate(int old_fd, int new_fd) {
+FdManager::ContextPtr FdManager::duplicate(std::intptr_t old_fd,
+                                           std::intptr_t new_fd) {
     std::lock_guard<std::mutex> lock(m_mutex);
     auto old = m_contexts.find(old_fd);
     if (old == m_contexts.end()) {
@@ -51,7 +52,7 @@ FdManager::ContextPtr FdManager::duplicate(int old_fd, int new_fd) {
     return result;
 }
 
-bool FdManager::set_nonblock(int fd, bool user, bool system) {
+bool FdManager::set_nonblock(std::intptr_t fd, bool user, bool system) {
     auto context = get(fd, true);
     if (!context) return false;
     std::lock_guard<std::mutex> lock(m_mutex);
@@ -60,7 +61,8 @@ bool FdManager::set_nonblock(int fd, bool user, bool system) {
     return true;
 }
 
-bool FdManager::set_timeout(int fd, bool receive, std::chrono::milliseconds timeout) {
+bool FdManager::set_timeout(std::intptr_t fd, bool receive,
+                            std::chrono::milliseconds timeout) {
     auto context = get(fd, true);
     if (!context || timeout.count() < 0) return false;
     std::lock_guard<std::mutex> lock(m_mutex);

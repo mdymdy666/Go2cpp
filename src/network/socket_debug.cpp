@@ -70,7 +70,7 @@ struct AtomicStats {
 struct Entry {
     explicit Entry(int descriptor) noexcept : fd(descriptor) {}
 
-    const int fd;
+    const std::intptr_t fd;
     AtomicStats stats;
     mutable std::mutex event_mutex;  ///< 保护 events/write_index/next_seq/recorded。
     std::array<SocketEvent, kRingCapacity> events{};
@@ -82,7 +82,7 @@ struct Entry {
 
 // 全局注册表：活条目与最近关闭的归档条目共用一把读写锁。
 std::shared_mutex g_registry_mutex;
-std::unordered_map<int, std::shared_ptr<Entry>> g_live;
+std::unordered_map<std::intptr_t, std::shared_ptr<Entry>> g_live;
 std::deque<std::pair<int, std::shared_ptr<Entry>>> g_finished;  // 最近关闭优先。
 std::atomic<std::uint64_t> g_dropped{0};
 
@@ -92,14 +92,14 @@ inline void Add(std::atomic<std::uint64_t>& counter,
 }
 
 /// @brief 在活表中查找（不创建）。
-std::shared_ptr<Entry> FindLive(int fd) noexcept {
+std::shared_ptr<Entry> FindLive(std::intptr_t fd) noexcept {
     std::shared_lock<std::shared_mutex> lock(g_registry_mutex);
     const auto found = g_live.find(fd);
     return found == g_live.end() ? std::shared_ptr<Entry>{} : found->second;
 }
 
 /// @brief 活表优先、归档兜底；`Snapshot/Events` 都走这里。
-std::shared_ptr<Entry> FindAny(int fd) noexcept {
+std::shared_ptr<Entry> FindAny(std::intptr_t fd) noexcept {
     std::shared_lock<std::shared_mutex> lock(g_registry_mutex);
     const auto found = g_live.find(fd);
     if (found != g_live.end()) {
@@ -119,7 +119,7 @@ std::shared_ptr<Entry> FindAny(int fd) noexcept {
  * @details 双重检查：热路径先用 shared_lock 命中已有条目；只有首次出现某个
  *          fd 时才升级到 unique_lock。注册表满时不再新建，计入 dropped。
  */
-std::shared_ptr<Entry> EnsureEntry(int fd) noexcept {
+std::shared_ptr<Entry> EnsureEntry(std::intptr_t fd) noexcept {
     if (fd < 0) {
         return {};
     }
@@ -237,7 +237,7 @@ void SocketDebug::Disable() noexcept {
     detail::g_socket_debug_enabled.store(false, std::memory_order_relaxed);
 }
 
-SocketStats SocketDebug::Snapshot(int fd) noexcept {
+SocketStats SocketDebug::Snapshot(std::intptr_t fd) noexcept {
     const auto entry = FindAny(fd);
     if (!entry) {
         return {};
@@ -245,7 +245,8 @@ SocketStats SocketDebug::Snapshot(int fd) noexcept {
     return MakeStats(*entry);
 }
 
-std::vector<SocketEvent> SocketDebug::Events(int fd, std::size_t max_events) {
+std::vector<SocketEvent> SocketDebug::Events(std::intptr_t fd,
+                                             std::size_t max_events) {
     std::vector<SocketEvent> result;
     const auto entry = FindAny(fd);
     if (!entry) {
@@ -321,7 +322,7 @@ void SocketDebug::Reset() noexcept {
     g_dropped.store(0, std::memory_order_relaxed);
 }
 
-void SocketDebug::RecordAccept(int fd) noexcept {
+void SocketDebug::RecordAccept(std::intptr_t fd) noexcept {
     if (!Enabled()) {
         return;
     }
@@ -333,7 +334,7 @@ void SocketDebug::RecordAccept(int fd) noexcept {
     PushEvent(entry, SocketEventKind::kAccept, 0, 0, 0);
 }
 
-void SocketDebug::RecordConnect(int fd, int error,
+void SocketDebug::RecordConnect(std::intptr_t fd, int error,
                                 std::uint64_t elapsed_ns) noexcept {
     if (!Enabled()) {
         return;
@@ -358,7 +359,7 @@ void SocketDebug::RecordConnect(int fd, int error,
     PushEvent(entry, kind, error, 0, elapsed_ns);
 }
 
-void SocketDebug::RecordRead(int fd, std::uint64_t bytes,
+void SocketDebug::RecordRead(std::intptr_t fd, std::uint64_t bytes,
                              int error) noexcept {
     if (!Enabled()) {
         return;
@@ -380,7 +381,7 @@ void SocketDebug::RecordRead(int fd, std::uint64_t bytes,
     PushEvent(entry, kind, error, bytes, 0);
 }
 
-void SocketDebug::RecordWrite(int fd, std::uint64_t bytes,
+void SocketDebug::RecordWrite(std::intptr_t fd, std::uint64_t bytes,
                               int error) noexcept {
     if (!Enabled()) {
         return;
@@ -402,7 +403,7 @@ void SocketDebug::RecordWrite(int fd, std::uint64_t bytes,
     PushEvent(entry, kind, error, bytes, 0);
 }
 
-void SocketDebug::RecordClose(int fd) noexcept {
+void SocketDebug::RecordClose(std::intptr_t fd) noexcept {
     if (!Enabled()) {
         return;
     }

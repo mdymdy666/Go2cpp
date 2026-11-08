@@ -31,16 +31,16 @@ class DescriptorToken final {
 public:
     ~DescriptorToken();
     /** @brief 返回关联 fd。 */
-    int fd() const noexcept { return m_fd; }
+    std::intptr_t fd() const noexcept { return m_fd; }
     /** @brief 返回 fd 当前代际编号。 */
     std::uint64_t generation() const noexcept { return m_generation; }
     /** @brief 返回令牌是否仍有效。 */
     bool valid() const noexcept { return m_valid.load(std::memory_order_acquire); }
 
 private:
-    DescriptorToken(int fd, std::uint64_t generation,
+    DescriptorToken(std::intptr_t fd, std::uint64_t generation,
                     std::weak_ptr<DescriptorRegistryState> registry);
-    int m_fd;
+    std::intptr_t m_fd;
     std::uint64_t m_generation;
     std::atomic<bool> m_valid{true};
     std::weak_ptr<DescriptorRegistryState> m_registry;
@@ -72,14 +72,14 @@ public:
      * @param fd 需要保护的描述符；构造时锁住该 fd 所属的注册表条带。
      * @note 同一线程对同一 fd 可重复构造（条带锁是递归互斥量）。
      */
-    explicit DescriptorGuard(int fd);
+    explicit DescriptorGuard(std::intptr_t fd);
     ~DescriptorGuard();
     DescriptorGuard(const DescriptorGuard&) = delete;
     DescriptorGuard& operator=(const DescriptorGuard&) = delete;
     /** @brief 捕获 fd 当前代际令牌。 */
-    static DescriptorTokenPtr Capture(int fd);
+    static DescriptorTokenPtr Capture(std::intptr_t fd);
     /** @brief 使 fd 当前代际失效并唤醒相关等待。 */
-    static void Invalidate(int fd) noexcept;
+    static void Invalidate(std::intptr_t fd) noexcept;
 
 private:
     std::shared_ptr<DescriptorRegistryState> m_state;
@@ -123,7 +123,7 @@ struct WaitResult {
 // 用于把数字 fd 与捕获时的代际绑定，避免 close+复用后误唤醒旧等待。
 /** @brief wait_many 请求项。 */
 struct WaitRequest {
-    int fd{-1};
+    std::intptr_t fd{-1};
     IOEvent event{IOEvent::kRead};
     DescriptorTokenPtr expected_descriptor;
 };
@@ -136,7 +136,7 @@ struct WaitAnyResult {
     WaitStatus status{WaitStatus::kError};
     int system_error{0};
     std::size_t index{kNoIndex};
-    int fd{-1};
+    std::intptr_t fd{-1};
     IOEvent event{IOEvent::kRead};
 
     bool ready() const noexcept {
@@ -250,13 +250,13 @@ public:
     // 等待一个 fd 的读/写就绪。参数 fd 为数字描述符，event 为读或写，
     // deadline 是可选的单调时钟截止点，context 可取消等待，token 用于
     // 校验 fd 代际。返回 WaitResult：ready/timeout/cancelled/closed/error。
-    WaitResult wait(int fd, IOEvent event,
+    WaitResult wait(std::intptr_t fd, IOEvent event,
                     std::optional<TimePoint> deadline = std::nullopt,
                     ContextPtr context = {},
                     DescriptorTokenPtr expected_descriptor = {});
     // 以相对 timeout 等待 fd；timeout<=0 表示立即检查。其余参数和 wait
     // 相同，返回值携带最终状态及 errno。
-    WaitResult wait_for(int fd, IOEvent event, Duration timeout,
+    WaitResult wait_for(std::intptr_t fd, IOEvent event, Duration timeout,
                         ContextPtr context = {});
 
     // 一次等待多个 fd，返回第一个获胜项。requests 是 fd/方向请求列表，
@@ -276,12 +276,12 @@ public:
     WaitManyResult wait_many_for(const std::vector<WaitRequest>& requests,
                                  Duration timeout, ContextPtr context = {});
 
-    WaitResult Wait(int fd, IOEvent event,
+    WaitResult Wait(std::intptr_t fd, IOEvent event,
                     std::optional<TimePoint> deadline = std::nullopt,
                     ContextPtr context = {}) {
         return wait(fd, event, deadline, std::move(context));
     }
-    WaitResult WaitFor(int fd, IOEvent event, Duration timeout,
+    WaitResult WaitFor(std::intptr_t fd, IOEvent event, Duration timeout,
                        ContextPtr context = {}) {
         return wait_for(fd, event, timeout, std::move(context));
     }
@@ -307,21 +307,21 @@ public:
 
     // 取消指定 fd/方向的等待并返回是否找到等待者；不会关闭 fd。
     /** @brief 取消指定 fd 事件并唤醒等待 Fiber。 */
-    bool cancel(int fd, IOEvent event);
+    bool cancel(std::intptr_t fd, IOEvent event);
     /** @brief 取消 fd 的全部等待事件。 */
-    bool cancel_all(int fd);
-    bool Cancel(int fd, IOEvent event) { return cancel(fd, event); }
-    bool CancelAll(int fd) { return cancel_all(fd); }
+    bool cancel_all(std::intptr_t fd);
+    bool Cancel(std::intptr_t fd, IOEvent event) { return cancel(fd, event); }
+    bool CancelAll(std::intptr_t fd) { return cancel_all(fd); }
 
     // Hook 层在真实 close 前调用。当前等待者收到 kClosed/EBADF，旧 epoll
     // 载荷同时失效。
     /** @brief 通知 fd 即将关闭并清理全部等待节点。 */
-    bool notify_close(int fd);
-    bool NotifyClose(int fd) { return notify_close(fd); }
+    bool notify_close(std::intptr_t fd);
+    bool NotifyClose(std::intptr_t fd) { return notify_close(fd); }
     // Hook 使用的跨 IOManager 安全路由；回调只保留 State 弱引用，析构中
     // 不会解引用已经销毁的 IOManager。
     /** @brief 通知全部 IOManager 某 fd 已关闭。 */
-    static void NotifyCloseAll(int fd) noexcept;
+    static void NotifyCloseAll(std::intptr_t fd) noexcept;
 
     Scheduler& scheduler() noexcept { return m_scheduler; }
     const Scheduler& scheduler() const noexcept { return m_scheduler; }

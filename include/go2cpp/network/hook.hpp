@@ -78,7 +78,7 @@ inline IOManager* BoundIOManager() noexcept { return bound_io_manager(); }
  * @param fd 目标文件描述符；负值或未接管时无操作。
  * @note 只影响 Hook 的 park 判定，不改变内核 fd 标志。
  */
-void mark_system_nonblocking(int fd) noexcept;
+void mark_system_nonblocking(std::intptr_t fd) noexcept;
 
 /** @brief 设置 Hook connect 调用使用的默认超时。 */
 void set_connect_timeout(std::chrono::milliseconds timeout) noexcept;

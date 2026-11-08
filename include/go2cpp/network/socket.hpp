@@ -68,7 +68,7 @@ struct SendBatchEntry {
 class SocketWaiter {
 public:
     virtual ~SocketWaiter() = default;
-    virtual int wait(int fd, io::IOEvent event,
+    virtual int wait(std::intptr_t fd, io::IOEvent event,
                      std::chrono::milliseconds timeout) = 0;
 };
 
@@ -87,7 +87,7 @@ public:
     static Ptr CreateTCP(int family = AF_INET);
     static Ptr CreateUDP(int family = AF_INET);
     static Ptr CreateUnix(bool datagram = false);
-    static Ptr FromFd(int fd, int family, int type, int protocol = 0,
+    static Ptr FromFd(std::intptr_t fd, int family, int type, int protocol = 0,
                       bool owner = true);
     /**
      * @brief 给一个已建立的 TCP socket 开启 `TCP_NODELAY`（关闭 Nagle）。
@@ -98,7 +98,7 @@ public:
      *       本库在 `accept()` 里自动调用（见 `TcpNoDelayDefault()`），
      *       直接用 `::accept` 的协议实现（如 `Socks5Server`）需要自行调用。
      */
-    static bool SetTcpNoDelay(int fd) noexcept;
+    static bool SetTcpNoDelay(std::intptr_t fd) noexcept;
     /**
      * @brief 设置 `accept()` 返回的新 TCP 连接是否默认开启 `TCP_NODELAY`。
      * @details 默认开启。关闭只用于「修复前行为」的对比实验与回归定位；
@@ -119,7 +119,7 @@ public:
      *       读写、accept、connect、选项查询与地址查询都会自行固定 fd，
      *       **调用方不应跨操作持有本返回值**。
      */
-    int fd() const noexcept;
+    std::intptr_t fd() const noexcept;
     int family() const noexcept { return m_family; }
     int type() const noexcept { return m_type; }
     int protocol() const noexcept { return m_protocol; }
@@ -132,7 +132,7 @@ public:
      *          最后一个在途操作结束时关闭本对象拥有的 fd。
      * @return 成功移交的 fd；失败返回 -1。
      */
-    int release() noexcept;
+    std::intptr_t release() noexcept;
     void set_waiter(std::shared_ptr<SocketWaiter> waiter) noexcept;
 
     bool bind(const Address& address);
@@ -281,7 +281,7 @@ public:
      *       中途出错时返回已发送字节数（error=0），调用方按
      *       `transferred < count` 判断是否继续，文件偏移已由内核推进。
      */
-    SocketResult send_file(int in_fd, off_t* offset, std::size_t count,
+    SocketResult send_file(std::intptr_t in_fd, off_t* offset, std::size_t count,
                            Duration timeout = Duration::max());
 
     AddressPtr local_address() const;
@@ -333,7 +333,7 @@ private:
      *          `m_inflight_keepalive`，不再每次操作 `shared_from_this()`。
      *          与 `close()` 的线性化见 socket.cpp 的实现注释。
      */
-    bool begin_operation(int& fd) noexcept;
+    bool begin_operation(std::intptr_t& fd) noexcept;
     /** @brief 系统调用结束后减少 in-flight 计数并唤醒关闭者。 */
     void end_operation() noexcept;
     /** @brief 0→1 边界安装自引用；对象不由 shared_ptr 管理时返回 false。 */
@@ -349,26 +349,27 @@ private:
     void finalize_deferred_close() noexcept;
     /** @brief 查询 Socket 是否已经进入关闭/释放阶段。 */
     bool is_closing() const noexcept;
-    Socket(int family, int type, int protocol, int fd, bool owner);
+    Socket(int family, int type, int protocol, std::intptr_t fd, bool owner);
     bool init_nonblock();
-    int wait_ready(int fd, io::IOEvent event, Duration timeout,
+    int wait_ready(std::intptr_t fd, io::IOEvent event, Duration timeout,
                    std::uint64_t cancel_generation);
-    bool wait_or_retry(int fd, io::IOEvent event, Duration& remaining,
+    bool wait_or_retry(std::intptr_t fd, io::IOEvent event, Duration& remaining,
                        std::chrono::steady_clock::time_point started,
                        std::uint64_t cancel_generation);
-    SocketResult send_impl(int fd, const msghdr* message, int flags,
+    SocketResult send_impl(std::intptr_t fd, const msghdr* message, int flags,
                            Duration timeout, std::uint64_t cancel_generation);
-    SocketResult recv_impl(int fd, msghdr* message, int flags, Duration timeout,
+    SocketResult recv_impl(std::intptr_t fd, msghdr* message, int flags, Duration timeout,
                            std::uint64_t cancel_generation);
-    SocketResult recv_batch_impl(int fd, RecvBatchEntry* entries, std::size_t count,
+    SocketResult recv_batch_impl(std::intptr_t fd, RecvBatchEntry* entries, std::size_t count,
                                  int flags, Duration timeout,
                                  std::uint64_t cancel_generation);
-    SocketResult send_batch_impl(int fd, const SendBatchEntry* entries,
+    SocketResult send_batch_impl(std::intptr_t fd, const SendBatchEntry* entries,
                                  std::size_t count, int flags, Duration timeout,
                                  std::uint64_t cancel_generation);
-    SocketResult send_file_impl(int fd, int in_fd, off_t* offset, std::size_t count,
+    SocketResult send_file_impl(std::intptr_t fd, std::intptr_t in_fd, off_t* offset,
+                                std::size_t count,
                                 Duration timeout, std::uint64_t cancel_generation);
-    int m_fd{-1};
+    std::intptr_t m_fd{-1};
     int m_family{AF_UNSPEC};
     int m_type{0};
     int m_protocol{0};
@@ -394,7 +395,7 @@ private:
     // m_fd 的无锁只读快照：begin_operation 免锁取 fd；所有写 m_fd 的路径
     // （构造失败 / close / release / 延迟关闭）都必须在同一临界区内同步它，
     // 且顺序为「先置 m_closing_flag，再更新此快照」，见 socket.cpp。
-    std::atomic<int> m_fd_fast{-1};
+    std::atomic<std::intptr_t> m_fd_fast{-1};
     // 在途操作期间自持有对象，防止最后一个外部 shared_ptr 释放后提前析构。
     std::shared_ptr<Socket> m_inflight_keepalive;
     bool m_closing{false};

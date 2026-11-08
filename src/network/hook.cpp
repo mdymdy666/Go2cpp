@@ -1662,7 +1662,10 @@ namespace go2cpp::hook {
  *          退化成 Socket 层的 100ms 分片轮询（每片一次 DEL+ADD）。
  * @param fd 目标描述符；负值或无法接管时静默返回。
  */
-void mark_system_nonblocking(int fd) noexcept {
+void mark_system_nonblocking(std::intptr_t handle) noexcept {
+    // hook 层是 Linux 专有实现（LD_PRELOAD），Linux 的 fd 必在 int 范围；
+    // 内部仍按 int 处理，避免把 x86-64 的 64 位收窄动作扩散到整个文件。
+    const int fd = static_cast<int>(handle);
     if (fd < 0) {
         return;
     }

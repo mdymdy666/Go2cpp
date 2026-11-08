@@ -72,8 +72,8 @@ public:
     bool supports_one_shot() const noexcept override { return false; }
 
     /// 将统一读写兴趣转换为 epoll 事件并注册代际 token。
-    int add_or_modify(int fd, std::uint32_t interest, std::uint64_t token,
-                      bool modify) noexcept override {
+    int add_or_modify(std::intptr_t fd, std::uint32_t interest,
+                      std::uint64_t token, bool modify) noexcept override {
         if (m_epoll_fd < 0 || fd < 0 || token == kWakeToken) return EINVAL;
         // IOManager 每次只唤醒一个等待者，剩余等待者仍需要收到下一次就绪通知。
         // 水平触发可保证可读/可写状态仍然存在时重复发送事件。
@@ -90,19 +90,22 @@ public:
         }
         event.data.u64 = token;
         int operation = modify ? EPOLL_CTL_MOD : EPOLL_CTL_ADD;
-        if (::epoll_ctl(m_epoll_fd, operation, fd, &event) == 0) return 0;
+        // epoll 的 `epfd`/`fd` 参数在 Linux 上就是 int：句柄由 IOManager
+        // 以 std::intptr_t 承载，进入内核边界时显式收窄（Linux fd 必为 int 范围）。
+        const int native_fd = static_cast<int>(fd);
+        if (::epoll_ctl(m_epoll_fd, operation, native_fd, &event) == 0) return 0;
         const int first = errno ? errno : EIO;
         if (!modify && first == EEXIST) operation = EPOLL_CTL_MOD;
         else if (modify && first == ENOENT) operation = EPOLL_CTL_ADD;
         else return first;
-        if (::epoll_ctl(m_epoll_fd, operation, fd, &event) == 0) return 0;
+        if (::epoll_ctl(m_epoll_fd, operation, native_fd, &event) == 0) return 0;
         return errno ? errno : EIO;
     }
 
     /// 删除 fd 的 epoll 注册；fd 已关闭时按幂等删除处理。
-    int remove(int fd) noexcept override {
+    int remove(std::intptr_t fd) noexcept override {
         if (m_epoll_fd < 0 || fd < 0) return EINVAL;
-        if (::epoll_ctl(m_epoll_fd, EPOLL_CTL_DEL, fd, nullptr) == 0) return 0;
+        if (::epoll_ctl(m_epoll_fd, EPOLL_CTL_DEL, static_cast<int>(fd), nullptr) == 0) return 0;
         return errno == ENOENT || errno == EBADF ? 0 : (errno ? errno : EIO);
     }
 

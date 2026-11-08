@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdint>
 #include <vector>
 
 #include "go2cpp/network/io_backend.hpp"
@@ -53,8 +54,8 @@ class WsaPollBackend final : public IOBackend {
     return m_wake.Open();
   }
 
-  int add_or_modify(int fd, std::uint32_t interest, std::uint64_t token,
-                    bool modify) noexcept override {
+  int add_or_modify(std::intptr_t fd, std::uint32_t interest,
+                    std::uint64_t token, bool modify) noexcept override {
     if (fd < 0) return WSAEINVAL;
     for (auto& entry : m_entries) {
       if (entry.fd == fd) {
@@ -69,7 +70,7 @@ class WsaPollBackend final : public IOBackend {
     return 0;
   }
 
-  int remove(int fd) noexcept override {
+  int remove(std::intptr_t fd) noexcept override {
     for (auto it = m_entries.begin(); it != m_entries.end(); ++it) {
       if (it->fd == fd) {
         m_entries.erase(it);
@@ -86,7 +87,10 @@ class WsaPollBackend final : public IOBackend {
     const std::size_t batch = std::min(capacity, m_entries.size());
     m_scratch.resize(batch);
     for (std::size_t i = 0; i < batch; ++i) {
-      m_scratch[i].fd = static_cast<SOCKET>(m_entries[i].fd);
+      // 句柄按位模式还原：`std::intptr_t` 与 `SOCKET`（UINT_PTR）同宽，
+      // static_cast 走模转换、reinterpret_cast 走位模式，这里用后者避免
+      // 符号位影响诊断输出；两者生成的指令相同。
+      m_scratch[i].fd = reinterpret_cast<SOCKET>(m_entries[i].fd);
       m_scratch[i].events = InterestToEvents(m_entries[i].interest);
       m_scratch[i].revents = 0;
     }
@@ -142,7 +146,7 @@ class WsaPollBackend final : public IOBackend {
 
  private:
   struct Entry {
-    int fd;
+    std::intptr_t fd;
     std::uint32_t interest;
     std::uint64_t token;
   };

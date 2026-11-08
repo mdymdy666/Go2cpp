@@ -24,6 +24,7 @@
 #include <netinet/tcp.h>
 #include <sys/ioctl.h>
 #include <algorithm>
+#include <cstdint>
 #include <cstring>
 #include <climits>
 #include <optional>
@@ -33,6 +34,52 @@
 namespace go2cpp::net {
 
 namespace {
+// ---------------------------------------------------------------------------
+// 原生句柄边界
+// ---------------------------------------------------------------------------
+// Socket 层对外只用 `std::intptr_t` 承载句柄：Linux 的 `fd` 是 int，Windows 的
+// `SOCKET` 是 64 位 `UINT_PTR`。用 int 存储会在 Windows 上截断高 32 位，使
+// 句柄永远无效（P0）。这里把「平台原生类型 ↔ intptr_t」的转换与关闭分派
+// 收敛到两个函数，调用点不再各写一次 static_cast。
+#if defined(_WIN32)
+using NativeSocket = SOCKET;
+#else
+using NativeSocket = int;
+#endif
+
+/// @brief 原生句柄 → 内部存储类型。
+/// @param handle [in] 平台原生句柄；Linux int / Windows `SOCKET`。
+/// @return 无符号位模式保持的 `std::intptr_t`；无效值（-1 / INVALID_SOCKET）仍为负。
+inline std::intptr_t ToIntPtr(NativeSocket handle) noexcept {
+#if defined(_WIN32)
+    return reinterpret_cast<std::intptr_t>(handle);
+#else
+    return static_cast<std::intptr_t>(handle);
+#endif
+}
+
+/// @brief 内部存储类型 → 平台原生句柄（系统调用边界使用）。
+/// @param handle [in] 内部句柄；调用方保证来自 ToIntPtr 或 >= 0。
+/// @return 平台原生句柄；Linux 上等价于 static_cast<int>。
+inline NativeSocket ToNative(std::intptr_t handle) noexcept {
+#if defined(_WIN32)
+    return reinterpret_cast<SOCKET>(handle);
+#else
+    return static_cast<int>(handle);
+#endif
+}
+
+/// @brief 关闭原生 socket 句柄（Linux `close` / Windows `closesocket`）。
+/// @param handle [in] 要关闭的句柄；-1 视为已关闭。
+/// @return true=关闭成功；false=失败（errno/WSAGetLastError 已设置）。
+inline bool CloseNative(std::intptr_t handle) noexcept {
+#if defined(_WIN32)
+    return ::closesocket(ToNative(handle)) == 0;
+#else
+    return ::close(ToNative(handle)) == 0;
+#endif
+}
+
 std::chrono::milliseconds remaining(std::chrono::milliseconds timeout,
                                     std::chrono::steady_clock::time_point start) {
     if (timeout == std::chrono::milliseconds::max()) return timeout;
@@ -80,8 +127,11 @@ private:
 /// @details 读多写少；用原子变量，测试里做「关闭 / 开启」A/B 对比时无数据竞争。
 std::atomic<bool> g_tcp_nodelay_default{true};
 
-int poll_wait(int fd, short events, std::chrono::milliseconds timeout) {
-    pollfd descriptor{fd, events, 0};
+int poll_wait(std::intptr_t fd, short events, std::chrono::milliseconds timeout) {
+    // Linux 的 poll(2) 只接受 int fd；句柄在 Socket 层用 intptr_t 承载，
+    // 这里显式收窄（Linux fd 必在 int 范围）。Windows 走 WSAPoll 后端，
+    // 不经过本函数。
+    pollfd descriptor{static_cast<int>(fd), events, 0};
     const int milliseconds = timeout == std::chrono::milliseconds::max()
         ? -1 : static_cast<int>(std::min<std::int64_t>(timeout.count(), INT_MAX));
     for (;;) {
@@ -121,18 +171,22 @@ constexpr int kSocketObserverCreated = 1;   ///< fd 已创建（含 accept）。
 constexpr int kSocketObserverClosed = 2;    ///< fd 即将关闭，仍然有效。
 constexpr int kSocketObserverDetached = 3;  ///< release()：fd 已移交给调用方。
 
+// 观察者 C ABI 固定为 `(int, int)`：MCP 侧按此签名手工声明
+// （mcp/include/mcp/tools/socket_autoregister.hpp），不能随本层扩宽而破坏
+// 二进制兼容。Linux fd 总在 int 范围内，转换无损。
 using SocketObserverFn = void (*)(int fd, int event);
 /// 观察者槽位；默认空（未安装），此时所有挂接点只剩一次原子读。
 std::atomic<SocketObserverFn> g_socket_observer{nullptr};
 
 /// 通知观察者；观察者抛出的异常绝不允许打断 socket 生命周期。
-void NotifySocketObserver(int fd, int event) noexcept {
+void NotifySocketObserver(std::intptr_t fd, int event) noexcept {
     if (fd < 0) return;
     const SocketObserverFn observer =
         g_socket_observer.load(std::memory_order_acquire);
     if (observer == nullptr) return;
     try {
-        observer(fd, event);
+        // ABI 是 int（见 SocketObserverFn 注释）；仅 Linux 安装观察者。
+        observer(static_cast<int>(fd), event);
     } catch (...) {
         // 观测失败不影响 socket 本身；上层自行决定是否记录错误。
     }
@@ -150,7 +204,7 @@ extern "C" void go2cpp_network_set_socket_observer(void (*observer)(int, int)) {
 #endif
 }
 
-Socket::Socket(int family, int type, int protocol, int fd, bool owner)
+Socket::Socket(int family, int type, int protocol, std::intptr_t fd, bool owner)
     : m_fd(fd), m_family(family), m_type(type), m_protocol(protocol), m_owner(owner) {
     if (m_fd >= 0) {
         const int saved_errno = errno;
@@ -159,7 +213,7 @@ Socket::Socket(int family, int type, int protocol, int fd, bool owner)
             // owner=false 时 fd 仍归调用方，不能替调用方关闭；owner=true
             // 时构造失败必须释放 fd，避免留下不可等待的阻塞句柄。
             if (m_owner) {
-                (void)::close(m_fd);
+                (void)CloseNative(m_fd);
             }
             m_fd = -1;
             errno = error;
@@ -177,23 +231,28 @@ Socket::Socket(int family, int type, int protocol, int fd, bool owner)
     }
 }
 Socket::~Socket() { close(); }
-Socket::Ptr Socket::FromFd(int fd, int family, int type, int protocol, bool owner) {
+Socket::Ptr Socket::FromFd(std::intptr_t fd, int family, int type, int protocol,
+                           bool owner) {
     if (fd < 0) return {};
     auto socket = Ptr(new Socket(family, type, protocol, fd, owner));
     if (!socket->valid()) return {};
     return socket;
 }
 Socket::Ptr Socket::CreateTCP(int family) {
-    const int fd = ::socket(family, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    // `socket(2)` 在 Linux 返回 int，Windows 返回 64 位 `SOCKET`；
+    // 先经 ToIntPtr 提升再存进 intptr_t，避免高 32 位被截断。
+    const std::intptr_t fd =
+        ToIntPtr(::socket(family, SOCK_STREAM | SOCK_CLOEXEC, 0));
     return fd < 0 ? Ptr{} : FromFd(fd, family, SOCK_STREAM, 0);
 }
 Socket::Ptr Socket::CreateUDP(int family) {
-    const int fd = ::socket(family, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    const std::intptr_t fd =
+        ToIntPtr(::socket(family, SOCK_DGRAM | SOCK_CLOEXEC, 0));
     return fd < 0 ? Ptr{} : FromFd(fd, family, SOCK_DGRAM, 0);
 }
 Socket::Ptr Socket::CreateUnix(bool datagram) {
     const int type = datagram ? SOCK_DGRAM : SOCK_STREAM;
-    const int fd = ::socket(AF_UNIX, type | SOCK_CLOEXEC, 0);
+    const std::intptr_t fd = ToIntPtr(::socket(AF_UNIX, type | SOCK_CLOEXEC, 0));
     return fd < 0 ? Ptr{} : FromFd(fd, AF_UNIX, type, 0);
 }
 /**
@@ -226,7 +285,7 @@ Socket::Ptr Socket::CreateUnix(bool datagram) {
  * 必须与 `end_operation()` 成对；漏掉会让 `release()` 永远等不到 inflight 归零，
  * 关闭路径卡死。
  */
-bool Socket::begin_operation(int& fd) noexcept {
+bool Socket::begin_operation(std::intptr_t& fd) noexcept {
     const std::size_t prev = m_inflight.fetch_add(1, std::memory_order_acq_rel);
     if (m_closing_flag.load(std::memory_order_seq_cst)) {
         end_operation();  // 走统一归零路径：可能正是关闭者等待的最后一次递减。
@@ -238,7 +297,7 @@ bool Socket::begin_operation(int& fd) noexcept {
         errno = EBADF;
         return false;
     }
-    const int snapshot = m_fd_fast.load(std::memory_order_acquire);
+    const std::intptr_t snapshot = m_fd_fast.load(std::memory_order_acquire);
     if (snapshot < 0) {
         end_operation();
         errno = EBADF;
@@ -315,7 +374,7 @@ bool Socket::wait_close_state(bool wait_fd_closed) noexcept {
     });
 }
 void Socket::finalize_deferred_close() noexcept {
-    int fd = -1;
+    std::intptr_t fd = -1;
     bool owner = false;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -336,7 +395,7 @@ void Socket::finalize_deferred_close() noexcept {
     // 延迟关闭与普通 close 共用同一个通知点：fd 仍有效，先通知再真正 close。
     NotifySocketObserver(fd, kSocketObserverClosed);
 #endif
-    if (owner) (void)::close(fd);
+    if (owner) (void)CloseNative(fd);
     // 延迟关闭与普通 close 走同一个归档点：在途操作归零后只记一次。
     GO2CPP_SOCKET_DEBUG_RECORD(SocketDebug::RecordClose(fd));
     m_operation_condition.notify_all();
@@ -346,7 +405,7 @@ bool Socket::is_closing() const noexcept {
     // 因此单次 acquire 读即可回答「还能不能用」，不必再抢 m_mutex。
     return m_closing_flag.load(std::memory_order_acquire);
 }
-int Socket::fd() const noexcept {
+std::intptr_t Socket::fd() const noexcept {
     // 无锁快照（与 begin_operation 取到的是同一个发布点）；语义仍是「瞬时值」，
     // 调用方不应跨系统调用持有它。
     return m_fd_fast.load(std::memory_order_acquire);
@@ -367,15 +426,16 @@ bool Socket::init_nonblock() {
     // 只读不写；只有确实需要**改变**状态时才走 Hook 版 fcntl，让
     // m_system_nonblocking/m_user_nonblocking 元数据与内核保持一致。
 #ifdef SYS_fcntl
-    const long flags = ::syscall(SYS_fcntl, m_fd, F_GETFL, 0);
+    const long flags = ::syscall(SYS_fcntl, static_cast<int>(m_fd), F_GETFL, 0);
 #else
-    const long flags = ::fcntl(m_fd, F_GETFL, 0);
+    const long flags = ::fcntl(static_cast<int>(m_fd), F_GETFL, 0);
 #endif
     if (flags < 0) {
         return false;
     }
     if ((flags & O_NONBLOCK) == 0 &&
-        ::fcntl(m_fd, F_SETFL, static_cast<int>(flags) | O_NONBLOCK) != 0) {
+        ::fcntl(static_cast<int>(m_fd), F_SETFL,
+                static_cast<int>(flags) | O_NONBLOCK) != 0) {
         return false;
     }
     FdManager::instance().set_nonblock(m_fd, false, true);
@@ -390,7 +450,7 @@ int Socket::last_error() const noexcept {
     if (!get_option(SOL_SOCKET, SO_ERROR, &error, &length)) return errno;
     return error;
 }
-int Socket::release() noexcept {
+std::intptr_t Socket::release() noexcept {
     std::unique_lock<std::mutex> lock(m_mutex);
     if (m_fd < 0) { m_owner = false; return -1; }
     if (m_closing) {
@@ -400,7 +460,7 @@ int Socket::release() noexcept {
         m_owner = false;
         return -1;
     }
-    const int fd = m_fd;
+    const std::intptr_t fd = m_fd;
     m_closing = true;
     m_closing_flag.store(true, std::memory_order_release);
     ++m_generation;
@@ -432,8 +492,8 @@ int Socket::release() noexcept {
 void Socket::set_waiter(std::shared_ptr<SocketWaiter> waiter) noexcept { std::lock_guard<std::mutex> lock(m_mutex); m_waiter = std::move(waiter); }
 
 bool Socket::bind(const Address& address) {
-    int fd = -1; if (!begin_operation(fd)) return false;
-    const bool result = ::bind(fd, address.addr(), address.addr_len()) == 0;
+    std::intptr_t fd = -1; if (!begin_operation(fd)) return false;
+    const bool result = ::bind(ToNative(fd), address.addr(), address.addr_len()) == 0;
     if (!result) {
         // 先固化 errno：to_string() 可能分配内存并覆盖它。
         const int saved_errno = errno;
@@ -444,8 +504,8 @@ bool Socket::bind(const Address& address) {
     end_operation(); return result;
 }
 bool Socket::listen(int backlog) {
-    int fd = -1; if (!begin_operation(fd)) return false;
-    const bool result = ::listen(fd, backlog) == 0;
+    std::intptr_t fd = -1; if (!begin_operation(fd)) return false;
+    const bool result = ::listen(ToNative(fd), backlog) == 0;
     if (!result) {
         const int saved_errno = errno;
         GO2CPP_LOG_ERROR(GO2CPP_LOG_NAME("net.socket"))
@@ -454,13 +514,14 @@ bool Socket::listen(int backlog) {
     }
     end_operation(); return result;
 }
-bool Socket::SetTcpNoDelay(int fd) noexcept {
+bool Socket::SetTcpNoDelay(std::intptr_t fd) noexcept {
     if (fd < 0) {
         errno = EBADF;
         return false;
     }
     const int enabled = 1;
-    return ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled)) == 0;
+    return ::setsockopt(ToNative(fd), IPPROTO_TCP, TCP_NODELAY, &enabled,
+                        sizeof(enabled)) == 0;
 }
 void Socket::SetTcpNoDelayDefault(bool enabled) noexcept {
     g_tcp_nodelay_default.store(enabled, std::memory_order_release);
@@ -498,7 +559,7 @@ Socket::Ptr Socket::accept(Duration timeout) {
     const auto start = std::chrono::steady_clock::now();
     // step1: begin_operation 固化 fd 并记录读取消代际，close 与 accept 竞争时据此判定取消。
     const auto cancel_generation = m_read_cancel_generation.load(std::memory_order_acquire);
-    int fd = -1; if (!begin_operation(fd)) return {};
+    std::intptr_t fd = -1; if (!begin_operation(fd)) return {};
     if (m_read_cancel_generation.load(std::memory_order_acquire) != cancel_generation) {
         errno = ECANCELED;
         end_operation();
@@ -507,8 +568,11 @@ Socket::Ptr Socket::accept(Duration timeout) {
     for (;;) {
         // step2: 循环 accept4；EINTR 重试，EAGAIN 转入等待，其它错误结束操作返回空。
         sockaddr_storage storage{}; socklen_t length = sizeof(storage);
-        const int accepted = ::accept4(fd, reinterpret_cast<sockaddr*>(&storage), &length,
-                                       SOCK_CLOEXEC | SOCK_NONBLOCK);
+        // Linux 的 accept4 返回 int；Windows 的 accept 返回 64 位 SOCKET。
+        // 统一经 ToIntPtr 提升后再判断有效性，避免句柄高位截断。
+        const std::intptr_t accepted = ToIntPtr(::accept4(
+            ToNative(fd), reinterpret_cast<sockaddr*>(&storage), &length,
+            SOCK_CLOEXEC | SOCK_NONBLOCK));
         // step3: 先纠正内核非阻塞标志（否则 Hook 误判为用户意图而拒绝 park），再 FromFd 包装并记录调试事件。
         if (accepted >= 0) {
             // accept4(SOCK_NONBLOCK) 的 O_NONBLOCK 是运行时为了让「先试一次」
@@ -578,7 +642,7 @@ Socket::Ptr Socket::accept(Duration timeout) {
 bool Socket::connect(const Address& address, Duration timeout) {
     // step1: begin_operation 固化 fd 并记录写取消代际，已取消则 ECANCELED 直接失败。
     const auto cancel_generation = m_write_cancel_generation.load(std::memory_order_acquire);
-    int fd = -1; if (!begin_operation(fd)) return false;
+    std::intptr_t fd = -1; if (!begin_operation(fd)) return false;
 #if GO2CPP_DEBUG_SOCKET
     // connect 的端到端耗时（含 EINPROGRESS 等待与 SO_ERROR 查询）。每个出口
     // 都必须调用一次，保证 connects == connect_ok + 失败次数 的守恒关系。
@@ -603,7 +667,7 @@ bool Socket::connect(const Address& address, Duration timeout) {
         m_remote = std::make_shared<UnknownAddress>(address.addr(), address.addr_len());
     }
     // step3: 真调 connect：立即成功即提交状态；非 EINPROGRESS/EALREADY 的错误原样失败。
-    const int result = ::connect(fd, address.addr(), address.addr_len());
+    const int result = ::connect(ToNative(fd), address.addr(), address.addr_len());
     if (result == 0) {
         { std::lock_guard<std::mutex> lock(m_mutex); m_connected = true; }
 #if GO2CPP_DEBUG_SOCKET
@@ -630,7 +694,8 @@ bool Socket::connect(const Address& address, Duration timeout) {
     }
     int error = 0; socklen_t length = sizeof(error);
     // step5: 就绪后用 SO_ERROR 取最终结果；非零即失败，否则才提交 m_connected=true。
-    if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &length) != 0 || error != 0) {
+    if (::getsockopt(ToNative(fd), SOL_SOCKET, SO_ERROR, &error, &length) != 0 ||
+        error != 0) {
         if (error) errno = error;
 #if GO2CPP_DEBUG_SOCKET
         record_connect(error != 0 ? error : errno);
@@ -657,7 +722,7 @@ bool Socket::close() noexcept {
         lock.unlock();
         return wait_close_state(true);
     }
-    const int fd = m_fd;
+    const std::intptr_t fd = m_fd;
     m_closing = true;
     m_closing_flag.store(true, std::memory_order_release);
     ++m_generation;
@@ -687,11 +752,11 @@ bool Socket::close() noexcept {
     // Socket 视角的生命周期在这里结束；owner=false 时 fd 已交还调用方，但本
     // 对象不再跟踪它，归档后 Snapshot/Events 仍可读到最后状态。
     GO2CPP_SOCKET_DEBUG_RECORD(SocketDebug::RecordClose(fd));
-    return !owner || ::close(fd) == 0;
+    return !owner || CloseNative(fd);
 }
 bool Socket::shutdown(int how) noexcept {
-    int fd = -1; if (!begin_operation(fd)) return false;
-    const bool result = ::shutdown(fd, how) == 0;
+    std::intptr_t fd = -1; if (!begin_operation(fd)) return false;
+    const bool result = ::shutdown(ToNative(fd), how) == 0;
     end_operation(); return result;
 }
 
@@ -741,7 +806,7 @@ bool Socket::shutdown(int how) noexcept {
  * - 本函数**不改 `m_fd`**，fd 的生命周期由调用方的 `begin_operation` /
  *   `end_operation` 保证。
  */
-int Socket::wait_ready(int fd, io::IOEvent event, Duration timeout,
+int Socket::wait_ready(std::intptr_t fd, io::IOEvent event, Duration timeout,
                        std::uint64_t cancel_generation) {
     // step1: 构造取消谓词——比较「当前代号」与「发起等待时的代号」。
     const auto cancelled = [this, event, cancel_generation] {
@@ -832,7 +897,7 @@ int Socket::wait_ready(int fd, io::IOEvent event, Duration timeout,
         }
     }
 }
-bool Socket::wait_or_retry(int fd, io::IOEvent event, Duration& left,
+bool Socket::wait_or_retry(std::intptr_t fd, io::IOEvent event, Duration& left,
                            std::chrono::steady_clock::time_point started,
                            std::uint64_t cancel_generation) {
     left = remaining(left, started);
@@ -841,7 +906,7 @@ bool Socket::wait_or_retry(int fd, io::IOEvent event, Duration& left,
     if (error != 0) { errno = error; return false; }
     left = remaining(left, started); return true;
 }
-SocketResult Socket::send_impl(int fd, const msghdr* message, int flags,
+SocketResult Socket::send_impl(std::intptr_t fd, const msghdr* message, int flags,
                                Duration timeout, std::uint64_t cancel_generation) {
     // timeout == max（默认）时 remaining() 直接返回 timeout、不读起点，
     // 因此不必为每包付一次 vDSO 时钟调用（实测 ~18 ns）。
@@ -851,7 +916,7 @@ SocketResult Socket::send_impl(int fd, const msghdr* message, int flags,
     for (;;) {
         if (is_closing() || m_write_cancel_generation.load(std::memory_order_acquire) !=
                                 cancel_generation) return {-1, ECANCELED};
-        const ssize_t count = ::sendmsg(fd, message, flags | MSG_NOSIGNAL);
+        const ssize_t count = ::sendmsg(ToNative(fd), message, flags | MSG_NOSIGNAL);
         if (count >= 0) return {count, 0};
         if (errno == EINTR) continue;
         if (errno != EAGAIN && errno != EWOULDBLOCK) return {-1, errno};
@@ -866,7 +931,8 @@ SocketResult Socket::send_impl(int fd, const msghdr* message, int flags,
     }
 }
 
-SocketResult Socket::recv_impl(int fd, msghdr* message, int flags, Duration timeout,
+SocketResult Socket::recv_impl(std::intptr_t fd, msghdr* message, int flags,
+                              Duration timeout,
                                std::uint64_t cancel_generation) {
     // timeout == max（默认）时 remaining() 直接返回 timeout、不读起点，
     // 因此不必为每包付一次 vDSO 时钟调用（实测 ~18 ns）。
@@ -876,7 +942,7 @@ SocketResult Socket::recv_impl(int fd, msghdr* message, int flags, Duration time
     for (;;) {
         if (is_closing() || m_read_cancel_generation.load(std::memory_order_acquire) !=
                                 cancel_generation) return {-1, ECANCELED};
-        const ssize_t count = ::recvmsg(fd, message, flags);
+        const ssize_t count = ::recvmsg(ToNative(fd), message, flags);
         if (count >= 0) return {count, 0};
         if (errno == EINTR) continue;
         if (errno != EAGAIN && errno != EWOULDBLOCK) return {-1, errno};
@@ -901,7 +967,7 @@ SocketResult Socket::sendv(const iovec* buffers, std::size_t count, int flags, D
     // 负数当成「预算已耗尽」变成 ETIMEDOUT——必须在这里先拦，不能靠下游。
     if (timeout.count() < 0) return {-1, EINVAL};
     const auto cancel_generation = m_write_cancel_generation.load(std::memory_order_acquire);
-    int fd = -1; if (!begin_operation(fd)) return {-1, errno};
+    std::intptr_t fd = -1; if (!begin_operation(fd)) return {-1, errno};
     if (m_write_cancel_generation.load(std::memory_order_acquire) != cancel_generation) {
         end_operation();
         return {-1, ECANCELED};
@@ -925,7 +991,7 @@ SocketResult Socket::SendAll(const void* data, std::size_t length, int flags,
     if (length > static_cast<std::size_t>(SSIZE_MAX)) return {-1, EINVAL};
     if (timeout.count() < 0) return {-1, EINVAL};
     const auto cancel_generation = m_write_cancel_generation.load(std::memory_order_acquire);
-    int fd = -1;
+    std::intptr_t fd = -1;
     if (!begin_operation(fd)) return {-1, errno};
     if (m_write_cancel_generation.load(std::memory_order_acquire) != cancel_generation) {
         end_operation();
@@ -989,7 +1055,7 @@ SocketResult Socket::recvv(iovec* buffers, std::size_t count, int flags, Duratio
     // 负数会被 remaining() 降级成 ETIMEDOUT（数据就绪时甚至直接成功）。
     if (timeout.count() < 0) return {-1, EINVAL};
     const auto cancel_generation = m_read_cancel_generation.load(std::memory_order_acquire);
-    int fd = -1; if (!begin_operation(fd)) return {-1, errno};
+    std::intptr_t fd = -1; if (!begin_operation(fd)) return {-1, errno};
     if (m_read_cancel_generation.load(std::memory_order_acquire) != cancel_generation) {
         end_operation();
         return {-1, ECANCELED};
@@ -1006,7 +1072,7 @@ SocketResult Socket::recvv(iovec* buffers, std::size_t count, int flags, Duratio
 }
 SocketResult Socket::send_to(const void* data, std::size_t length, const Address& to, int flags, Duration timeout) {
     const auto cancel_generation = m_write_cancel_generation.load(std::memory_order_acquire);
-    int fd = -1; if (!begin_operation(fd)) return {-1, errno};
+    std::intptr_t fd = -1; if (!begin_operation(fd)) return {-1, errno};
     if (m_write_cancel_generation.load(std::memory_order_acquire) != cancel_generation) {
         end_operation();
         return {-1, ECANCELED};
@@ -1024,7 +1090,7 @@ SocketResult Socket::send_to(const void* data, std::size_t length, const Address
 }
 SocketResult Socket::recv_from(void* data, std::size_t length, AddressPtr& from, int flags, Duration timeout) {
     const auto cancel_generation = m_read_cancel_generation.load(std::memory_order_acquire);
-    int fd = -1; if (!begin_operation(fd)) return {-1, errno};
+    std::intptr_t fd = -1; if (!begin_operation(fd)) return {-1, errno};
     if (m_read_cancel_generation.load(std::memory_order_acquire) != cancel_generation) {
         end_operation();
         return {-1, ECANCELED};
@@ -1068,7 +1134,7 @@ SocketResult Socket::recv_batch(RecvBatchEntry* entries, std::size_t count, int 
         }
     }
     const auto cancel_generation = m_read_cancel_generation.load(std::memory_order_acquire);
-    int fd = -1;
+    std::intptr_t fd = -1;
     if (!begin_operation(fd)) return {-1, errno};
     if (m_read_cancel_generation.load(std::memory_order_acquire) != cancel_generation) {
         end_operation();
@@ -1090,8 +1156,8 @@ SocketResult Socket::recv_batch(RecvBatchEntry* entries, std::size_t count, int 
     return result;
 }
 
-SocketResult Socket::recv_batch_impl(int fd, RecvBatchEntry* entries, std::size_t count,
-                                     int flags, Duration timeout,
+SocketResult Socket::recv_batch_impl(std::intptr_t fd, RecvBatchEntry* entries,
+                                    std::size_t count, int flags, Duration timeout,
                                      std::uint64_t cancel_generation) {
     const auto started = std::chrono::steady_clock::now();
     std::vector<iovec> vectors(count);
@@ -1111,7 +1177,7 @@ SocketResult Socket::recv_batch_impl(int fd, RecvBatchEntry* entries, std::size_
             messages[index].msg_hdr.msg_iovlen = 1;
         }
         const int received =
-            ::recvmmsg(fd, messages.data(), static_cast<unsigned int>(count),
+            ::recvmmsg(ToNative(fd), messages.data(), static_cast<unsigned int>(count),
                        flags | MSG_DONTWAIT, nullptr);
         if (received > 0) {
             for (int index = 0; index < received; ++index) {
@@ -1137,7 +1203,7 @@ SocketResult Socket::send_batch(const SendBatchEntry* entries, std::size_t count
         if (entries[index].data == nullptr) return {-1, EINVAL};
     }
     const auto cancel_generation = m_write_cancel_generation.load(std::memory_order_acquire);
-    int fd = -1;
+    std::intptr_t fd = -1;
     if (!begin_operation(fd)) return {-1, errno};
     if (m_write_cancel_generation.load(std::memory_order_acquire) != cancel_generation) {
         end_operation();
@@ -1158,8 +1224,8 @@ SocketResult Socket::send_batch(const SendBatchEntry* entries, std::size_t count
     return result;
 }
 
-SocketResult Socket::send_batch_impl(int fd, const SendBatchEntry* entries, std::size_t count,
-                                     int flags, Duration timeout,
+SocketResult Socket::send_batch_impl(std::intptr_t fd, const SendBatchEntry* entries,
+                                    std::size_t count, int flags, Duration timeout,
                                      std::uint64_t cancel_generation) {
     const auto started = std::chrono::steady_clock::now();
     std::vector<iovec> vectors(count);
@@ -1180,7 +1246,8 @@ SocketResult Socket::send_batch_impl(int fd, const SendBatchEntry* entries, std:
             messages[index].msg_hdr.msg_iov = &vectors[index];
             messages[index].msg_hdr.msg_iovlen = 1;
         }
-        const int sent = ::sendmmsg(fd, messages.data(), static_cast<unsigned int>(count),
+        const int sent = ::sendmmsg(ToNative(fd), messages.data(),
+                                    static_cast<unsigned int>(count),
                                     flags | MSG_NOSIGNAL | MSG_DONTWAIT);
         if (sent >= 0) return {sent, 0};
         if (errno == EINTR) continue;
@@ -1192,13 +1259,14 @@ SocketResult Socket::send_batch_impl(int fd, const SendBatchEntry* entries, std:
     }
 }
 
-SocketResult Socket::send_file(int in_fd, off_t* offset, std::size_t count, Duration timeout) {
+SocketResult Socket::send_file(std::intptr_t in_fd, off_t* offset, std::size_t count,
+                               Duration timeout) {
     if (in_fd < 0) return {-1, EBADF};
     // 文件传输可能持续很久，整段调用都在屏蔽 SIGPIPE 的作用域内。
     ScopedSigpipeBlock sigpipe_block;
     if (count == 0) return {0, 0};
     const auto cancel_generation = m_write_cancel_generation.load(std::memory_order_acquire);
-    int fd = -1;
+    std::intptr_t fd = -1;
     if (!begin_operation(fd)) return {-1, errno};
     if (m_write_cancel_generation.load(std::memory_order_acquire) != cancel_generation) {
         end_operation();
@@ -1214,8 +1282,9 @@ SocketResult Socket::send_file(int in_fd, off_t* offset, std::size_t count, Dura
     return result;
 }
 
-SocketResult Socket::send_file_impl(int fd, int in_fd, off_t* offset, std::size_t count,
-                                    Duration timeout, std::uint64_t cancel_generation) {
+SocketResult Socket::send_file_impl(std::intptr_t fd, std::intptr_t in_fd, off_t* offset,
+                                   std::size_t count, Duration timeout,
+                                   std::uint64_t cancel_generation) {
     const auto started = std::chrono::steady_clock::now();
     std::size_t total = 0;
     while (total < count) {
@@ -1225,7 +1294,8 @@ SocketResult Socket::send_file_impl(int fd, int in_fd, off_t* offset, std::size_
                              : SocketResult{-1, ECANCELED};
         }
         // count 参数是 size_t；sendfile 内部按页拆分，一次调用即可传剩余全部。
-        const ssize_t sent = ::sendfile(fd, in_fd, offset, count - total);
+        const ssize_t sent = ::sendfile(ToNative(fd), ToNative(in_fd), offset,
+                                       count - total);
         if (sent > 0) {
             total += static_cast<std::size_t>(sent);
             continue;
@@ -1253,19 +1323,21 @@ SocketResult Socket::send_file_impl(int fd, int in_fd, off_t* offset, std::size_
 }
 
 AddressPtr Socket::local_address() const {
-    int fd = -1;
+    std::intptr_t fd = -1;
     if (!const_cast<Socket*>(this)->begin_operation(fd)) return {};
     sockaddr_storage storage{}; socklen_t length = sizeof(storage);
-    const bool ok = ::getsockname(fd, reinterpret_cast<sockaddr*>(&storage), &length) == 0;
+    const bool ok =
+        ::getsockname(ToNative(fd), reinterpret_cast<sockaddr*>(&storage), &length) == 0;
     const auto address = ok ? Address::Create(reinterpret_cast<sockaddr*>(&storage), length) : AddressPtr{};
     const_cast<Socket*>(this)->end_operation();
     return address;
 }
 AddressPtr Socket::remote_address() const {
-    int fd = -1;
+    std::intptr_t fd = -1;
     if (!const_cast<Socket*>(this)->begin_operation(fd)) return {};
     sockaddr_storage storage{}; socklen_t length = sizeof(storage);
-    const bool ok = ::getpeername(fd, reinterpret_cast<sockaddr*>(&storage), &length) == 0;
+    const bool ok =
+        ::getpeername(ToNative(fd), reinterpret_cast<sockaddr*>(&storage), &length) == 0;
     const auto address = ok ? Address::Create(reinterpret_cast<sockaddr*>(&storage), length) : AddressPtr{};
     const_cast<Socket*>(this)->end_operation();
     return address;
@@ -1275,7 +1347,7 @@ bool Socket::set_recv_timeout(Duration timeout) {
     // clear_recv_timeout()（= max = 无限），避免把 POSIX/Go 的 0=清除习惯
     // 带进来后得到「每次读立即 ETIMEDOUT」的秒断。
     if (timeout.count() <= 0) return false;
-    int fd = -1; if (!begin_operation(fd)) return false;
+    std::intptr_t fd = -1; if (!begin_operation(fd)) return false;
     m_recv_timeout.store(timeout.count(), std::memory_order_relaxed);
     FdManager::instance().set_timeout(fd, true, timeout);
     end_operation();
@@ -1284,26 +1356,26 @@ bool Socket::set_recv_timeout(Duration timeout) {
 bool Socket::set_send_timeout(Duration timeout) {
     // H-02：同 set_recv_timeout，0 与负数都拒绝；清除用 clear_send_timeout()。
     if (timeout.count() <= 0) return false;
-    int fd = -1; if (!begin_operation(fd)) return false;
+    std::intptr_t fd = -1; if (!begin_operation(fd)) return false;
     m_send_timeout.store(timeout.count(), std::memory_order_relaxed);
     FdManager::instance().set_timeout(fd, false, timeout);
     end_operation();
     return true;
 }
 bool Socket::set_option(int level, int option, const void* value, socklen_t length) {
-    int fd = -1; if (!begin_operation(fd)) return false;
-    const bool result = ::setsockopt(fd, level, option, value, length) == 0;
+    std::intptr_t fd = -1; if (!begin_operation(fd)) return false;
+    const bool result = ::setsockopt(ToNative(fd), level, option, value, length) == 0;
     end_operation(); return result;
 }
 bool Socket::get_option(int level, int option, void* value, socklen_t* length) const {
-    int fd = -1; if (!const_cast<Socket*>(this)->begin_operation(fd)) return false;
-    const bool result = ::getsockopt(fd, level, option, value, length) == 0;
+    std::intptr_t fd = -1; if (!const_cast<Socket*>(this)->begin_operation(fd)) return false;
+    const bool result = ::getsockopt(ToNative(fd), level, option, value, length) == 0;
     const_cast<Socket*>(this)->end_operation(); return result;
 }
 // 发布读取消代际，并尽可能通知当前线程的 IOManager；代际检查覆盖跨线程调用。
 bool Socket::cancel_read() noexcept {
     m_read_cancel_generation.fetch_add(1, std::memory_order_acq_rel);
-    int fd = -1; if (!begin_operation(fd)) return false;
+    std::intptr_t fd = -1; if (!begin_operation(fd)) return false;
     auto* manager = io::IOManager::current();
     if (manager) {
         (void)manager->cancel(fd, io::IOEvent::kRead);
@@ -1314,7 +1386,7 @@ bool Socket::cancel_read() noexcept {
 // 发布写取消代际，并尽可能通知当前线程的 IOManager；没有 IOManager 时由分片等待退出。
 bool Socket::cancel_write() noexcept {
     m_write_cancel_generation.fetch_add(1, std::memory_order_acq_rel);
-    int fd = -1; if (!begin_operation(fd)) return false;
+    std::intptr_t fd = -1; if (!begin_operation(fd)) return false;
     auto* manager = io::IOManager::current();
     if (manager) {
         (void)manager->cancel(fd, io::IOEvent::kWrite);
@@ -1350,7 +1422,10 @@ Socket::Ptr DialUDP(const std::string& host, std::uint16_t port, Socket::Duratio
 Socket::Ptr ListenTCP(const std::string& host, std::uint16_t port, int backlog) {
     auto address = ResolveTCPAddr(host, port); if (!address) return {};
     auto socket = Socket::CreateTCP(address->family()); if (!socket) return {};
-    (void)go2cpp::platform::SetReuseAddr(socket->fd());  // 跨平台：Windows 用 SO_EXCLUSIVEADDRUSE
+    // 已知跨模块冲突：`platform::SetReuseAddr` 的形参仍是 int（platform 层已定稿，
+    // 本轮不越权修改）。Windows 上这里会截断 64 位 SOCKET —— 已上报父 agent，
+    // platform 层改 std::intptr_t 后此行即可去掉显式转换。
+    (void)go2cpp::platform::SetReuseAddr(static_cast<int>(socket->fd()));
     return socket->bind(*address) && socket->listen(backlog) ? socket : Socket::Ptr{};
 }
 Socket::Ptr ListenUDP(const std::string& host, std::uint16_t port) {
