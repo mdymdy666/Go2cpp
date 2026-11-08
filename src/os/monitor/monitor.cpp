@@ -25,7 +25,7 @@ void Put(go2cpp::json::JsonBuilder& builder, const char* key, const T& value) {
     }
 }
 
-/// 取值：字段缺失或类型不符时保持 out 的现值（对应 nlohmann 的
+/// 取值：字段缺失或类型不符时保持 out 的现值（对应旧版 value 的
 /// value("k", default) 的「缺失取默认」语义）。
 template <typename T>
 void Get(const go2cpp::json::Value& object, const char* key, T& out) {
