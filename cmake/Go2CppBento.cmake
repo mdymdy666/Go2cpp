@@ -82,6 +82,21 @@ if (GO2CPP_WITH_BENTO)
     set_target_properties(go2cpp_bento PROPERTIES POSITION_INDEPENDENT_CODE ON)
     add_library(go2cpp::bento ALIAS go2cpp_bento)
 
+    # 延迟梯度 BWE（GCC / trendline 简化版）：纯计算、零 IO/fiber 依赖。
+    # 独立成目标，内网/简单场景不引入公网复杂度；输出字节/秒，可直接交给
+    # bento::Pacer::SetRate(bwe.TargetBitrate(), now_ms)。
+    add_library(go2cpp_bwe_gcc STATIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/bwe_gcc.cpp)
+    target_include_directories(go2cpp_bwe_gcc
+        PUBLIC
+            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+            $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+    target_compile_features(go2cpp_bwe_gcc PUBLIC cxx_std_17)
+    target_compile_options(go2cpp_bwe_gcc PRIVATE
+        -Wall -Wextra -Wpedantic -Werror ${BENTO_OPT_FLAGS})
+    set_target_properties(go2cpp_bwe_gcc PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    add_library(go2cpp::bwe_gcc ALIAS go2cpp_bwe_gcc)
+
     # MOD-26/28：通用命令协议 + 文件传输（JinShan 场景缺口）。
     # MOD-31：通用备份模块（store-only zip + 打包 + 上传）。
     # 依赖 go2cpp_os（os::proc 进程执行）与 go2cpp_hash（CRC-32/SHA-256），
@@ -314,6 +329,15 @@ if (GO2CPP_WITH_BENTO)
     option(GO2CPP_BENTO_TESTS "Build Bento transport tests" ON)
     if (GO2CPP_BENTO_TESTS)
         enable_testing()
+        # GCC 延迟梯度 BWE：纯计算单测 + 与 BBR 的「延迟上升但无丢包」对照。
+        # 链接 go2cpp_bento 只为复用真实 BBR 控制器做对照，模块本身零依赖。
+        add_executable(bento_test_bwe_gcc
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/net/test_bwe_gcc.cpp)
+        target_link_libraries(bento_test_bwe_gcc PRIVATE go2cpp_bwe_gcc go2cpp_bento)
+        target_compile_options(bento_test_bwe_gcc PRIVATE
+            -Wall -Wextra -Wpedantic -Werror ${BENTO_OPT_FLAGS})
+        add_test(NAME bento_bwe_gcc COMMAND bento_test_bwe_gcc)
+        set_tests_properties(bento_bwe_gcc PROPERTIES TIMEOUT 120)
         # SOCKS5 骨架：纯协议编解码 + 真实回环（握手/无认证/CONNECT/域名/
         # 失败码/中继/非法请求/超时/并发/优雅关闭）；无外部网络依赖。
         add_executable(bento_test_socks5
