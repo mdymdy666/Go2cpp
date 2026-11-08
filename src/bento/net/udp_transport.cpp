@@ -245,6 +245,9 @@ Result UdpTransport::Bind(const Endpoint& local, bool reuse_address) {
         }
 
         if (reuse_address) {
+            // UDP 复用端口是正常需求（多实例 / 多播收包），不是 TCP 的
+            // 「复用 TIME_WAIT」；Windows 的 SO_EXCLUSIVEADDRUSE 会直接阻止
+            // 第二个绑定，因此 #if defined(_WIN32) 下也保留 SO_REUSEADDR。
             int reuse = 1;
             (void)::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
         }

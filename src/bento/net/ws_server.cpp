@@ -8,6 +8,8 @@
 
 #include "go2cpp/bento/net/ws_server.hpp"
 
+#include "go2cpp/platform/socket_option.hpp"
+
 #include <sys/socket.h>
 
 #include <algorithm>
@@ -226,8 +228,9 @@ WsServerResult WsServer::Listen(std::string address, WsServerConfig config) {
         return WsServerResult::Failure(WsServerError::BindFailed,
                                        "创建监听 socket 失败", errno);
     }
-    int reuse = 1;
-    (void)listener->set_option(SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    // Windows 的 SO_REUSEADDR 允许端口劫持：platform 封装在 Windows 上改用
+    // SO_EXCLUSIVEADDRUSE + SO_LINGER{1,0}。原实现忽略失败，保持同样语义。
+    (void)platform::SetReuseAddr(listener->fd());
     if (!listener->bind(*resolved)) {
         const int error = listener->last_error();
         return WsServerResult::Failure(WsServerError::BindFailed,

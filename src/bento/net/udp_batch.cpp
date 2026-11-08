@@ -192,6 +192,10 @@ bool UdpBatchSocket::Open(const Endpoint& bind, Config config, std::string* erro
             }
             break;
         }
+        // UDP 复用语义与 TCP 不同：此处 queues 个 socket 可能绑同一端口做多队列
+        // （配合下方 SO_REUSEPORT）。Windows 的 SO_EXCLUSIVEADDRUSE 会让第二个
+        // 队列 bind 失败，也会阻断多播/多实例——故 #if defined(_WIN32) 下同样
+        // 保留 SO_REUSEADDR，不换成 platform::SetReuseAddr。
         int one = 1;
         (void)::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
         // 压测时窗口内一次灌入上千个小包，默认 212KB 接收缓冲不够。

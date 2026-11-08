@@ -302,7 +302,9 @@ if (GO2CPP_WITH_BENTO)
         -Wall -Wextra -Wpedantic -Werror ${BENTO_OPT_FLAGS})
     # socks5 的 TCP_NODELAY 复用 net::Socket 的标准实现（accept 后设），
     # 因此需要链接 go2cpp_network；否则 Socket::SetTcpNoDelay 未定义。
-    target_link_libraries(go2cpp_bento_socks PUBLIC Threads::Threads)
+    # socks5.cpp 复用 platform::SetReuseAddr（SO_REUSEADDR 语义反转）：
+    # Windows 走 SO_EXCLUSIVEADDRUSE + SO_LINGER{1,0}。
+    target_link_libraries(go2cpp_bento_socks PUBLIC Threads::Threads go2cpp_platform)
     if (TARGET go2cpp_network)
         target_link_libraries(go2cpp_bento_socks PRIVATE go2cpp_network)
     endif()

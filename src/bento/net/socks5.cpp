@@ -34,6 +34,7 @@
 
 #include "go2cpp/bento/net/socks5.hpp"
 #include "go2cpp/network/socket.hpp"
+#include "go2cpp/platform/socket_option.hpp"
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -603,8 +604,10 @@ bool Socks5Server::Open(std::string* error) {
         if (fd < 0) {
             continue;
         }
-        const int yes = 1;
-        (void)::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+        // Linux 用 SO_REUSEADDR（只复用 TIME_WAIT）；Windows 用
+        // SO_EXCLUSIVEADDRUSE + SO_LINGER{1,0}，避免 SO_REUSEADDR 的端口劫持。
+        // 原实现忽略设置失败（bind/listen 失败会继续试下一个地址），保持。
+        (void)platform::SetReuseAddr(fd);
         if (::bind(fd, it->ai_addr, it->ai_addrlen) == 0 &&
             ::listen(fd, m_config.backlog) == 0) {
             listen_fd = fd;
