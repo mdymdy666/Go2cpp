@@ -26,7 +26,10 @@
  *
  * ## 失败口径
  * 只有两种失败：`to_chars` 无法表示（缓冲不足，实际不会发生）与
- * **非有限浮点**（`NaN` / `Inf`，JSON 不允许，输出 `null` 并返回 false）。
+ * **非有限浮点**（`NaN` / `Inf`，JSON 不允许）。非有限浮点**不输出任何字节**
+ * （不写 `nan` / `inf` / `null` 占位），直接返回 false——此时输出缓冲里只有
+ * 它之前的前缀，整体不可用。`Document` 只能由解析器构造、解析器拒绝
+ * `nan`/`inf`，所以这条防御分支在正常路径上不可达。
  * 字符串里的非法 UTF-8 字节**不**导致失败：默认原样输出，转义模式按字节
  * 逐个保留（不让 writer 成为数据丢失点）。
  */
@@ -56,7 +59,7 @@ struct WriterOptions {
  * @param doc [in] 解析结果；借用，调用期间有效（`Root()` 为 null 时输出 `null`）。
  * @param options [in] 序列化选项；见 `WriterOptions`。
  * @return JSON 文本；**不会**为空串（最小输出是 `null`）。失败时返回已写部分
- *         （只有非有限浮点会触发，此时该值写成 `null`）。
+ *         （只有非有限浮点会触发，此时该值不写出，输出可能被截断）。
  *
  * @note 复杂度 O(节点数 + 输出字节数)；内部用显式栈而非递归，10 万层嵌套也
  *       不会爆栈（与解析器一致）。
@@ -71,8 +74,8 @@ std::string Write(const Document& doc, const WriterOptions& options = WriterOpti
  * @param out [in,out] 目标缓冲；**入口先 clear()**，成功时是完整 JSON。
  *        失败时内容未定义（可能已写入部分字节），调用方不应使用。
  * @param options [in] 序列化选项。
- * @return 成功 true；遇到 `NaN` / `Inf` 返回 false（该值写成 `null` 后继续，
- *         但整体结果不可用于反序列化——调用方应视为失败）。
+ * @return 成功 true；遇到 `NaN` / `Inf` 返回 false（该值不写出任何字节，
+ *         输出缓冲里只有它之前的前缀——调用方应视为失败、不要使用 `out`）。
  *
  * ## 并发/失败语义
  * - 纯函数：只读 `value` 与 `options`，写 `out`；不同线程各用自己的缓冲即可并发；

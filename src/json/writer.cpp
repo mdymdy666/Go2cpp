@@ -156,7 +156,8 @@ bool WriteNumber(const Value& value, std::string* out) {
   if (value.IsDouble()) {
     const double number = value.As<double>();
     if (!std::isfinite(number)) {
-      out->append("null");  // JSON 没有 NaN / Infinity，用 null 占位并报失败。
+      // JSON 没有 NaN / Infinity：**不写任何字节**（也不写 null 占位），
+      // 由调用方根据返回值 false 判定整份输出不可用。
       return false;
     }
     const std::to_chars_result result = std::to_chars(
