@@ -10,7 +10,8 @@
 //   5. Aggregator + Pusher 后台周期推送，Manager 端计数持续增长。
 
 #include <chrono>
-#include <cstdio>
+
+#include "go2cpp/tools/json.hpp"#include <cstdio>
 #include <string>
 #include <thread>
 #include <vector>

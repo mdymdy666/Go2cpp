@@ -23,7 +23,8 @@
 //      的真实数据。
 
 #include <arpa/inet.h>
-#include <fcntl.h>
+
+#include "go2cpp/tools/json.hpp"#include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <sched.h>
