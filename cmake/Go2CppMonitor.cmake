@@ -41,8 +41,7 @@ if(WIN32)
     add_library(go2cpp_os_monitor INTERFACE)
     target_include_directories(go2cpp_os_monitor INTERFACE
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
-        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party>)
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
     target_link_libraries(go2cpp_os_monitor INTERFACE go2cpp_network go2cpp_scheduler go2cpp_channel)
     message(STATUS "go2cpp::os::monitor: Windows 上为空实现（/proc + eBPF 不可用）")
 else()
@@ -168,7 +167,6 @@ if (GO2CPP_BUILD_OS_MONITOR_TESTS)
         add_executable(${name} ${GO2CPP_OS_MONITOR_TEST_DIR}/${source})
         target_include_directories(${name} PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/include
-            ${CMAKE_CURRENT_SOURCE_DIR}/third_party
             ${GO2CPP_OS_MONITOR_TEST_DIR}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(${name} PRIVATE go2cpp_os_monitor go2cpp_network)

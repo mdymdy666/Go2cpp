@@ -27,7 +27,7 @@ endif()
 add_library(go2cpp_error ${CMAKE_CURRENT_SOURCE_DIR}/src/tools/error.cpp)
 
 # 自研 JSON 引擎（include/go2cpp/json + src/json）：monitor 的 Snapshot
-# 序列化与 tools/json.hpp 的解析入口都基于它，不再依赖 third_party/nlohmann。
+# 序列化与 tools/json.hpp 的解析入口都基于它，不依赖任何第三方 JSON 单头。
 add_library(go2cpp_json
     ${CMAKE_CURRENT_SOURCE_DIR}/src/json/core/conversion.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/json/core/decimal.cpp
@@ -519,7 +519,6 @@ endif()
 
 target_include_directories(go2cpp_runtime INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/third_party>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
