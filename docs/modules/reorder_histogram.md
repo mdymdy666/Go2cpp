@@ -236,3 +236,19 @@ ctest --test-dir .build-reorder -R reorder_histogram --output-on-failure
   - `modules/video_coding/nack_requester.cc`：`NackRequester::UpdateReorderingStatistics`、
     `WaitNumberOfPackets`、`AddPacketsToNack`、`GetNackBatch`；
   - `modules/video_coding/histogram.cc`：`Histogram::Add` / `InverseCdf`。
+
+## 11. 验证记录（2026-11-08）
+
+在 **干净 worktree `332e4aa` + 本任务文件**（提交 `7bc4208` 的内容）上验证，
+以隔离并行任务的未提交改动：
+
+| 项 | 命令 / 条件 | 结果 |
+|---|---|---|
+| 全量构建 | CI quick 同选项（Release、Bento/MCP/app/p2p/sqlite 全开，12 并发） | **0 error**；唯一 warning 是既有 `src/tunnel/net.cpp:529:9 unused variable`（本任务未改该文件） |
+| 模块单测 | `ctest -R reorder_histogram` | **Passed**，117 checks / 0.94s |
+| 跨平台语法 | `g++ -std=c++17 -Wall -Wextra -Wpedantic -Werror -Iinclude -U__linux__ -fsyntax-only`（实现 + 测试） | **通过**；三个文件零 `__linux__` / `_WIN32` / `__APPLE__` 分支 |
+| 既有测试 | `ctest -R bento`（63 项，低负载 load≈6） | **63/63 通过**，`bento_netem` 环境性 skip |
+| 竞争条件说明 | 验证期间并行任务构建把 load 推到 8–12 时，曾出现 `bento_omni_server_m1` / `bento_http_server` 超时与 `bento_session_table` 并发计数偶发 | 同一构建低负载重跑全过；**基线构建（无本任务改动）重复 3 次也全过**；本任务对 `src/bento/`、`tests/bento/`、`cmake/Go2CppBento.cmake` 的 diff 为空 |
+
+已知边界：均匀 1–16 乱序模型下 WiFi 画像误重传率 6.66%（见 §4.4），
+真实长尾模型下 6 个画像均 ≤ 0.71%。
