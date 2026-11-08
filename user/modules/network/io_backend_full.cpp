@@ -34,8 +34,8 @@ public:
         }
         return true;
     }
-    int add_or_modify(int fd, std::uint32_t events, std::uint64_t data,
-                      bool enable) noexcept override {
+    int add_or_modify(std::intptr_t fd, std::uint32_t events,
+                      std::uint64_t data, bool enable) noexcept override {
         ++add_calls;
         last_fd = fd;
         last_events = events;
@@ -43,7 +43,7 @@ public:
         last_enable = enable;
         return 0;
     }
-    int remove(int fd) noexcept override {
+    int remove(std::intptr_t fd) noexcept override {
         ++remove_calls;
         last_removed_fd = fd;
         return 0;
@@ -66,11 +66,11 @@ public:
     int wake_calls{0};
     int drain_calls{0};
     int shutdown_calls{0};
-    int last_fd{-1};
+    std::intptr_t last_fd{-1};
     std::uint32_t last_events{0};
     std::uint64_t last_data{0};
     bool last_enable{false};
-    int last_removed_fd{-1};
+    std::intptr_t last_removed_fd{-1};
     std::size_t last_wait_capacity{0};
     int last_wait_timeout{0};
 };

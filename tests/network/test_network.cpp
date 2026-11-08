@@ -25,7 +25,8 @@
 
 class BlockingSocketWaiter final : public go2cpp::net::SocketWaiter {
 public:
-    int wait(int, go2cpp::io::IOEvent, std::chrono::milliseconds) override {
+    int wait(std::intptr_t, go2cpp::io::IOEvent,
+             std::chrono::milliseconds) override {
         std::unique_lock<std::mutex> lock(m_mutex);
         m_entered = true;
         m_condition.notify_all();

@@ -18,11 +18,12 @@ public:
         }
         return true;
     }
-    int add_or_modify(int, std::uint32_t, std::uint64_t, bool) noexcept override {
+    int add_or_modify(std::intptr_t, std::uint32_t, std::uint64_t,
+                      bool) noexcept override {
         ++add_calls;
         return 0;
     }
-    int remove(int) noexcept override { return 0; }
+    int remove(std::intptr_t) noexcept override { return 0; }
     int wait(go2cpp::io::BackendEvent*, std::size_t, int) noexcept override {
         return 0;
     }
