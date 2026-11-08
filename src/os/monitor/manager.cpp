@@ -312,6 +312,10 @@ bool Manager::Start() {
                 ToJson(body, snapshot);
             }
             body.EndArray();
+            if (!body.ok()) {
+                return JsonResponse(http::Status::BadRequest,
+                                    "{\"error\":\"" + body.error() + "\"}");
+            }
             return JsonResponse(http::Status::OK, body.Take());
         });
     impl_->server->route(
@@ -336,6 +340,10 @@ bool Manager::Start() {
                 body.EndObject();
             }
             body.EndArray();
+            if (!body.ok()) {
+                return JsonResponse(http::Status::BadRequest,
+                                    "{\"error\":\"" + body.error() + "\"}");
+            }
             return JsonResponse(http::Status::OK, body.Take());
         });
     impl_->server->route(
@@ -492,6 +500,10 @@ bool Manager::Start() {
                 body.EndObject();
             }
             body.EndArray();
+            if (!body.ok()) {
+                return JsonResponse(http::Status::BadRequest,
+                                    "{\"error\":\"" + body.error() + "\"}");
+            }
             return JsonResponse(http::Status::OK, body.Take());
         });
     impl_->server->route(
@@ -512,6 +524,10 @@ bool Manager::Start() {
             Put(body, "rejected", rejected);
             Put(body, "stored", impl_->store->size());
             body.EndObject();
+            if (!body.ok()) {
+                return JsonResponse(http::Status::BadRequest,
+                                    "{\"error\":\"" + body.error() + "\"}");
+            }
             return JsonResponse(http::Status::OK, body.Take());
         });
 
