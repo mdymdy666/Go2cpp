@@ -89,3 +89,50 @@
 | 3 | **路径必须写死真树**（`E:\CodexWorkspace\Go2Cpp` 是旧副本，**没有 `src/`**） |
 | 4 | **「重启了」不等于「生效了」**——`run_all.sh stop` 曾杀不掉旧进程，导致改代码不生效 |
 | 5 | **`grep` 关键词要覆盖间接引用**（`nlohmann` 藏在 `go2cpp/json.hpp` 转发后面） |
+
+---
+
+## 六、可裁剪性（用户核心诉求：每个模块能单独使用，不引入其他模块）
+
+> **目标**：任意模块（如 `json` / `url` / `log` / `metrics`）可以**单独作为一个库使用**——
+> 只链接它 + 它**真正必需**的依赖，**不拖入** fiber / hook / scheduler / network 等重组件。
+
+### 6.1 现状盘点（待做）
+
+| # | 事项 | 说明 |
+|---|---|---|
+| C1 | **画模块依赖图** | 用 `cmake --graphviz` 或手写（`docs/modules/dependency-graph.md`），列出「A -> B」的**真实**依赖 |
+| C2 | **找出「隐性依赖」** | 例：`go2cpp_network` 是否真的需要 `fiber`？`go2cpp_log` 是否真的需要 `hook`？——**逐个验证**，不是看 CMake 写了什么 |
+| C3 | **`go2cpp_hook` 的强制链接** | 现在很多 target 无条件 `target_link_libraries(... go2cpp_hook)`——**改为可选**（`GO2CPP_BUILD_HOOK` 已存在，但调用方没尊重它） |
+| C4 | **`go2cpp_runtime` 的 INTERFACE 聚合** | 它把一堆模块捆在一起——**要能拆**（只取需要的） |
+| C5 | **`GO2CPP_MODULE_TARGETS` 的粒度** | 现在是一个整体列表——**每个模块能否单独 `-DGO2CPP_MODULE_JSON=ON` 之类** |
+
+### 6.2 方案（待定稿）
+
+| # | 方案 | 说明 |
+|---|---|---|
+| P1 | **每个模块一个最小示例** | `examples/minimal/<module>/`：`CMakeLists.txt` **只 `find_package`/`target_link_libraries` 该模块**，编译一个 10 行程序 |
+| P2 | **依赖方向守卫** | CMake 里禁止「低层依赖高层」（如 `json` 依赖 `network`）——用 `if(TARGET ...)` + `message(FATAL_ERROR)` |
+| P3 | **`go2cpp_hook` 可选** | 默认 OFF；只有需要「阻塞调用自动 fiber 化」时才开——**json/log/metrics 这些纯计算模块不该被 hook 拖累** |
+| P4 | **`platform/` 保持零依赖** | 它只能依赖标准库（**已经是**），供所有模块用 |
+| P5 | **每个模块的 `target_include_directories` 用 `$<BUILD_INTERFACE>`** | 已经做了（`go2cpp_platform`），其他模块要跟进 |
+
+### 6.3 验收标准（硬性）
+
+| # | 标准 |
+|---|---|
+| V1 | **每个模块**都有 `examples/minimal/<module>/`，`cmake --build` 通过 |
+| V2 | 该示例的**链接库清单里没有「无关模块」**（如 `minimal/json` 不含 `go2cpp_network`/`go2cpp_fiber`） |
+| V3 | 用 `cmake --graphviz` 导出的依赖图**无环、无越层** |
+| V4 | **关掉 `GO2CPP_BUILD_HOOK=OFF`** 后，`json`/`log`/`metrics`/`url` 等纯计算模块**仍能构建并使用** |
+| V5 | 文档 `docs/modules/cuttable.md`：**每个模块的「必需依赖」清单 + 最小示例路径** |
+
+### 6.4 我的初步观察（待验证）
+
+| 模块 | 现在链接了什么 | 疑似可以去掉的 |
+|---|---|---|
+| `go2cpp_json` | `go2cpp_reflect`（+ error） | **合理**（reflect 是它的字段反射依赖） |
+| `go2cpp_log` | 待查 | **可能不需要 hook** |
+| `go2cpp_network` | `hook`/`scheduler`/`fiber` | **可疑**：纯 socket 封装应该不需要 fiber（**待验证**） |
+| `go2cpp_os_monitor` | `network`/`scheduler`/`channel` | **可疑**：采集器为什么要 scheduler？ |
+| `go2cpp_http` | 待查 | 待查 |
