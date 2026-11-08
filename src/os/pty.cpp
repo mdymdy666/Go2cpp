@@ -183,15 +183,15 @@ Result<void> Pty::SetEcho(bool enabled) {
     return OkResult();
 }
 
-int Pty::ReleaseMaster() noexcept {
+std::intptr_t Pty::ReleaseMaster() noexcept {
     (void)DisableAsync();
-    const int fd = m_master;
+    const std::intptr_t fd = m_master;
     m_master = -1;
     return fd;
 }
 
-int Pty::ReleaseSlave() noexcept {
-    const int fd = m_slave;
+std::intptr_t Pty::ReleaseSlave() noexcept {
+    const std::intptr_t fd = m_slave;
     m_slave = -1;
     return fd;
 }

@@ -43,7 +43,10 @@ const char* ToString(IoKind kind) noexcept {
     return "unknown";
 }
 
-IoCapability DetectIoCapability(int fd) {
+IoCapability DetectIoCapability(std::intptr_t handle) {
+    // 公开接口用 intptr_t 承载句柄；本层实现是 Linux 专有（fstat/isatty），
+    // 进入系统调用前收窄一次。
+    const int fd = static_cast<int>(handle);
     IoCapability capability;
     if (fd < 0) {
         capability.kind = IoKind::kUnknown;
@@ -120,7 +123,8 @@ IoCapability DetectIoCapability(int fd) {
     return capability;
 }
 
-Result<void> SetFdNonBlocking(int fd, bool enable) {
+Result<void> SetFdNonBlocking(std::intptr_t handle, bool enable) {
+    const int fd = static_cast<int>(handle);
     if (fd < 0) {
         return MakeError(ProcErrorCode::kInvalidArgument, EBADF, "fd 无效", "SetFdNonBlocking");
     }
@@ -143,8 +147,10 @@ Result<void> SetFdNonBlocking(int fd, bool enable) {
     return OkResult();
 }
 
-Result<void> AsyncIoBinding::Enable(int fd, const IoCapability& capability,
+Result<void> AsyncIoBinding::Enable(std::intptr_t handle,
+                                    const IoCapability& capability,
                                     go2cpp::io::IOManager* manager) {
+    const int fd = static_cast<int>(handle);
     std::lock_guard<std::mutex> lock(m_mutex);
     if (m_enabled.load(std::memory_order_acquire)) {
         return MakeError(ProcErrorCode::kInvalidArgument, 0, "异步模式已启用", "AsyncIoBinding::Enable");
@@ -202,7 +208,7 @@ Result<void> AsyncIoBinding::WaitWritable(std::chrono::milliseconds timeout) {
 
 Result<void> AsyncIoBinding::Wait(bool read, std::chrono::milliseconds timeout) {
     go2cpp::io::IOManager* manager = m_manager.load(std::memory_order_acquire);
-    const int fd = m_fd.load(std::memory_order_acquire);
+    const std::intptr_t fd = m_fd.load(std::memory_order_acquire);
     if (!m_enabled.load(std::memory_order_acquire) || manager == nullptr) {
         return MakeError(ProcErrorCode::kUnsupported, 0, "异步模式未启用",
                          "AsyncIoBinding::Wait");

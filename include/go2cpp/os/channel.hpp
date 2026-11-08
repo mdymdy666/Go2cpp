@@ -223,7 +223,7 @@ public:
     virtual void Close() noexcept = 0;
     virtual bool closed() const noexcept = 0;
     /// 底层 fd；非 fd 后端返回 -1。
-    virtual int native_fd() const noexcept { return -1; }
+    virtual std::intptr_t native_fd() const noexcept { return -1; }
     virtual const ChannelStats& stats() const noexcept = 0;
 
     // ---- IO 能力与显式异步（R27-R30）----
@@ -297,13 +297,13 @@ private:
  */
 class FdChannel final : public MessageChannel {
 public:
-    FdChannel(int fd, bool take_ownership, ChannelOptions options = {});
+    FdChannel(std::intptr_t fd, bool take_ownership, ChannelOptions options = {});
     ~FdChannel() override;
 
     Result<void> Write(ByteSpan data, std::chrono::milliseconds timeout) override;
     void Close() noexcept override;
     bool closed() const noexcept override;
-    int native_fd() const noexcept override;
+    std::intptr_t native_fd() const noexcept override;
     const ChannelStats& stats() const noexcept override;
 
     // ---- IO 能力与异步（R27-R30）----
@@ -317,7 +317,7 @@ protected:
     Result<std::size_t> Pull(std::chrono::milliseconds timeout) override;
 
 private:
-    int m_fd{-1};
+    std::intptr_t m_fd{-1};
     bool m_owned{true};
     bool m_closed{false};
     IoCapability m_capability;  ///< 构造时探测一次（fd 类型不会变）
@@ -325,7 +325,7 @@ private:
 };
 
 /** @brief 便捷构造。 */
-std::unique_ptr<FdChannel> MakeFdChannel(int fd, bool take_ownership,
+std::unique_ptr<FdChannel> MakeFdChannel(std::intptr_t fd, bool take_ownership,
                                          ChannelOptions options = {});
 
 // ---------------------------------------------------------------------------
@@ -493,7 +493,7 @@ enum class ChannelKind : std::uint8_t {
 /** @brief 创建通道的规格。 */
 struct ChannelSpec final {
     ChannelKind kind{ChannelKind::kPipe};
-    int fd{-1};                 ///< kPipe/kSocketPair：要接管的 fd
+    std::intptr_t fd{-1};       ///< kPipe/kSocketPair：要接管的 fd
     bool take_ownership{true};  ///< fd 是否由通道负责关闭
     std::string name;           ///< shm/mq 名称
     std::size_t capacity{1u << 20};  ///< shm 环容量 / mq 深度相关

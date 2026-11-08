@@ -125,7 +125,7 @@ public:
     const void* data() const noexcept { return m_data; }
     std::size_t size() const noexcept { return m_size; }
     const std::string& name() const noexcept { return m_name; }
-    int fd() const noexcept { return m_fd; }
+    std::intptr_t fd() const noexcept { return m_fd; }
     bool valid() const noexcept { return m_data != nullptr && m_size > 0; }
 
     /// 解除映射并关闭 fd（幂等）。
@@ -135,7 +135,7 @@ private:
     void* m_data{nullptr};
     std::size_t m_size{0};
     std::string m_name;
-    int m_fd{-1};
+    std::intptr_t m_fd{-1};
     bool m_writable{true};
 };
 

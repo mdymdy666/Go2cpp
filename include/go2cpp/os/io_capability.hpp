@@ -106,7 +106,7 @@ struct IoCapability final {
  *          只用于确认 socket（`S_ISSOCK` 已足够，保留它作为交叉校验）。
  * @return fd < 0 或 `fstat` 失败时返回 `kUnknown` + reason（不抛异常）。
  */
-IoCapability DetectIoCapability(int fd);
+IoCapability DetectIoCapability(std::intptr_t fd);
 
 /**
  * @brief 设置/清除 `O_NONBLOCK`（不校验能力，纯系统调用封装）。
@@ -114,7 +114,7 @@ IoCapability DetectIoCapability(int fd);
  * @note 能力不允许非阻塞时应先查 `can_nonblocking`；`File::SetNonBlocking`
  *       等对象方法会替调用方做这层校验并给出 `kUnsupported`。
  */
-Result<void> SetFdNonBlocking(int fd, bool enable);
+Result<void> SetFdNonBlocking(std::intptr_t fd, bool enable);
 
 /**
  * @brief 把一个 fd 的等待显式绑定到 `IOManager`（R28）。
@@ -140,7 +140,7 @@ public:
      * @return 不可 poll/不可非阻塞/manager 为空时返回 `kUnsupported`/`kInvalidArgument`，
      *         并在 message 里带上 `capability.reason`。
      */
-    Result<void> Enable(int fd, const IoCapability& capability,
+    Result<void> Enable(std::intptr_t fd, const IoCapability& capability,
                         go2cpp::io::IOManager* manager);
 
     /// 恢复启用前的阻塞状态并解绑；未启用时为空操作。
@@ -150,7 +150,7 @@ public:
     go2cpp::io::IOManager* manager() const noexcept {
         return m_manager.load(std::memory_order_acquire);
     }
-    int fd() const noexcept { return m_fd.load(std::memory_order_acquire); }
+    std::intptr_t fd() const noexcept { return m_fd.load(std::memory_order_acquire); }
 
     /// 等待可读；`timeout < 0` 表示永久（依赖 Context 取消）。
     Result<void> WaitReadable(std::chrono::milliseconds timeout);
@@ -163,7 +163,7 @@ private:
     /// 保护 Enable/Disable 的复合状态（并发调用安全；Wait 只做快照）。
     mutable std::mutex m_mutex;
     std::atomic<go2cpp::io::IOManager*> m_manager{nullptr};
-    std::atomic<int> m_fd{-1};
+    std::atomic<std::intptr_t> m_fd{-1};
     std::atomic<bool> m_enabled{false};
     bool m_was_blocking{true};  ///< Enable 前的 O_NONBLOCK 状态，Disable 恢复
 };

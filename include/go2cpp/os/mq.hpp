@@ -147,7 +147,7 @@ public:
         std::chrono::milliseconds timeout = kWaitForever);
 
     const std::string& name() const noexcept { return m_name; }
-    int fd() const noexcept { return m_fd; }
+    std::intptr_t fd() const noexcept { return m_fd; }
     long max_messages() const noexcept { return m_max_messages; }
     long max_message_size() const noexcept { return m_max_message_size; }
     /// `kDropNewest` 策略下被丢弃的消息数。
@@ -184,7 +184,7 @@ public:
 
 private:
     std::string m_name;
-    int m_fd{-1};
+    std::intptr_t m_fd{-1};
     long m_max_messages{0};
     long m_max_message_size{0};
     std::uint64_t m_dropped{0};
@@ -220,7 +220,7 @@ public:
     void Close() noexcept override;
     bool closed() const noexcept override;
     const ChannelStats& stats() const noexcept override;
-    int native_fd() const noexcept override;
+    std::intptr_t native_fd() const noexcept override;
 
     // ---- IO 能力与异步（R31）----
     IoCapability Capability() const override;

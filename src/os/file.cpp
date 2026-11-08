@@ -301,7 +301,10 @@ FileStatus File::Create(const std::string& path, mode_t mode, File* out) {
  * `Adopt` **不修改** fd 的任何标志位（尤其不碰 `O_NONBLOCK`），避免与
  * `FdManager` 的 `m_user_nonblock`/`m_system_nonblock` 还原逻辑打架。
  */
-FileStatus File::Adopt(int fd, bool take_ownership, File* out) {
+FileStatus File::Adopt(std::intptr_t handle, bool take_ownership, File* out) {
+    // os 层当前仍是 Linux 专有实现：公开接口用 intptr_t 承载句柄（Windows
+    // 会放 HANDLE），进入 POSIX 系统调用前在这里收窄一次。
+    const int fd = static_cast<int>(handle);
     FileStatus status;
     if (out == nullptr) {
         // 与"路径为空"一样是参数错误：统一填 EINVAL，避免调用方按

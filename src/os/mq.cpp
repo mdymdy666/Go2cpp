@@ -571,7 +571,9 @@ void MqChannel::Close() noexcept {
 
 bool MqChannel::closed() const noexcept { return m_closed; }
 const ChannelStats& MqChannel::stats() const noexcept { return m_stats; }
-int MqChannel::native_fd() const noexcept { return m_closed ? -1 : m_queue.fd(); }
+std::intptr_t MqChannel::native_fd() const noexcept {
+    return m_closed ? -1 : m_queue.fd();
+}
 const std::string& MqChannel::name() const noexcept { return m_queue.name(); }
 
 IoCapability MqChannel::Capability() const { return m_queue.Capability(); }

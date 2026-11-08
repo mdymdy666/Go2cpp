@@ -499,9 +499,9 @@ struct SpawnedProcess final {
     pid_t pid{-1};
     pid_t ppid{-1};
     pid_t pgid{-1};
-    int stdin_fd{-1};   ///< 父进程侧写端；-1 表示该流不是管道
-    int stdout_fd{-1};  ///< 父进程侧读端
-    int stderr_fd{-1};
+    std::intptr_t stdin_fd{-1};   ///< 父进程侧写端；-1 表示该流不是管道
+    std::intptr_t stdout_fd{-1};  ///< 父进程侧读端
+    std::intptr_t stderr_fd{-1};
     bool pty{false};    ///< stdin/stdout 共用 PTY master
     std::chrono::steady_clock::time_point started_monotonic{};
     std::chrono::system_clock::time_point started_wall{};

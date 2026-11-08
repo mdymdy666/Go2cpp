@@ -306,7 +306,7 @@ public:
      * @details **会检查 fd 类型并拒绝 socket**（返回 `kIsSocket`）。
      *          不会修改 fd 的任何标志位（见 1.5）。
      */
-    static FileStatus Adopt(int fd, bool take_ownership, File* out);
+    static FileStatus Adopt(std::intptr_t fd, bool take_ownership, File* out);
 
     /**
      * @brief 读最多 `length` 字节（同步阻塞，不参与协程调度）。
@@ -476,8 +476,8 @@ public:
      */
     void Close() noexcept;
 
-    /** @brief 底层 fd；已关闭时返回 -1。 */
-    int fd() const noexcept { return m_fd; }
+    /** @brief 底层句柄（Linux fd / Windows HANDLE 的位模式）；已关闭时返回 -1。 */
+    std::intptr_t fd() const noexcept { return m_fd; }
 
     /** @brief 是否持有有效 fd。 */
     bool valid() const noexcept { return m_fd >= 0; }
@@ -486,7 +486,7 @@ public:
     int last_error() const noexcept { return m_last_error; }
 
 private:
-    int m_fd{-1};  ///< 持有的 fd，-1 表示关闭；Open/Adopt/移动赋值写入，Close 置 -1，fd()/valid() 读取
+    std::intptr_t m_fd{-1};  ///< 持有的句柄，-1 表示关闭；Open/Adopt/移动赋值写入，Close 置 -1，fd()/valid() 读取
     bool m_owned{false};  ///< 是否拥有 fd（析构/Close 负责关闭）；Adopt 的 take_ownership 决定，移动时随 fd 转移
     /// fd 是否带 `O_APPEND`：`Open` 按调用方 flags 记录，`Adopt` 用 `F_GETFL`
     /// 只读探测一次（不修改标志）。`WriteAt` 据此拒绝写入 —— Linux `pwrite`

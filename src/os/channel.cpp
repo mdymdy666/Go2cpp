@@ -494,8 +494,11 @@ Result<std::string> MessageChannel::ReadDelimited(std::chrono::milliseconds time
 // FdChannel
 // ===========================================================================
 
-FdChannel::FdChannel(int fd, bool take_ownership, ChannelOptions options)
-    : MessageChannel(options), m_fd(fd), m_owned(take_ownership) {
+FdChannel::FdChannel(std::intptr_t handle, bool take_ownership,
+                     ChannelOptions options)
+    : MessageChannel(options), m_fd(handle), m_owned(take_ownership) {
+    // 本层实现是 Linux 专有（raw fcntl/poll）：进入系统调用前收窄一次。
+    const int fd = static_cast<int>(handle);
     m_capability = DetectIoCapability(fd);
     if (fd >= 0) {
         // 内部统一非阻塞：同步模式用 poll 等就绪，异步模式交给 IOManager。
@@ -661,7 +664,9 @@ void FdChannel::Close() noexcept {
 }
 
 bool FdChannel::closed() const noexcept { return m_closed; }
-int FdChannel::native_fd() const noexcept { return m_closed ? -1 : m_fd; }
+std::intptr_t FdChannel::native_fd() const noexcept {
+    return m_closed ? -1 : m_fd;
+}
 const ChannelStats& FdChannel::stats() const noexcept { return m_stats; }
 
 IoCapability FdChannel::Capability() const { return m_capability; }
@@ -691,7 +696,7 @@ Result<void> FdChannel::DisableAsync() { return m_async.Disable(); }
 
 bool FdChannel::async_enabled() const noexcept { return m_async.enabled(); }
 
-std::unique_ptr<FdChannel> MakeFdChannel(int fd, bool take_ownership,
+std::unique_ptr<FdChannel> MakeFdChannel(std::intptr_t fd, bool take_ownership,
                                          ChannelOptions options) {
     return std::make_unique<FdChannel>(fd, take_ownership, options);
 }

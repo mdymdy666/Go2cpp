@@ -43,6 +43,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -76,8 +77,8 @@ public:
      */
     static Result<void> Open(int columns, int rows, bool echo, Pty* out);
 
-    int master_fd() const noexcept { return m_master; }
-    int slave_fd() const noexcept { return m_slave; }
+    std::intptr_t master_fd() const noexcept { return m_master; }
+    std::intptr_t slave_fd() const noexcept { return m_slave; }
     const std::string& slave_name() const noexcept { return m_slave_name; }
     bool valid() const noexcept { return m_master >= 0 && m_slave >= 0; }
 
@@ -87,8 +88,8 @@ public:
     /// 开关从端回显（`tcsetattr`）。
     Result<void> SetEcho(bool enabled);
 
-    int ReleaseMaster() noexcept;
-    int ReleaseSlave() noexcept;
+    std::intptr_t ReleaseMaster() noexcept;
+    std::intptr_t ReleaseSlave() noexcept;
     void CloseMaster() noexcept;
     void CloseSlave() noexcept;
 
@@ -136,8 +137,8 @@ private:
     /// 等待 master 可读/可写；按当前模式走 IOManager 或裸 poll。
     Result<void> WaitFor(bool readable, std::chrono::milliseconds timeout);
 
-    int m_master{-1};
-    int m_slave{-1};
+    std::intptr_t m_master{-1};
+    std::intptr_t m_slave{-1};
     std::string m_slave_name;
 
     /// 取异步绑定快照；调用方持有返回的 `shared_ptr` 期间绑定不会被销毁。
