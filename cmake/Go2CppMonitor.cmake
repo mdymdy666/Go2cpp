@@ -34,44 +34,58 @@ endif()
 
 message(STATUS "go2cpp::os::monitor eBPF support: ${GO2CPP_MONITOR_EBPF_AVAILABLE}")
 
-add_library(go2cpp_os_monitor
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/os/monitor/monitor.cpp
-    # 内部接口与可替换实现：SnapshotSink / SnapshotSource / SnapshotStore。
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/os/monitor/interfaces.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/os/monitor/cpu_monitor.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/os/monitor/mem_monitor.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/os/monitor/disk_monitor.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/os/monitor/net_monitor.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/os/monitor/net_ebpf_monitor.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/os/monitor/aggregator.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/os/monitor/pusher.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/os/monitor/manager.cpp
-    # 内核 tracepoint 监控：syscall / sched / futex + 共享的 eBPF 加载工具。
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/os/monitor/kernel_ebpf.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/os/monitor/syscall_monitor.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/os/monitor/sched_monitor.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/os/monitor/futex_monitor.cpp
-    # TCP 重传/RTT（tracepoint）与文件 IO 延迟（kprobe）。
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/os/monitor/tcp_monitor.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/os/monitor/fileio_monitor.cpp)
-
-target_include_directories(go2cpp_os_monitor
-    PUBLIC
+# Windows：os::monitor 依赖 /proc + eBPF/tracepoint（Linux 内核专属），**无法等价移植**。
+# 处理：Windows 上编译为空 INTERFACE 库（保持 target 存在，链接不失败），
+# 功能缺失在文档与调用处明确标注（见 docs/reports/cross-platform-syscall-audit.md TOP5）。
+if(WIN32)
+    add_library(go2cpp_os_monitor INTERFACE)
+    target_include_directories(go2cpp_os_monitor INTERFACE
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
-        # nlohmann/json.hpp 位于 go2cpp/third_party，monitor.hpp 经
-        # go2cpp/tools/json.hpp 间接包含它。
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party>)
-target_compile_features(go2cpp_os_monitor PUBLIC cxx_std_17)
-target_compile_options(go2cpp_os_monitor PRIVATE -Wall -Wextra -Wpedantic)
-target_link_libraries(go2cpp_os_monitor
-    PUBLIC go2cpp_network go2cpp_scheduler go2cpp_channel
-    PRIVATE Threads::Threads)
-set_target_properties(go2cpp_os_monitor PROPERTIES
-    EXPORT_NAME os_monitor
-    POSITION_INDEPENDENT_CODE ON
-    VERSION ${PROJECT_VERSION}
-    SOVERSION 0)
+    target_link_libraries(go2cpp_os_monitor INTERFACE go2cpp_network go2cpp_scheduler go2cpp_channel)
+    message(STATUS "go2cpp::os::monitor: Windows 上为空实现（/proc + eBPF 不可用）")
+else()
+    add_library(go2cpp_os_monitor
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/os/monitor/monitor.cpp
+        # 内部接口与可替换实现：SnapshotSink / SnapshotSource / SnapshotStore。
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/os/monitor/interfaces.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/os/monitor/cpu_monitor.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/os/monitor/mem_monitor.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/os/monitor/disk_monitor.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/os/monitor/net_monitor.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/os/monitor/net_ebpf_monitor.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/os/monitor/aggregator.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/os/monitor/pusher.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/os/monitor/manager.cpp
+        # 内核 tracepoint 监控：syscall / sched / futex + 共享的 eBPF 加载工具。
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/os/monitor/kernel_ebpf.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/os/monitor/syscall_monitor.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/os/monitor/sched_monitor.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/os/monitor/futex_monitor.cpp
+        # TCP 重传/RTT（tracepoint）与文件 IO 延迟（kprobe）。
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/os/monitor/tcp_monitor.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/os/monitor/fileio_monitor.cpp)
+
+    target_include_directories(go2cpp_os_monitor
+        PUBLIC
+            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+            $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+            # nlohmann/json.hpp 位于 go2cpp/third_party，monitor.hpp 经
+            # go2cpp/tools/json.hpp 间接包含它。
+            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party>)
+    target_compile_features(go2cpp_os_monitor PUBLIC cxx_std_17)
+    target_compile_options(go2cpp_os_monitor PRIVATE -Wall -Wextra -Wpedantic)
+    target_link_libraries(go2cpp_os_monitor
+        PUBLIC go2cpp_network go2cpp_scheduler go2cpp_channel
+        PRIVATE Threads::Threads)
+    set_target_properties(go2cpp_os_monitor PROPERTIES
+        EXPORT_NAME os_monitor
+        POSITION_INDEPENDENT_CODE ON
+        VERSION ${PROJECT_VERSION}
+        SOVERSION 0)
+endif()
+
 add_library(go2cpp::os_monitor ALIAS go2cpp_os_monitor)
 
 # 纳入统一的安装/导出集合：Go2CppInstall.cmake 只导出 GO2CPP_MODULE_TARGETS
