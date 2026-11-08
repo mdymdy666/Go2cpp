@@ -82,11 +82,17 @@
 #include "nlohmann/json.hpp"
 
 #include "go2cpp/error.hpp"
+// 解析内部改走自研 go2cpp::json，nlohmann 只保留对外 Json 类型（下一轮
+// debug/CLI/bench 迁移完成后可一并删除）。
+#include "go2cpp/json/parser.hpp"
 
 #include <cstddef>
+#include <cstdlib>
 #include <exception>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 /**
  * ## 模块定位
@@ -127,6 +133,106 @@
  */
 
 namespace go2cpp {
+
+namespace detail {
+
+/// @brief 把一个自研 JSON 标量转成 nlohmann 值。
+inline ::nlohmann::json ScalarToNlohmann(const go2cpp::json::Value& value) {
+    if (value.IsNull()) {
+        return nullptr;
+    }
+    if (value.IsBool()) {
+        bool parsed = false;
+        value.As(parsed);
+        return parsed;
+    }
+    if (value.IsInt()) {
+        std::int64_t parsed = 0;
+        value.As(parsed);
+        return parsed;
+    }
+    if (value.IsDouble()) {
+        double parsed = 0.0;
+        value.As(parsed);
+        return parsed;
+    }
+    if (value.IsDecimal()) {
+        // 自研库用 Decimal 表示超出 int64/double 的数值；nlohmann 没有任意
+        // 精度类型，退化成 double（与 nlohmann 自身对超大数的处理一致）。
+        go2cpp::json::core::Decimal decimal;
+        if (!value.As(decimal)) {
+            return nullptr;
+        }
+        return std::strtod(decimal.ToString().c_str(), nullptr);
+    }
+    if (value.IsString()) {
+        return std::string(value.AsText());
+    }
+    return nullptr;
+}
+
+/// @brief 把自研 Value 转成 nlohmann::json；显式栈迭代，深文档不爆栈。
+inline ::nlohmann::json ToNlohmann(const go2cpp::json::Value& root) {
+    if (!root.IsArray() && !root.IsObject()) {
+        return ScalarToNlohmann(root);
+    }
+
+    struct Frame {
+        go2cpp::json::Value source;
+        ::nlohmann::json local;
+        std::size_t next = 0;
+        std::string parent_key;  ///< 在对象父容器中的键；数组父容器为空。
+    };
+
+    std::vector<Frame> stack;
+    stack.push_back(Frame{root,
+                          root.IsArray() ? ::nlohmann::json::array()
+                                         : ::nlohmann::json::object(),
+                          0,
+                          std::string{}});
+    while (!stack.empty()) {
+        Frame& frame = stack.back();
+        if (frame.next < frame.source.Size()) {
+            const std::size_t index = frame.next++;
+            const go2cpp::json::Value child = frame.source.At(index);
+            std::string key;
+            if (frame.source.IsObject()) {
+                key.assign(frame.source.MemberName(index));
+            }
+            if (child.IsArray() || child.IsObject()) {
+                Frame next_frame;
+                next_frame.source = child;
+                next_frame.local = child.IsArray()
+                                       ? ::nlohmann::json::array()
+                                       : ::nlohmann::json::object();
+                next_frame.parent_key = std::move(key);
+                stack.push_back(std::move(next_frame));
+            } else if (frame.local.is_array()) {
+                frame.local.push_back(ScalarToNlohmann(child));
+            } else {
+                frame.local[key] = ScalarToNlohmann(child);
+            }
+            continue;
+        }
+        // 当前容器处理完：move 到父容器（或作为根返回），再弹帧。
+        ::nlohmann::json finished = std::move(frame.local);
+        std::string key = std::move(frame.parent_key);
+        const bool is_root = stack.size() == 1;
+        stack.pop_back();
+        if (is_root) {
+            return finished;
+        }
+        Frame& parent = stack.back();
+        if (parent.local.is_array()) {
+            parent.local.push_back(std::move(finished));
+        } else {
+            parent.local[key] = std::move(finished);
+        }
+    }
+    return nullptr;
+}
+
+}  // namespace detail
 
 /**
  * @brief JSON 值类型。
@@ -317,14 +423,18 @@ inline JsonParseResult ParseJson(std::string_view text,
                      " 层即早退，完整深度未统计）");
         return result;
     }
-    // step2: 确认不超限后才交给上游；异常一律转成 ErrorPtr。
-    try {
-        result.value = Json::parse(text.begin(), text.end());
-    } catch (const std::exception& failure) {
-        result.error = NewError(std::string("JSON 解析失败: ") + failure.what());
-    } catch (...) {
-        result.error = NewError("JSON 解析失败: 未知异常");
+    // step2: 确认不超限后才交给自研解析器；失败转成 ErrorPtr。
+    go2cpp::json::Document document;
+    go2cpp::json::Parser parser;
+    go2cpp::json::ParserConfig config;
+    config.max_depth = max_depth == kJsonDepthUnlimited ? 0 : max_depth;
+    ErrorPtr parse_error;
+    if (!parser.Parse(text, document, parse_error, config)) {
+        result.error =
+            NewError(std::string("JSON 解析失败: ") + ErrorMessage(parse_error));
+        return result;
     }
+    result.value = detail::ToNlohmann(document.Root());
     return result;
 }
 
