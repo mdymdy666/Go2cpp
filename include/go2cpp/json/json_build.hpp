@@ -85,11 +85,18 @@ class JsonBuilder final {
     auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), value,
                                    std::chars_format::general);
     if (ec == std::errc{}) {
+      const std::size_t start = m_out.size();
       m_out.append(buf, static_cast<std::size_t>(ptr - buf));
-      // 整数形态补 .0（与 writer.hpp 契约一致，保持类型）
-      if (m_out.find('.') == std::string::npos &&
-          m_out.find('e') == std::string::npos &&
-          m_out.find('E') == std::string::npos) {
+      // 整数形态补 .0：只检查本次 to_chars 写入的区间，不看整个 m_out
+      // （否则前文写过的字符串/浮点里的 '.' 会让后续整值 double 漏掉 .0）。
+      bool has_dot = false;
+      for (std::size_t i = start; i < m_out.size(); ++i) {
+        if (m_out[i] == '.' || m_out[i] == 'e' || m_out[i] == 'E') {
+          has_dot = true;
+          break;
+        }
+      }
+      if (!has_dot) {
         m_out.append(".0");
       }
     } else {
