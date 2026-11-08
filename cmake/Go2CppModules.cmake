@@ -270,6 +270,7 @@ add_library(go2cpp_os
     $<$<NOT:$<PLATFORM_ID:Windows>>:${CMAKE_CURRENT_SOURCE_DIR}/src/os/proc.cpp>
     $<$<PLATFORM_ID:Windows>:${CMAKE_CURRENT_SOURCE_DIR}/src/os/proc_win32.cpp>
     $<$<PLATFORM_ID:Windows>:${CMAKE_CURRENT_SOURCE_DIR}/src/os/proc_win32_misc.cpp>
+    $<$<PLATFORM_ID:Windows>:${CMAKE_CURRENT_SOURCE_DIR}/src/os/proc_win32_impl.cpp>
     ${CMAKE_CURRENT_SOURCE_DIR}/src/os/channel.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/os/shm.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/os/mq.cpp
