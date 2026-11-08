@@ -28,6 +28,7 @@
 #pragma once
 
 #include "douyin_shutdown.hpp"
+#include "go2cpp/json/escape.hpp"
 #include "go2cpp/network/socket.hpp"
 
 #include <algorithm>
@@ -370,6 +371,59 @@ inline std::string ErrorBody(int status, std::string_view message) {
            "\",\"code\":" + std::to_string(status) + "}";
 }
 
+/// @brief 解码 `\uXXXX`（含 4 位 hex 与 UTF-16 代理对），写入 UTF-8 字节。
+///
+/// @param body [in] 完整 JSON 文本；借用，调用期间有效。
+/// @param pos [in,out] 指向 `\u` 之后第一个 hex 位的下标；成功时前进到序列末尾
+///        （普通码点 +4，代理对 +10，因为第二个 `\u` 前后还有 4 位 hex 与 `\u`）。
+/// @param out [in,out] 目标字符串；成功时追加 UTF-8 字节，失败时保持原值。
+/// @return 成功 true；hex 位数不足、含非法字符、孤立代理、代理对残缺均返回 false。
+///
+/// ## 定位
+/// 本函数是 douyin 侧 `\u` 的**唯一解码点**。旧实现把 `u` 当普通字符追加，
+/// 导致 `"\u6f14"` 落库成字面量 `u6f14`（P0 用户可见 bug）。解码语义直接复用
+/// `go2cpp::json::escape` 的权威实现，避免两处逻辑各自漂移。
+///
+/// ## 并发/失败语义
+/// - 纯函数，只操作传入的字符串视图与输出缓冲，无线程约束；
+/// - 失败时 `pos` 与 `out` 均保持不变，由调用方把整个字段判为解析失败。
+inline bool DecodeJsonUnicodeEscape(std::string_view body, std::size_t* pos,
+                                    std::string* out) {
+    const std::size_t start = *pos;
+    if (body.size() - start < 4) {
+        return false;
+    }
+    go2cpp::json::EscapeError error;
+    std::uint32_t unit = 0;
+    // step1. 先解出首个 UTF-16 码元，判定是否需要代理对。
+    if (!go2cpp::json::DecodeUnicodeEscape(body.substr(start, 4), &unit, &error)) {
+        return false;
+    }
+    std::uint32_t code_point = unit;
+    std::size_t consumed = 4;
+    if (unit >= 0xD800u && unit <= 0xDBFFu) {
+        // step2. 高代理：后面必须紧跟 `\uDCxx`，否则是非法序列（不静默吞掉）。
+        if (body.size() - start < 10 || body[start + 4] != '\\' ||
+            body[start + 5] != 'u') {
+            return false;
+        }
+        std::uint32_t low = 0;
+        if (!go2cpp::json::DecodeUnicodeEscape(body.substr(start + 6, 4), &low,
+                                               &error) ||
+            !go2cpp::json::CombineSurrogates(unit, low, &code_point, &error)) {
+            return false;
+        }
+        consumed = 10;
+    } else if (unit >= 0xDC00u && unit <= 0xDFFFu) {
+        // step3. 孤立低代理没有前置高代理，按非法 JSON 拒绝。
+        return false;
+    }
+    // step4. 合法码点直接按 UTF-8 追加；代理区码点已被上面两条分支挡掉。
+    go2cpp::json::AppendUtf8(code_point, out);
+    *pos = start + consumed;
+    return true;
+}
+
 /// @brief 从 JSON 文本里取字符串字段（只支持本项目固定结构，解析失败返回 false）。
 inline bool JsonStringField(std::string_view body, std::string_view key, std::string* out) {
     const std::string needle = "\"" + std::string(key) + "\"";
@@ -405,6 +459,12 @@ inline bool JsonStringField(std::string_view body, std::string_view key, std::st
                 case '"': value += '"'; break;
                 case '\\': value += '\\'; break;
                 case '/': value += '/'; break;
+                case 'u':
+                    // `\uXXXX`：交给 go2cpp::json 的权威解码（含代理对）。
+                    if (!DecodeJsonUnicodeEscape(body, &pos, &value)) {
+                        return false;
+                    }
+                    break;
                 default: value += escaped; break;
             }
             continue;

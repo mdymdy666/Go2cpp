@@ -58,10 +58,13 @@ CXXFLAGS=(-std=c++17 -O2 -g -Wall -Wextra -Wpedantic -Werror -Wno-unused-paramet
           -DDOUYIN_WEB_DIR="\"$ROOT/web\"")
 
 # network 依赖 io/sync/context 等，用 --start-group 消掉静态顺序问题。
+# json：douyin_http.hpp 的 JsonStringField 复用 go2cpp::json 的 \uXXXX 解码
+# （含代理对），因此每个可执行文件都要链接 libgo2cpp_json。
 LDFLAGS=(-L"$BUILD_LIB" -Wl,-rpath,"$BUILD_LIB" -Wl,--start-group
          -lgo2cpp_network -lgo2cpp_io -lgo2cpp_sync -lgo2cpp_context
-         -lgo2cpp_error -lgo2cpp_scheduler -lgo2cpp_fiber -lgo2cpp_log
-         -lgo2cpp_hash -lgo2cpp_metrics -lgo2cpp_compress -Wl,--end-group -lpthread)
+         -lgo2cpp_error -lgo2cpp_json -lgo2cpp_scheduler -lgo2cpp_fiber
+         -lgo2cpp_log -lgo2cpp_hash -lgo2cpp_metrics -lgo2cpp_compress
+         -Wl,--end-group -lpthread)
 
 # user 服务额外依赖 storage（libgo2cpp_storage.so + 系统 sqlite3）。
 EXTRA_LDLIBS=()
