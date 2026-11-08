@@ -57,7 +57,10 @@ std::string DrainOpenSslErrors() {
 // 信号系统调用。读也走 recv，保持 OpenSSL 的 retry 标志语义不变。
 int NoSignalBioWrite(BIO* bio, const char* data, int len) {
     BIO_clear_retry_flags(bio);
-    const int fd = static_cast<int>(reinterpret_cast<std::intptr_t>(BIO_get_data(bio)));
+    const std::intptr_t handle =
+        reinterpret_cast<std::intptr_t>(BIO_get_data(bio));
+    // BIO 承载的是原生句柄；Linux 的 send/setsockopt 参数是 int。
+    const int fd = static_cast<int>(handle);
     ssize_t written;
     do {
         written = ::send(fd, data, static_cast<std::size_t>(len), MSG_NOSIGNAL);
@@ -73,7 +76,9 @@ int NoSignalBioWrite(BIO* bio, const char* data, int len) {
 
 int NoSignalBioRead(BIO* bio, char* data, int len) {
     BIO_clear_retry_flags(bio);
-    const int fd = static_cast<int>(reinterpret_cast<std::intptr_t>(BIO_get_data(bio)));
+    const std::intptr_t handle =
+        reinterpret_cast<std::intptr_t>(BIO_get_data(bio));
+    const int fd = static_cast<int>(handle);
     ssize_t got;
     do {
         got = ::recv(fd, data, static_cast<std::size_t>(len), 0);
@@ -88,7 +93,9 @@ int NoSignalBioRead(BIO* bio, char* data, int len) {
 }
 
 long NoSignalBioCtrl(BIO* bio, int cmd, long /*num*/, void* ptr) {
-    const int fd = static_cast<int>(reinterpret_cast<std::intptr_t>(BIO_get_data(bio)));
+    const std::intptr_t handle =
+        reinterpret_cast<std::intptr_t>(BIO_get_data(bio));
+    const int fd = static_cast<int>(handle);
     switch (cmd) {
         case BIO_CTRL_FLUSH:
             return 1;
@@ -140,7 +147,7 @@ BIO_METHOD* NoSignalBioMethod() {
 
 /// 给 SSL 挂上 MSG_NOSIGNAL BIO；失败返回 false，调用方回退 SSL_set_fd
 /// （回退路径仍由 ScopedSigpipeBlock 兜底）。
-bool AttachNoSignalBio(SSL* ssl, int fd) {
+bool AttachNoSignalBio(SSL* ssl, std::intptr_t fd) {
     BIO_METHOD* method = NoSignalBioMethod();
     if (method == nullptr) {
         return false;
@@ -149,7 +156,7 @@ bool AttachNoSignalBio(SSL* ssl, int fd) {
     if (bio == nullptr) {
         return false;
     }
-    BIO_set_data(bio, reinterpret_cast<void*>(static_cast<std::intptr_t>(fd)));
+    BIO_set_data(bio, reinterpret_cast<void*>(fd));
     SSL_set_bio(ssl, bio, bio);
     return true;
 }
@@ -313,13 +320,16 @@ std::unique_ptr<TlsTransport> TlsTransport::CreateClient(
     }
     // 关键：把 socket 设为非阻塞，避免 SSL 内部阻塞整个 worker 线程。
     // 本项目的 hook 会拦截 poll，让它变成 Fiber 友好的等待。
-    ::fcntl(transport->m_fd, F_SETFL, ::fcntl(transport->m_fd, F_GETFL, 0) | O_NONBLOCK);
+    ::fcntl(static_cast<int>(transport->m_fd), F_SETFL,
+            ::fcntl(static_cast<int>(transport->m_fd), F_GETFL, 0) | O_NONBLOCK);
     // 优先挂 send(MSG_NOSIGNAL) 的自定义 BIO；失败回退 SSL_set_fd，
     // 由 ScopedSigpipeBlock 继续兜底。
     transport->m_nosignal_bio =
         AttachNoSignalBio(transport->m_ssl, transport->m_fd);
     if (!transport->m_nosignal_bio &&
-        SSL_set_fd(transport->m_ssl, transport->m_fd) != 1) {
+        // OpenSSL 的回退接口 `SSL_set_fd` 形参是 int（其 fd 语义在 Windows 上
+        // 无法承载 64 位 SOCKET）；Windows 必须走上面的自定义 BIO 路径。
+        SSL_set_fd(transport->m_ssl, static_cast<int>(transport->m_fd)) != 1) {
         return nullptr;
     }
     if (!server_name.empty()) {
@@ -401,7 +411,8 @@ bool TlsTransport::WaitFor(bool want_read,
             slice = Duration{1};
         }
         struct pollfd pfd;
-        pfd.fd = m_fd;
+        // poll(2) 的 fd 字段是 int；Linux 句柄必在 int 范围。
+        pfd.fd = static_cast<int>(m_fd);
         pfd.events = want_read ? POLLIN : POLLOUT;
         pfd.revents = 0;
         const int result = ::poll(&pfd, 1, static_cast<int>(slice.count()));

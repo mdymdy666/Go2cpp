@@ -234,8 +234,9 @@ private:
     std::string m_last_error;
     /// 保护 m_last_error；RecordSslError() 写、LastErrorString() 读。
     mutable std::mutex m_error_mutex;
-    /// socket fd 副本；构造时取，WaitFor() 与 SSL_set_fd() 使用。
-    int m_fd{-1};
+    /// socket 句柄副本；构造时取，WaitFor() 与自定义 BIO 使用。
+    /// 用 `std::intptr_t`：Windows 的 `SOCKET` 是 64 位，int 会截断。
+    std::intptr_t m_fd{-1};
     /// 是否已挂上 send(MSG_NOSIGNAL) 的自定义 BIO：true 时 SSL_* 不再
     /// 产生 SIGPIPE，写路径跳过 ScopedSigpipeBlock 的信号系统调用。
     bool m_nosignal_bio{false};
