@@ -52,7 +52,7 @@
 #include "transport.hpp"
 
 #include "go2cpp/debug/diagnostic_protocol.hpp"
-#include "nlohmann/json.hpp"
+#include "go2cpp/json.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -81,7 +81,7 @@
 namespace go2cpp::cli {
 namespace {
 
-using nlohmann::json;
+using json = go2cpp::Json;
 using Clock = std::chrono::steady_clock;
 namespace protocol = go2cpp::debug;
 
@@ -100,15 +100,14 @@ constexpr std::uint64_t kMaxFileBytes = 64ULL * 1024ULL * 1024ULL;
 // ---------------------------------------------------------------------------
 
 bool Has(const json& object, const char* key) {
-    return object.is_object() && object.find(key) != object.end();
+    return object.is_object() && object.find(key) != nullptr;
 }
 
 const json* Get(const json& object, const char* key) {
     if (!object.is_object()) {
         return nullptr;
     }
-    const auto it = object.find(key);
-    return it == object.end() ? nullptr : &(*it);
+    return object.find(key);
 }
 
 std::uint64_t U64(const json& object, const char* key, std::uint64_t fallback = 0) {

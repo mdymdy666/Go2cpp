@@ -35,7 +35,7 @@
 #include "help.hpp"
 #include "transport.hpp"
 
-#include "nlohmann/json.hpp"
+#include "go2cpp/json.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -181,7 +181,7 @@ std::string FindExecutable(const std::string& name) {
     return found;
 }
 
-std::string RenderJson(const nlohmann::json& value) {
+std::string RenderJson(const go2cpp::Json& value) {
     return value.dump(2) + "\n";
 }
 
@@ -200,25 +200,25 @@ void WriteOutput(const std::string& out, const std::string& content) {
     std::fflush(stdout);
 }
 
-const nlohmann::json* Dig(const nlohmann::json& root,
+const go2cpp::Json* Dig(const go2cpp::Json& root,
                           std::initializer_list<const char*> path) {
-    const nlohmann::json* node = &root;
+    const go2cpp::Json* node = &root;
     for (const char* key : path) {
         if (!node->is_object()) {
             return nullptr;
         }
-        const auto it = node->find(key);
-        if (it == node->end()) {
+        const go2cpp::Json* next = node->find(key);
+        if (next == nullptr) {
             return nullptr;
         }
-        node = &(*it);
+        node = next;
     }
     return node;
 }
 
-std::optional<double> FindNumber(const nlohmann::json& root,
+std::optional<double> FindNumber(const go2cpp::Json& root,
                                  std::initializer_list<const char*> path) {
-    const nlohmann::json* node = Dig(root, path);
+    const go2cpp::Json* node = Dig(root, path);
     if (node != nullptr && node->is_number()) {
         return node->get<double>();
     }
@@ -328,9 +328,9 @@ ComponentSelection ParseSections(const std::string& text) {
     return selection;
 }
 
-nlohmann::json ParseJsonPayload(const std::string& payload, const char* what) {
+go2cpp::Json ParseJsonPayload(const std::string& payload, const char* what) {
     try {
-        return nlohmann::json::parse(payload);
+        return go2cpp::Json::parse(payload);
     } catch (const std::exception& error) {
         throw CliError(ExitCode::kFailure,
                        std::string("DebugServer 返回的 ") + what + " 不是合法 JSON：" +
@@ -338,22 +338,22 @@ nlohmann::json ParseJsonPayload(const std::string& payload, const char* what) {
     }
 }
 
-nlohmann::json ParseJsonText(const std::string& content, const std::string& path,
+go2cpp::Json ParseJsonText(const std::string& content, const std::string& path,
                              const char* what) {
     try {
-        return nlohmann::json::parse(content);
+        return go2cpp::Json::parse(content);
     } catch (const std::exception& error) {
         throw CliError(ExitCode::kFormat,
                        std::string(what) + " JSON 解析失败：'" + path + "'：" + error.what());
     }
 }
 
-std::string StateOf(const nlohmann::json& item) {
+std::string StateOf(const go2cpp::Json& item) {
     if (!item.is_object()) {
         return {};
     }
-    const auto it = item.find("state");
-    if (it == item.end()) {
+    const go2cpp::Json* const it = item.find("state");
+    if (it == nullptr) {
         return {};
     }
     if (it->is_string()) {
@@ -365,12 +365,12 @@ std::string StateOf(const nlohmann::json& item) {
     return it->dump();
 }
 
-std::string ReasonOf(const nlohmann::json& item) {
+std::string ReasonOf(const go2cpp::Json& item) {
     if (!item.is_object()) {
         return {};
     }
-    const auto it = item.find("suspend_reason");
-    if (it == item.end()) {
+    const go2cpp::Json* const it = item.find("suspend_reason");
+    if (it == nullptr) {
         return {};
     }
     if (it->is_string()) {
@@ -382,13 +382,13 @@ std::string ReasonOf(const nlohmann::json& item) {
     return it->dump();
 }
 
-std::string EventTypeOf(const nlohmann::json& item) {
+std::string EventTypeOf(const go2cpp::Json& item) {
     if (!item.is_object()) {
         return {};
     }
     for (const char* key : {"type", "event", "name", "kind"}) {
-        const auto it = item.find(key);
-        if (it == item.end()) {
+        const go2cpp::Json* const it = item.find(key);
+        if (it == nullptr) {
             continue;
         }
         if (it->is_string()) {
@@ -401,7 +401,7 @@ std::string EventTypeOf(const nlohmann::json& item) {
     return {};
 }
 
-std::string CompactJson(const nlohmann::json& value, std::size_t limit = 240) {
+std::string CompactJson(const go2cpp::Json& value, std::size_t limit = 240) {
     std::string text;
     try {
         text = value.dump();
@@ -767,7 +767,7 @@ int RunDumpImpl(const std::vector<std::string>& args) {
     } else {
         // 逐组件请求：这样「目标进程未注册该组件」能准确报出来，而不是被 ALL
         // 静默省略。任一组件不可用即整体失败，避免输出半份 dump。
-        nlohmann::json components = nlohmann::json::object();
+        go2cpp::Json components = go2cpp::Json::object();
         std::string text;
         text += "schema=go2cpp-cli.dump.selection/1\n";
         text += "version=1\n";
@@ -794,7 +794,7 @@ int RunDumpImpl(const std::vector<std::string>& args) {
             }
         }
         if (as_json) {
-            nlohmann::json aggregate;
+            go2cpp::Json aggregate;
             aggregate["schema"] = "go2cpp-cli.dump.selection/1";
             aggregate["version"] = 1;
             aggregate["components"] = std::move(components);
@@ -808,14 +808,14 @@ int RunDumpImpl(const std::vector<std::string>& args) {
     return 0;
 }
 
-std::string TaskDistribution(const nlohmann::json& tasks, std::size_t* count) {
+std::string TaskDistribution(const go2cpp::Json& tasks, std::size_t* count) {
     *count = 0;
     if (!tasks.is_array()) {
         return {};
     }
     *count = tasks.size();
     std::map<std::string, std::uint64_t> states;
-    for (const nlohmann::json& task : tasks) {
+    for (const go2cpp::Json& task : tasks) {
         const std::string state = StateOf(task);
         if (!state.empty()) {
             ++states[state];
@@ -832,7 +832,7 @@ std::string TaskDistribution(const nlohmann::json& tasks, std::size_t* count) {
 }
 
 void PrintStatus(const std::map<std::string, std::string>& status,
-                 const nlohmann::json& scheduler, bool has_scheduler, int pid) {
+                 const go2cpp::Json& scheduler, bool has_scheduler, int pid) {
     int missing = 0;
     std::printf("目标进程: pid=%d\n", pid);
 
@@ -880,8 +880,8 @@ void PrintStatus(const std::map<std::string, std::string>& status,
                     : "?");
 
     std::size_t task_count = 0;
-    const nlohmann::json* tasks = Dig(scheduler, {"tasks"});
-    const std::string distribution = TaskDistribution(tasks != nullptr ? *tasks : nlohmann::json(), &task_count);
+    const go2cpp::Json* tasks = Dig(scheduler, {"tasks"});
+    const std::string distribution = TaskDistribution(tasks != nullptr ? *tasks : go2cpp::Json(), &task_count);
     if (tasks != nullptr && tasks->is_array()) {
         std::printf("任务: %zu 个", task_count);
         if (!distribution.empty()) {
@@ -895,7 +895,7 @@ void PrintStatus(const std::map<std::string, std::string>& status,
 
     const auto local_total = FindNumber(scheduler, {"runqueue", "local_total"});
     const auto global_queue = FindNumber(scheduler, {"runqueue", "global"});
-    const nlohmann::json* processors = Dig(scheduler, {"processors"});
+    const go2cpp::Json* processors = Dig(scheduler, {"processors"});
     std::string line = "runqueue: ";
     line += local_total ? "local=" + FormatCount(*local_total) : "local=?";
     line += global_queue ? " global=" + FormatCount(*global_queue) : " global=?";
@@ -977,7 +977,7 @@ int RunStatusImpl(const std::vector<std::string>& args) {
     const DebugReply status_reply = client.Call("STATUS");
     const std::map<std::string, std::string> status = ParseKeyValueText(status_reply.payload);
 
-    nlohmann::json scheduler;
+    go2cpp::Json scheduler;
     bool has_scheduler = true;
     try {
         const DebugReply reply = client.Call("JSON scheduler");
@@ -991,7 +991,7 @@ int RunStatusImpl(const std::vector<std::string>& args) {
     }
 
     if (parsed.Has("--json")) {
-        nlohmann::json out;
+        go2cpp::Json out;
         out["status"] = status;
         if (has_scheduler) {
             out["scheduler"] = scheduler;
@@ -1275,7 +1275,7 @@ int RunReplayPlay(const std::vector<std::string>& args) {
     // 退出码 0 还不够：必须确认引擎真的执行了重放，而不是只做了静态分析。
     bool replay_executed = false;
     try {
-        const nlohmann::json report = nlohmann::json::parse(backend_result.output);
+        const go2cpp::Json report = go2cpp::Json::parse(backend_result.output);
         replay_executed = report.value("replay_executed", false);
     } catch (const std::exception&) {
         throw CliError(
@@ -1523,9 +1523,9 @@ TraceStats ParseTraceText(const std::string& content, std::size_t top) {
     return stats;
 }
 
-void PrintJsonDumpStats(const FileProbe& probe, const nlohmann::json& root, std::size_t top,
+void PrintJsonDumpStats(const FileProbe& probe, const go2cpp::Json& root, std::size_t top,
                         bool as_json) {
-    nlohmann::json stats = nlohmann::json::object();
+    go2cpp::Json stats = go2cpp::Json::object();
     stats["file"] = probe.path;
     stats["size_bytes"] = probe.size;
     stats["format"] = FileFormatName(probe.format);
@@ -1534,7 +1534,7 @@ void PrintJsonDumpStats(const FileProbe& probe, const nlohmann::json& root, std:
         if (root.contains("schema") && root["schema"].is_string()) {
             stats["schema"] = root["schema"];
         }
-        nlohmann::json keys = nlohmann::json::array();
+        go2cpp::Json keys = go2cpp::Json::array();
         for (auto it = root.begin(); it != root.end(); ++it) {
             keys.push_back(it.key());
         }
@@ -1542,9 +1542,9 @@ void PrintJsonDumpStats(const FileProbe& probe, const nlohmann::json& root, std:
     }
 
     std::uint64_t fiber_count = 0;
-    nlohmann::json fiber_states = nlohmann::json::object();
-    nlohmann::json suspend_reasons = nlohmann::json::object();
-    const nlohmann::json* fibers = Dig(root, {"fibers"});
+    go2cpp::Json fiber_states = go2cpp::Json::object();
+    go2cpp::Json suspend_reasons = go2cpp::Json::object();
+    const go2cpp::Json* fibers = Dig(root, {"fibers"});
     if (fibers == nullptr) {
         fibers = Dig(root, {"tasks"});
     }
@@ -1553,7 +1553,7 @@ void PrintJsonDumpStats(const FileProbe& probe, const nlohmann::json& root, std:
     }
     if (fibers != nullptr && fibers->is_array()) {
         fiber_count = static_cast<std::uint64_t>(fibers->size());
-        for (const nlohmann::json& fiber : *fibers) {
+        for (const go2cpp::Json& fiber : *fibers) {
             const std::string state = StateOf(fiber);
             if (!state.empty()) {
                 fiber_states[state] = fiber_states.value(state, 0) + 1;
@@ -1569,15 +1569,15 @@ void PrintJsonDumpStats(const FileProbe& probe, const nlohmann::json& root, std:
     stats["suspend_reasons"] = suspend_reasons;
 
     std::uint64_t event_count = 0;
-    nlohmann::json event_types = nlohmann::json::object();
-    nlohmann::json timeline = nlohmann::json::array();
-    const nlohmann::json* events = Dig(root, {"events"});
+    go2cpp::Json event_types = go2cpp::Json::object();
+    go2cpp::Json timeline = go2cpp::Json::array();
+    const go2cpp::Json* events = Dig(root, {"events"});
     if (events == nullptr) {
         events = Dig(root, {"trace"});
     }
     if (events != nullptr && events->is_array()) {
         event_count = static_cast<std::uint64_t>(events->size());
-        for (const nlohmann::json& event : *events) {
+        for (const go2cpp::Json& event : *events) {
             const std::string type = EventTypeOf(event);
             if (!type.empty()) {
                 event_types[type] = event_types.value(type, 0) + 1;
@@ -1653,7 +1653,7 @@ void PrintJsonDumpStats(const FileProbe& probe, const nlohmann::json& root, std:
 
 void PrintTraceDumpStats(const FileProbe& probe, const TraceStats& stats, bool as_json) {
     if (as_json) {
-        nlohmann::json out = nlohmann::json::object();
+        go2cpp::Json out = go2cpp::Json::object();
         out["file"] = probe.path;
         out["size_bytes"] = probe.size;
         out["format"] = FileFormatName(probe.format);
@@ -1661,12 +1661,12 @@ void PrintTraceDumpStats(const FileProbe& probe, const TraceStats& stats, bool a
         out["input"] = stats.input;
         out["output"] = stats.output;
         out["unparsed"] = stats.unparsed;
-        nlohmann::json types = nlohmann::json::object();
+        go2cpp::Json types = go2cpp::Json::object();
         for (const auto& [name, count] : stats.event_types) {
             types[name] = count;
         }
         out["event_types"] = types;
-        nlohmann::json timeline = nlohmann::json::array();
+        go2cpp::Json timeline = go2cpp::Json::array();
         for (const std::string& line : stats.timeline) {
             timeline.push_back(line);
         }
@@ -1729,7 +1729,7 @@ void PrintIniDumpStats(const FileProbe& probe, bool as_json) {
     }
 
     if (as_json) {
-        nlohmann::json out = nlohmann::json::object();
+        go2cpp::Json out = go2cpp::Json::object();
         out["file"] = probe.path;
         out["size_bytes"] = probe.size;
         out["format"] = FileFormatName(probe.format);
@@ -1782,7 +1782,7 @@ void PrintReplayBinaryStats(const FileProbe& probe, std::size_t top, bool as_jso
     const std::uint64_t producer = ReadLeU64(head, 24);
 
     if (as_json) {
-        nlohmann::json out;
+        go2cpp::Json out;
         out["file"] = probe.path;
         out["size_bytes"] = probe.size;
         out["format"] = "replay-binary";
@@ -1812,7 +1812,7 @@ void PrintMigrationBinaryStats(const FileProbe& probe, bool as_json) {
         (static_cast<std::uint32_t>(static_cast<unsigned char>(head[23])) << 24));
 
     if (as_json) {
-        nlohmann::json out;
+        go2cpp::Json out;
         out["file"] = probe.path;
         out["size_bytes"] = probe.size;
         out["format"] = "migration-binary";
@@ -1853,7 +1853,7 @@ int RunDebugImpl(const std::vector<std::string>& args) {
     switch (probe.format) {
         case FileFormat::kJson: {
             const std::string content = ReadTextFile(probe.path, kMaxFileBytes);
-            const nlohmann::json root = ParseJsonText(content, probe.path, "dump");
+            const go2cpp::Json root = ParseJsonText(content, probe.path, "dump");
             PrintJsonDumpStats(probe, root, top, as_json);
             return 0;
         }
