@@ -1338,5 +1338,8 @@ if (GO2CPP_BUILD_TESTS)
 
 endif()
 
+# ---- 乱序直方图（P0-2）：纯计算模块，库与测试目标见该文件 ----
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Go2CppReorderHistogram.cmake)
+
 # ---- 自适应 FEC 冗余度（P1-2）：纯计算模块，库与测试目标见该文件 ----
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Go2CppFecController.cmake)
