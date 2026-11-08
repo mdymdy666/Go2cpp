@@ -1484,6 +1484,13 @@ ViewJson GmpView(const ViewJson& scheduler,
     return gmp;
 }
 
+// GCC 13 在 -O3 下会针对 std::variant 递归存储的移动构造报
+// -Wmaybe-uninitialized 误报（位置落在 basic_string/stl_tree 的系统头里）。
+// 这里只对这一个函数做抑制，避免把项目级的 -Wno-... 打开。
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+#endif
 ViewJson TimerView(const ViewJson& timer_service,
                    const std::vector<EventRecord>& events) {
     ViewJson view = ViewJson::object();
@@ -1695,6 +1702,9 @@ ViewJson TimerView(const ViewJson& timer_service,
     view["pairing"] = pairing;
     return view;
 }
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
 ViewJson ParkView(const std::vector<ParkPair>& pairs,
                   const ViewJson& scheduler) {

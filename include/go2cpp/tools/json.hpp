@@ -462,8 +462,8 @@ public:
         const std::string& key() const noexcept {
             return m_kind == Kind::kObject ? m_object->first : empty_key();
         }
-        /// @brief 当前值（同 `operator*`）。
-        const Json& value() const noexcept { return *m_array; }
+        /// @brief 当前值（同 `operator*`；对象迭代取成员值，不能直接解引用 m_array）。
+        const Json& value() const noexcept { return operator*(); }
 
     private:
         friend class Json;
