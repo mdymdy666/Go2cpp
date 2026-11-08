@@ -67,7 +67,8 @@ if (GO2CPP_WITH_BENTO)
     # 零警告是验收条件：本模块独立编译，-Werror 把回归挡在构建期。
     target_compile_options(go2cpp_bento PRIVATE -Wall -Wextra -Wpedantic -Werror
         ${BENTO_OPT_FLAGS})
-    target_link_libraries(go2cpp_bento PUBLIC Threads::Threads)
+    # link.cpp 复用 platform::SetReuseAddr（SO_REUSEADDR 语义反转）。
+    target_link_libraries(go2cpp_bento PUBLIC Threads::Threads go2cpp_platform)
     # 帧校验和复用 hash 模块（CRC-32/IEEE，slicing-by-8）。完整构建下该目标
     # 必然已存在；standalone 只构建 Bento 时把 hash 的两个源文件并入本目标，
     # 避免为两处 CRC 依赖引入整个模块构建。
@@ -127,7 +128,8 @@ if (GO2CPP_WITH_BENTO)
     target_compile_features(go2cpp_bento_transport PUBLIC cxx_std_17)
     target_compile_options(go2cpp_bento_transport PRIVATE
         -Wall -Wextra -Wpedantic -Werror ${BENTO_OPT_FLAGS})
-    target_link_libraries(go2cpp_bento_transport PUBLIC Threads::Threads)
+    # tcp_transport.cpp 复用 platform::SetReuseAddr。
+    target_link_libraries(go2cpp_bento_transport PUBLIC Threads::Threads go2cpp_platform)
     set_target_properties(go2cpp_bento_transport PROPERTIES POSITION_INDEPENDENT_CODE ON)
     add_library(go2cpp::bento_transport ALIAS go2cpp_bento_transport)
 

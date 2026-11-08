@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <iomanip>
 #include <mutex>
@@ -27,6 +28,7 @@
 #include <utility>
 
 #include "go2cpp/network/endian.hpp"
+#include "go2cpp/platform/socket_option.hpp"
 
 namespace go2cpp::bento {
 namespace {
@@ -308,16 +310,39 @@ bool UdpSocket::Open(const std::string& bind_address, std::uint16_t port, std::s
             int v6_only = 0;
             (void)::setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6_only, sizeof(v6_only));
         }
-        const int reuse = 1;
-        (void)::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+        // 跨平台「重启不失败」语义：Linux 用 SO_REUSEADDR（只复用 TIME_WAIT）；
+        // Windows 用 SO_EXCLUSIVEADDRUSE + SO_LINGER{1,0}——Windows 的
+        // SO_REUSEADDR 允许其他进程抢绑同一端口（端口劫持），绝不能直接用。
+        // 设置失败就换下一个地址：在 Windows 上忽略失败等于放弃独占，不能
+        // 静默继续监听。
+        int reuse_error = 0;
+        if (!go2cpp::platform::SetReuseAddr(fd, &reuse_error)) {
+            last_error = std::string("SetReuseAddr: ") + std::strerror(reuse_error);
+            ::close(fd);
+            continue;
+        }
         if (reuse_port) {
+#if !defined(_WIN32)
             // 多队列必须所有 socket 都设 REUSEPORT，否则第二个 bind 直接
             // EADDRINUSE。失败时明确报错，由 Link 回退单队列而不是静默半开。
+            const int reuse = 1;
             if (::setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse)) != 0) {
                 last_error = std::string("SO_REUSEPORT: ") + std::strerror(errno);
                 ::close(fd);
                 continue;
             }
+#else
+            // Windows（Winsock）没有 SO_REUSEPORT，也不能拿 SO_REUSEADDR 顶替：
+            // 后者在 Windows 上允许别人抢绑同一端口。这里显式告警一次，再按
+            // 单进程监听继续——其余队列会在 bind 时失败，由 Link 退化为单队列，
+            // 调用方从这条 warning 能知道多进程/多队列语义已经丢失。
+            static std::once_flag reuse_port_warned;
+            std::call_once(reuse_port_warned, [] {
+                std::fprintf(stderr,
+                             "[bento][warn] SO_REUSEPORT is unavailable on Windows; "
+                             "UdpSocket degrades to single-process listen\n");
+            });
+#endif
         }
         // 突发流量下内核接收队列是 UDP 的第一道丢包点：默认 rmem ~212KB，
         // 多 peer 场景下 150 个 80B 小包叠加 skb 开销就可能溢出。统一抬到

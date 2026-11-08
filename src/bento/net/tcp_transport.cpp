@@ -26,6 +26,8 @@
 #include <string>
 #include <vector>
 
+#include "go2cpp/platform/socket_option.hpp"
+
 namespace go2cpp::bento::net {
 namespace {
 
@@ -300,8 +302,17 @@ Result TcpTransport::Listen(const Endpoint& bind_endpoint, int backlog) {
             continue;
         }
 
-        int reuse = 1;
-        (void)::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+        // 跨平台「重启不失败」语义：Linux 用 SO_REUSEADDR（只复用 TIME_WAIT）；
+        // Windows 用 SO_EXCLUSIVEADDRUSE + SO_LINGER{1,0}——Windows 的
+        // SO_REUSEADDR 允许其他进程抢绑同一端口（端口劫持），绝不能直接用。
+        // 设置失败就换下一个地址：在 Windows 上忽略失败等于放弃独占，不能
+        // 静默继续监听。
+        int reuse_error = 0;
+        if (!go2cpp::platform::SetReuseAddr(fd, &reuse_error)) {
+            last_error = reuse_error;
+            (void)::close(fd);
+            continue;
+        }
         if (entry.storage.ss_family == AF_INET6) {
             // 双栈监听：绑定 :: 时同时接受 IPv4 映射地址，部署更省事。
             int v6_only = 0;
