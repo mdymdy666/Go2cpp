@@ -28,7 +28,7 @@ using go2cpp::json::FieldRule;
 using go2cpp::json::Reader;
 using go2cpp::json::RowView;
 using go2cpp::reflect::kBoolType;
-using go2cpp::reflect::kDecimalType;
+using go2cpp::json::core::kDecimalType;
 using go2cpp::reflect::kDoubleType;
 using go2cpp::reflect::kInt32Type;
 using go2cpp::reflect::kStringType;

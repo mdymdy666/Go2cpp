@@ -70,7 +70,7 @@ void TestZeroAllocation() {
   std::printf("\n[1] 零分配证据...\n");
   const std::size_t base = g_new_calls.load(std::memory_order_relaxed);
   {
-    extened::KInlineStack<int, 8> stack;
+    go2cpp::KInlineStack<int, 8> stack;
     for (int i = 0; i < 8; ++i) {
       stack.push(i);
     }
@@ -82,7 +82,7 @@ void TestZeroAllocation() {
   std::printf("  深度 8（N=8）分配次数: %zu\n", inline_allocs);
   CHECK(inline_allocs == 0u);
 
-  extened::KInlineStack<int, 8> stack;
+  go2cpp::KInlineStack<int, 8> stack;
   for (int i = 0; i < 8; ++i) {
     stack.push(i);
   }
@@ -98,7 +98,7 @@ void TestZeroAllocation() {
 /// @brief 2. LIFO 顺序。
 void TestLifoOrder() {
   std::printf("\n[2] LIFO 顺序...\n");
-  extened::KInlineStack<std::string, 4> stack;
+  go2cpp::KInlineStack<std::string, 4> stack;
   stack.push("a");
   stack.push("b");
   stack.push("c");
@@ -117,7 +117,7 @@ void TestNonTrivial() {
   std::printf("\n[3] 非平凡类型...\n");
   Tracked::Reset();
   {
-    extened::KInlineStack<Tracked, 3> stack;
+    go2cpp::KInlineStack<Tracked, 3> stack;
     for (int i = 0; i < 6; ++i) {
       stack.push(Tracked(i));
     }
@@ -136,26 +136,26 @@ void TestNonTrivial() {
 /// @brief 4. 拷贝/移动/赋值。
 void TestCopyMove() {
   std::printf("\n[4] 拷贝 / 移动...\n");
-  extened::KInlineStack<int, 3> source;
+  go2cpp::KInlineStack<int, 3> source;
   for (int i = 0; i < 5; ++i) {
     source.push(i);
   }
 
-  extened::KInlineStack<int, 3> copied(source);
+  go2cpp::KInlineStack<int, 3> copied(source);
   CHECK(copied.size() == source.size());
   CHECK(copied.top() == source.top());
   copied.pop();
   CHECK(source.size() == 5u);  // 拷贝独立
 
-  extened::KInlineStack<int, 3> moved(std::move(source));
+  go2cpp::KInlineStack<int, 3> moved(std::move(source));
   CHECK(moved.size() == 5u);
   CHECK(source.empty());
 
-  extened::KInlineStack<int, 3> assigned;
+  go2cpp::KInlineStack<int, 3> assigned;
   assigned = moved;
   CHECK(assigned.size() == moved.size());
 
-  extened::KInlineStack<int, 3> move_assigned;
+  go2cpp::KInlineStack<int, 3> move_assigned;
   move_assigned = std::move(assigned);
   CHECK(move_assigned.size() == 5u);
 }
@@ -163,7 +163,7 @@ void TestCopyMove() {
 /// @brief 5. try_pop 的空栈行为。
 void TestTryPop() {
   std::printf("\n[5] try_pop...\n");
-  extened::KInlineStack<int, 2> stack;
+  go2cpp::KInlineStack<int, 2> stack;
   int out = -1;
   CHECK(!stack.try_pop(out));
   CHECK(out == -1);  // 失败不修改 out
@@ -180,7 +180,7 @@ void TestTryPop() {
 /// @brief 6. 边界：N=1、clear 后复用、reserve。
 void TestBoundary() {
   std::printf("\n[6] 边界条件...\n");
-  extened::KInlineStack<int, 1> stack;
+  go2cpp::KInlineStack<int, 1> stack;
   stack.push(1);
   CHECK(!stack.using_heap());
   stack.push(2);
@@ -199,7 +199,7 @@ void TestBoundary() {
 /// @brief 7. 与 std::stack 随机对照。
 void TestAgainstStdStack() {
   std::printf("\n[7] 随机对照 std::stack...\n");
-  extened::KInlineStack<int, 4> ours;
+  go2cpp::KInlineStack<int, 4> ours;
   std::stack<int> model;
   unsigned seed = 20261106u;
   std::size_t mismatches = 0;
@@ -237,7 +237,7 @@ void TestDeepNesting() {
   std::printf("\n[8] 深嵌套模拟...\n");
   constexpr int kDepth = 1000;
   const std::size_t base = g_new_calls.load(std::memory_order_relaxed);
-  extened::KInlineStack<int, 16> stack;
+  go2cpp::KInlineStack<int, 16> stack;
   for (int i = 0; i < kDepth; ++i) {
     stack.push(i);  // 模拟进入一层嵌套
   }

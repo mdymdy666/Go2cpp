@@ -434,13 +434,13 @@ void TestDecimalError() {
   // 继承 go2cpp::Error：可以直接放进错误链。
   const go2cpp::ErrorPtr base = invalid;
   CHECK(go2cpp::ErrorMessage(base) == invalid->Message());
-  CHECK(go2cpp::ErrorMessage(extened::Wrap(base, "字段 price")) ==
+  CHECK(go2cpp::ErrorMessage(go2cpp::Wrap(base, "字段 price")) ==
         "字段 price: " + invalid->Message());
-  CHECK(extened::Unwrap(base) == nullptr);
-  CHECK(extened::UnwrapAll(base).empty());
+  CHECK(go2cpp::Unwrap(base) == nullptr);
+  CHECK(go2cpp::UnwrapAll(base).empty());
 
   // 错误链上仍能按地址找到这个节点。
-  CHECK(extened::Is(base, base));
+  CHECK(go2cpp::Is(base, base));
 }
 
 // ---------------------------------------------------------------------------
@@ -671,7 +671,7 @@ void ScenarioFieldErrorChain() {
     CHECK(!Decimal::Parse(text, value, failure));
     causes.push_back(std::make_shared<DecimalError>(failure, text));
   }
-  const go2cpp::ErrorPtr joined = extened::Join(causes);
+  const go2cpp::ErrorPtr joined = go2cpp::Join(causes);
   const std::string message = go2cpp::ErrorMessage(joined);
   CHECK(message.find("empty") != std::string::npos);
   CHECK(message.find("12x3") != std::string::npos);
@@ -679,7 +679,7 @@ void ScenarioFieldErrorChain() {
   CHECK(message.find('\n') != std::string::npos);
 
   // 包装后仍可判断「是不是 DecimalError」。
-  const go2cpp::ErrorPtr wrapped = extened::Wrap(joined, "导入 CSV 第 3 行");
+  const go2cpp::ErrorPtr wrapped = go2cpp::Wrap(joined, "导入 CSV 第 3 行");
   CHECK(go2cpp::ErrorMessage(wrapped).find("导入 CSV 第 3 行") == 0);
 }
 

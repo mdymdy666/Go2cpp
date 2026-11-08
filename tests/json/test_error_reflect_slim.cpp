@@ -9,6 +9,8 @@
  */
 
 #include <cstddef>
+
+#include "go2cpp/reflect/field.hpp"
 #include <cstdint>
 #include <cstdio>
 #include <memory>
@@ -50,9 +52,9 @@ struct go2cpp::reflect::FieldList<Point> {
     static constexpr const char* kName = "Point";
     static const go2cpp::reflect::FieldDescriptor* Fields(std::size_t& count) {
         static const go2cpp::reflect::FieldDescriptor fields[] = {
-            EXTENED_REFLECT_FIELD(Point, x),
-            EXTENED_REFLECT_FIELD(Point, y),
-            EXTENED_REFLECT_FIELD(Point, label),
+            GO2CPP_REFLECT_FIELD(Point, x),
+            GO2CPP_REFLECT_FIELD(Point, y),
+            GO2CPP_REFLECT_FIELD(Point, label),
         };
         count = sizeof(fields) / sizeof(fields[0]);
         return fields;
@@ -69,8 +71,8 @@ template <>
 struct go2cpp::reflect::FieldList<TwoFields> {
     static const go2cpp::reflect::FieldDescriptor* Fields(std::size_t& count) {
         static const go2cpp::reflect::FieldDescriptor fields[] = {
-            EXTENED_REFLECT_FIELD(TwoFields, ab),
-            EXTENED_REFLECT_FIELD(TwoFields, ac),
+            GO2CPP_REFLECT_FIELD(TwoFields, ab),
+            GO2CPP_REFLECT_FIELD(TwoFields, ac),
         };
         count = sizeof(fields) / sizeof(fields[0]);
         return fields;
@@ -140,101 +142,101 @@ class NestedReleaseError final : public go2cpp::Error {
 namespace {
 
 void TestErrorBasics() {
-    const go2cpp::ErrorPtr leaf = extened::NewError("boom");
+    const go2cpp::ErrorPtr leaf = go2cpp::NewError("boom");
     CHECK(go2cpp::ErrorMessage(leaf) == "boom");
     CHECK(leaf->ErrorString() == "boom");
-    CHECK(extened::Unwrap(leaf) == nullptr);
-    CHECK(extened::UnwrapAll(leaf).empty());
+    CHECK(go2cpp::Unwrap(leaf) == nullptr);
+    CHECK(go2cpp::UnwrapAll(leaf).empty());
 
-    const go2cpp::ErrorPtr inner = extened::Wrap(leaf, "read config");
+    const go2cpp::ErrorPtr inner = go2cpp::Wrap(leaf, "read config");
     CHECK(go2cpp::ErrorMessage(inner) == "read config: boom");
-    CHECK(extened::Unwrap(inner) == leaf);
-    CHECK(extened::UnwrapAll(inner).size() == 1);
+    CHECK(go2cpp::Unwrap(inner) == leaf);
+    CHECK(go2cpp::UnwrapAll(inner).size() == 1);
 
-    const go2cpp::ErrorPtr outer = extened::Wrap(inner, "load");
+    const go2cpp::ErrorPtr outer = go2cpp::Wrap(inner, "load");
     CHECK(go2cpp::ErrorMessage(outer) == "load: read config: boom");
-    CHECK(extened::Wrap(go2cpp::ErrorPtr{}, "ignored") == nullptr);
+    CHECK(go2cpp::Wrap(go2cpp::ErrorPtr{}, "ignored") == nullptr);
 
-    const go2cpp::ErrorPtr joined = extened::Join({extened::NewError("a"), extened::NewError("b")});
+    const go2cpp::ErrorPtr joined = go2cpp::Join({go2cpp::NewError("a"), go2cpp::NewError("b")});
     CHECK(go2cpp::ErrorMessage(joined) == "a\nb");
-    CHECK(extened::UnwrapAll(joined).size() == 2);
-    CHECK(extened::Join(std::vector<go2cpp::ErrorPtr>{}) == nullptr);
-    CHECK(extened::Join({go2cpp::ErrorPtr{}, go2cpp::ErrorPtr{}}) == nullptr);
+    CHECK(go2cpp::UnwrapAll(joined).size() == 2);
+    CHECK(go2cpp::Join(std::vector<go2cpp::ErrorPtr>{}) == nullptr);
+    CHECK(go2cpp::Join({go2cpp::ErrorPtr{}, go2cpp::ErrorPtr{}}) == nullptr);
 
-    const go2cpp::ErrorPtr nested = extened::Join({joined, extened::NewError("c")});
+    const go2cpp::ErrorPtr nested = go2cpp::Join({joined, go2cpp::NewError("c")});
     CHECK(go2cpp::ErrorMessage(nested) == "a\nb\nc");
 }
 
 void TestMessageFormatting() {
     // 空描述层被忽略，不产生多余的 ": "。
-    const go2cpp::ErrorPtr blank = extened::Wrap(extened::Wrap(extened::NewError("leaf"), ""), "outer");
+    const go2cpp::ErrorPtr blank = go2cpp::Wrap(go2cpp::Wrap(go2cpp::NewError("leaf"), ""), "outer");
     CHECK(go2cpp::ErrorMessage(blank) == "outer: leaf");
 
     // 包装 Join：Join 的换行文本作为叶子整体追加。
-    const go2cpp::ErrorPtr joined = extened::Join({extened::NewError("x"), extened::NewError("y")});
-    CHECK(go2cpp::ErrorMessage(extened::Wrap(joined, "wrap")) == "wrap: x\ny");
+    const go2cpp::ErrorPtr joined = go2cpp::Join({go2cpp::NewError("x"), go2cpp::NewError("y")});
+    CHECK(go2cpp::ErrorMessage(go2cpp::Wrap(joined, "wrap")) == "wrap: x\ny");
 
     // 自定义错误作为叶子，走虚接口。
-    CHECK(go2cpp::ErrorMessage(extened::Wrap(std::make_shared<TaggedError>(), "w")) == "w: tagged");
+    CHECK(go2cpp::ErrorMessage(go2cpp::Wrap(std::make_shared<TaggedError>(), "w")) == "w: tagged");
 
     // Join 内嵌 Join 只展开子原因，不输出额外分隔。
     const go2cpp::ErrorPtr nested =
-        extened::Join({extened::Join({extened::NewError("a")}), extened::NewError("b")});
+        go2cpp::Join({go2cpp::Join({go2cpp::NewError("a")}), go2cpp::NewError("b")});
     CHECK(go2cpp::ErrorMessage(nested) == "a\nb");
 }
 
 void TestIs() {
-    const go2cpp::ErrorPtr cause = extened::NewError("cause");
-    const go2cpp::ErrorPtr wrapped = extened::Wrap(cause, "outer");
-    CHECK(extened::Is(wrapped, cause));   // 包装后仍能匹配到原因
-    CHECK(extened::Is(cause, cause));     // 叶子匹配自身
-    CHECK(!extened::Is(cause, extened::NewError("other")));
-    CHECK(extened::Is(go2cpp::ErrorPtr{}, go2cpp::ErrorPtr{}));
-    CHECK(!extened::Is(cause, go2cpp::ErrorPtr{}));
-    CHECK(!extened::Is(go2cpp::ErrorPtr{}, cause));
-    CHECK(extened::Is(wrapped, wrapped));  // 根节点自身
+    const go2cpp::ErrorPtr cause = go2cpp::NewError("cause");
+    const go2cpp::ErrorPtr wrapped = go2cpp::Wrap(cause, "outer");
+    CHECK(go2cpp::Is(wrapped, cause));   // 包装后仍能匹配到原因
+    CHECK(go2cpp::Is(cause, cause));     // 叶子匹配自身
+    CHECK(!go2cpp::Is(cause, go2cpp::NewError("other")));
+    CHECK(go2cpp::Is(go2cpp::ErrorPtr{}, go2cpp::ErrorPtr{}));
+    CHECK(!go2cpp::Is(cause, go2cpp::ErrorPtr{}));
+    CHECK(!go2cpp::Is(go2cpp::ErrorPtr{}, cause));
+    CHECK(go2cpp::Is(wrapped, wrapped));  // 根节点自身
 
     const go2cpp::ErrorPtr tagged = std::make_shared<TaggedError>();
-    CHECK(extened::Is(tagged, std::make_shared<TaggedError>()));
-    CHECK(!extened::Is(tagged, cause));
+    CHECK(go2cpp::Is(tagged, std::make_shared<TaggedError>()));
+    CHECK(!go2cpp::Is(tagged, cause));
 
     // Join 图里的深层原因也能匹配。
     const go2cpp::ErrorPtr graph =
-        extened::Join({extened::Wrap(cause, "a"), extened::NewError("b")});
-    CHECK(extened::Is(graph, cause));
+        go2cpp::Join({go2cpp::Wrap(cause, "a"), go2cpp::NewError("b")});
+    CHECK(go2cpp::Is(graph, cause));
 }
 
 void TestWalkErrors() {
-    const go2cpp::ErrorPtr wrapped = extened::Wrap(extened::NewError("leaf"), "wrap");
+    const go2cpp::ErrorPtr wrapped = go2cpp::Wrap(go2cpp::NewError("leaf"), "wrap");
     std::size_t visited = 0;
-    CHECK(extened::WalkErrors(wrapped, [&visited](const go2cpp::ErrorPtr&) {
+    CHECK(go2cpp::WalkErrors(wrapped, [&visited](const go2cpp::ErrorPtr&) {
         ++visited;
         return go2cpp::ErrorVisitResult::kContinue;
     }));
     CHECK(visited == 2);
 
     visited = 0;
-    CHECK(!extened::WalkErrors(wrapped, [&visited](const go2cpp::ErrorPtr&) {
+    CHECK(!go2cpp::WalkErrors(wrapped, [&visited](const go2cpp::ErrorPtr&) {
         ++visited;
         return go2cpp::ErrorVisitResult::kStop;
     }));
     CHECK(visited == 1);
 
-    CHECK(!extened::WalkErrors(wrapped, go2cpp::ErrorVisitor{}));
-    CHECK(extened::WalkErrors(go2cpp::ErrorPtr{}, [](const go2cpp::ErrorPtr&) {
+    CHECK(!go2cpp::WalkErrors(wrapped, go2cpp::ErrorVisitor{}));
+    CHECK(go2cpp::WalkErrors(go2cpp::ErrorPtr{}, [](const go2cpp::ErrorPtr&) {
         return go2cpp::ErrorVisitResult::kContinue;
     }));
 }
 
 void TestWalkErrorsMixedGraph() {
     // 菱形：两条 WrappedError 共享同一个 cause，cause 只能访问一次。
-    const go2cpp::ErrorPtr shared = extened::NewError("shared");
-    const go2cpp::ErrorPtr left = extened::Wrap(shared, "a");
-    const go2cpp::ErrorPtr right = extened::Wrap(shared, "b");
-    const go2cpp::ErrorPtr diamond = extened::Join({left, right});
+    const go2cpp::ErrorPtr shared = go2cpp::NewError("shared");
+    const go2cpp::ErrorPtr left = go2cpp::Wrap(shared, "a");
+    const go2cpp::ErrorPtr right = go2cpp::Wrap(shared, "b");
+    const go2cpp::ErrorPtr diamond = go2cpp::Join({left, right});
 
     std::size_t visited = 0;
-    CHECK(extened::WalkErrors(diamond, [&visited](const go2cpp::ErrorPtr&) {
+    CHECK(go2cpp::WalkErrors(diamond, [&visited](const go2cpp::ErrorPtr&) {
         ++visited;
         return go2cpp::ErrorVisitResult::kContinue;
     }));
@@ -242,10 +244,10 @@ void TestWalkErrorsMixedGraph() {
     CHECK(go2cpp::ErrorMessage(diamond) == "a: shared\nb: shared");
 
     // 嵌套 Join：内层 Join 自身也是节点。
-    const go2cpp::ErrorPtr nested = extened::Join(
-        {extened::Join({extened::NewError("x"), extened::NewError("y")}), extened::NewError("z")});
+    const go2cpp::ErrorPtr nested = go2cpp::Join(
+        {go2cpp::Join({go2cpp::NewError("x"), go2cpp::NewError("y")}), go2cpp::NewError("z")});
     visited = 0;
-    CHECK(extened::WalkErrors(nested, [&visited](const go2cpp::ErrorPtr&) {
+    CHECK(go2cpp::WalkErrors(nested, [&visited](const go2cpp::ErrorPtr&) {
         ++visited;
         return go2cpp::ErrorVisitResult::kContinue;
     }));
@@ -254,7 +256,7 @@ void TestWalkErrorsMixedGraph() {
     // 自定义错误（只覆写 UnwrapAll）走通用路径。
     RingError lone("lone");
     visited = 0;
-    CHECK(extened::WalkErrors(go2cpp::ErrorPtr(&lone, NoopDeleter{}),
+    CHECK(go2cpp::WalkErrors(go2cpp::ErrorPtr(&lone, NoopDeleter{}),
                              [&visited](const go2cpp::ErrorPtr&) {
                                  ++visited;
                                  return go2cpp::ErrorVisitResult::kContinue;
@@ -264,9 +266,9 @@ void TestWalkErrorsMixedGraph() {
 
 void TestWalkErrorsExceptionBoundary() {
     // 访问器抛异常：边界按失败返回，不向调用方传播。
-    const go2cpp::ErrorPtr leaf = extened::NewError("leaf");
+    const go2cpp::ErrorPtr leaf = go2cpp::NewError("leaf");
     std::size_t visited = 0;
-    const bool ok = extened::WalkErrors(leaf, [&visited](const go2cpp::ErrorPtr&)
+    const bool ok = go2cpp::WalkErrors(leaf, [&visited](const go2cpp::ErrorPtr&)
                                            -> go2cpp::ErrorVisitResult {
         ++visited;
         throw std::runtime_error("visitor boom");
@@ -276,14 +278,14 @@ void TestWalkErrorsExceptionBoundary() {
 
     // 自定义 UnwrapAll 抛异常：同样按失败返回。
     const go2cpp::ErrorPtr throwing = std::make_shared<ThrowingUnwrapError>();
-    CHECK(!extened::WalkErrors(throwing, [](const go2cpp::ErrorPtr&) {
+    CHECK(!go2cpp::WalkErrors(throwing, [](const go2cpp::ErrorPtr&) {
         return go2cpp::ErrorVisitResult::kContinue;
     }));
 
     // 包装 + 抛异常：先访问包装层，再在取原因时失败。
     visited = 0;
-    const go2cpp::ErrorPtr wrapped_throwing = extened::Wrap(throwing, "outer");
-    CHECK(!extened::WalkErrors(wrapped_throwing, [&visited](const go2cpp::ErrorPtr&) {
+    const go2cpp::ErrorPtr wrapped_throwing = go2cpp::Wrap(throwing, "outer");
+    CHECK(!go2cpp::WalkErrors(wrapped_throwing, [&visited](const go2cpp::ErrorPtr&) {
         ++visited;
         return go2cpp::ErrorVisitResult::kContinue;
     }));
@@ -299,19 +301,19 @@ void TestWalkErrorsRing() {
     const go2cpp::ErrorPtr ring(&first, NoopDeleter{});
 
     std::size_t visited = 0;
-    CHECK(extened::WalkErrors(ring, [&visited](const go2cpp::ErrorPtr&) {
+    CHECK(go2cpp::WalkErrors(ring, [&visited](const go2cpp::ErrorPtr&) {
         ++visited;
         return go2cpp::ErrorVisitResult::kContinue;
     }));
     CHECK(visited == 2);  // 每个节点只访问一次，不死循环
-    CHECK(extened::Is(ring, go2cpp::ErrorPtr(&second, NoopDeleter{})));
+    CHECK(go2cpp::Is(ring, go2cpp::ErrorPtr(&second, NoopDeleter{})));
 }
 
 void TestDeepWrapDestruction() {
     // 规格要求：300 层 Wrap 链析构不爆栈。
-    go2cpp::ErrorPtr chain = extened::NewError("leaf");
+    go2cpp::ErrorPtr chain = go2cpp::NewError("leaf");
     for (int i = 0; i < 300; ++i) {
-        chain = extened::Wrap(std::move(chain), "layer");
+        chain = go2cpp::Wrap(std::move(chain), "layer");
     }
     const std::string message = go2cpp::ErrorMessage(chain);
     CHECK(message.size() == 300u * 7u + 4u);
@@ -320,9 +322,9 @@ void TestDeepWrapDestruction() {
     chain.reset();
 
     // 加强项：20 万层递归析构必然爆栈，只有迭代工作表能通过。
-    go2cpp::ErrorPtr deep = extened::NewError("deep-leaf");
+    go2cpp::ErrorPtr deep = go2cpp::NewError("deep-leaf");
     for (int i = 0; i < 200000; ++i) {
-        deep = extened::Wrap(std::move(deep), "d");
+        deep = go2cpp::Wrap(std::move(deep), "d");
     }
     CHECK(go2cpp::ErrorMessage(deep).size() == 200000u * 3u + 9u);
     deep.reset();
@@ -334,11 +336,11 @@ void TestNestedRelease() {
     g_counted_destroyed = 0;
     go2cpp::ErrorPtr inner = std::make_shared<CountedError>();
     for (int i = 0; i < 3; ++i) {
-        inner = extened::Wrap(std::move(inner), "inner");
+        inner = go2cpp::Wrap(std::move(inner), "inner");
     }
     go2cpp::ErrorPtr outer = std::make_shared<NestedReleaseError>(std::move(inner));
     for (int i = 0; i < 5; ++i) {
-        outer = extened::Wrap(std::move(outer), "outer");
+        outer = go2cpp::Wrap(std::move(outer), "outer");
     }
     outer.reset();
     CHECK(g_counted_destroyed == 1);
@@ -359,7 +361,7 @@ void TestTypeTraits() {
     CHECK(TypeIdOf<Point>() == 100);
     CHECK(TypeIdOf<int>() == go2cpp::reflect::kInt32Type);
     CHECK(std::string_view(go2cpp::reflect::TypeNameOf<Point>()) == "Point");
-    CHECK(std::string_view(go2cpp::reflect::TypeName<Point>()) == "Point");
+    CHECK(std::string_view(go2cpp::reflect::TypeNameOf<Point>()) == "Point");
     CHECK(std::string_view(go2cpp::reflect::TypeNameOf<long double>()) == "unknown");
     CHECK(go2cpp::reflect::IsBuiltinType<int>());
     CHECK(!go2cpp::reflect::IsBuiltinType<Point>());

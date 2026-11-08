@@ -38,7 +38,7 @@ using go2cpp::json::Reader;
 using go2cpp::json::RowView;
 using go2cpp::json::Value;
 using go2cpp::reflect::kBoolType;
-using go2cpp::reflect::kDecimalType;
+using go2cpp::json::core::kDecimalType;
 using go2cpp::reflect::kInt32Type;
 using go2cpp::reflect::kStringType;
 

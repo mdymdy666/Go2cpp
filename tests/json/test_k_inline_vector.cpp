@@ -202,7 +202,7 @@ void TestZeroAllocation() {
 
   const std::size_t before_inline = g_new_calls.load(std::memory_order_relaxed);
   {
-    extened::KInlineVector<int, 4> vec;
+    go2cpp::KInlineVector<int, 4> vec;
     CHECK(vec.empty());
     CHECK(vec.size() == 0u);
     CHECK(vec.capacity() == 4u);
@@ -222,7 +222,7 @@ void TestZeroAllocation() {
   CHECK(inline_allocations == 0u);
 
   const std::size_t before_growth = g_new_calls.load(std::memory_order_relaxed);
-  extened::KInlineVector<int, 4> vec;
+  go2cpp::KInlineVector<int, 4> vec;
   for (int i = 0; i < 4; ++i) {
     vec.push_back(i);
   }
@@ -241,7 +241,7 @@ void TestZeroAllocation() {
 /// @brief 2. 值与顺序：逐个元素比对，并校验各访问器彼此一致。
 void TestValueAndOrder() {
   std::cout << "\n[2] 值、顺序与访问器...\n";
-  extened::KInlineVector<int, 4> vec;
+  go2cpp::KInlineVector<int, 4> vec;
   for (int i = 0; i < 10; ++i) {
     vec.push_back(i);
   }
@@ -259,7 +259,7 @@ void TestValueAndOrder() {
   CHECK(vec.end() == vec.data() + vec.size());
   CHECK(static_cast<std::size_t>(vec.end() - vec.begin()) == vec.size());
 
-  const extened::KInlineVector<int, 4>& const_ref = vec;
+  const go2cpp::KInlineVector<int, 4>& const_ref = vec;
   CHECK(const_ref.data() == vec.data());
   CHECK(const_ref.begin() == vec.begin());
   CHECK(const_ref.end() == vec.end());
@@ -275,7 +275,7 @@ void TestValueAndOrder() {
   CHECK(expected == 10);
 
   // 内联模式下 data / begin / end 也必须正确。
-  extened::KInlineVector<int, 4> inline_vec;
+  go2cpp::KInlineVector<int, 4> inline_vec;
   inline_vec.push_back(11);
   inline_vec.push_back(12);
   CHECK(inline_vec.begin() == inline_vec.data());
@@ -288,7 +288,7 @@ void TestValueAndOrder() {
 void TestNonTrivialTypes() {
   std::cout << "\n[3] 非平凡类型...\n";
 
-  extened::KInlineVector<std::string, 2> words;
+  go2cpp::KInlineVector<std::string, 2> words;
   words.push_back("alpha");
   words.push_back("beta");
   CHECK(words.size() == 2u);
@@ -306,7 +306,7 @@ void TestNonTrivialTypes() {
 
   Tracked::Reset();
   {
-    extened::KInlineVector<Tracked, 2> tracked;
+    go2cpp::KInlineVector<Tracked, 2> tracked;
     for (int i = 0; i < 5; ++i) {
       tracked.emplace_back(i);
     }
@@ -335,19 +335,19 @@ void TestCopyMoveAssign() {
   std::cout << "\n[4] 拷贝 / 移动 / 赋值...\n";
 
   // 空容器拷贝 / 移动：不应分配，也不应改变模式。
-  extened::KInlineVector<int, 4> empty_src;
-  extened::KInlineVector<int, 4> empty_copy(empty_src);
+  go2cpp::KInlineVector<int, 4> empty_src;
+  go2cpp::KInlineVector<int, 4> empty_copy(empty_src);
   CHECK(empty_copy.empty());
   CHECK(!empty_copy.using_heap());
-  extened::KInlineVector<int, 4> empty_move(std::move(empty_src));
+  go2cpp::KInlineVector<int, 4> empty_move(std::move(empty_src));
   CHECK(empty_move.empty());
   CHECK(empty_src.empty());
 
   // 内联拷贝：副本修改不影响源。
-  extened::KInlineVector<int, 4> a;
+  go2cpp::KInlineVector<int, 4> a;
   a.push_back(1);
   a.push_back(2);
-  extened::KInlineVector<int, 4> b(a);
+  go2cpp::KInlineVector<int, 4> b(a);
   CHECK(b.size() == 2u);
   CHECK(!b.using_heap());
   CHECK(b[0] == 1);
@@ -356,12 +356,12 @@ void TestCopyMoveAssign() {
   CHECK(a[0] == 1);
 
   // 堆拷贝。
-  extened::KInlineVector<int, 4> big;
+  go2cpp::KInlineVector<int, 4> big;
   for (int i = 0; i < 6; ++i) {
     big.push_back(i);
   }
   CHECK(big.using_heap());
-  extened::KInlineVector<int, 4> big_copy(big);
+  go2cpp::KInlineVector<int, 4> big_copy(big);
   CHECK(big_copy.using_heap());
   CHECK(big_copy.size() == 6u);
   for (std::size_t i = 0; i < big_copy.size(); ++i) {
@@ -371,10 +371,10 @@ void TestCopyMoveAssign() {
   CHECK(big[5] == 5);
 
   // 内联移动：源变为空。
-  extened::KInlineVector<int, 4> move_source;
+  go2cpp::KInlineVector<int, 4> move_source;
   move_source.push_back(7);
   move_source.push_back(8);
-  extened::KInlineVector<int, 4> move_target(std::move(move_source));
+  go2cpp::KInlineVector<int, 4> move_target(std::move(move_source));
   CHECK(move_target.size() == 2u);
   CHECK(!move_target.using_heap());
   CHECK(move_target[1] == 8);
@@ -382,11 +382,11 @@ void TestCopyMoveAssign() {
   CHECK(move_source.size() == 0u);
 
   // 堆移动：源变为空。
-  extened::KInlineVector<int, 4> heap_source;
+  go2cpp::KInlineVector<int, 4> heap_source;
   for (int i = 0; i < 6; ++i) {
     heap_source.push_back(i);
   }
-  extened::KInlineVector<int, 4> heap_target(std::move(heap_source));
+  go2cpp::KInlineVector<int, 4> heap_target(std::move(heap_source));
   CHECK(heap_target.size() == 6u);
   CHECK(heap_target.using_heap());
   CHECK(heap_target[5] == 5);
@@ -394,7 +394,7 @@ void TestCopyMoveAssign() {
   CHECK(heap_source.size() == 0u);
 
   // 拷贝赋值：堆模式 ← 内联模式，赋值后模式跟随右操作数（回退内联）。
-  extened::KInlineVector<int, 4> assign_target;
+  go2cpp::KInlineVector<int, 4> assign_target;
   for (int i = 0; i < 6; ++i) {
     assign_target.push_back(i);
   }
@@ -406,7 +406,7 @@ void TestCopyMoveAssign() {
   CHECK(assign_target[1] == 2);
 
   // 拷贝赋值：内联模式 ← 堆模式。
-  extened::KInlineVector<int, 4> assign_small;
+  go2cpp::KInlineVector<int, 4> assign_small;
   assign_small.push_back(42);
   assign_small = big;
   CHECK(assign_small.using_heap());
@@ -415,13 +415,13 @@ void TestCopyMoveAssign() {
   CHECK(assign_small[5] == 5);
 
   // 自赋值：通过指针绕开编译器的自赋值告警。
-  extened::KInlineVector<int, 4>* self = &assign_small;
+  go2cpp::KInlineVector<int, 4>* self = &assign_small;
   assign_small = *self;
   CHECK(assign_small.size() == 6u);
   CHECK(assign_small[5] == 5);
 
   // 移动赋值：内联 ← 内联。
-  extened::KInlineVector<int, 4> move_assign_target;
+  go2cpp::KInlineVector<int, 4> move_assign_target;
   move_assign_target.push_back(1);
   move_assign_target = std::move(b);
   CHECK(move_assign_target.size() == 2u);
@@ -430,7 +430,7 @@ void TestCopyMoveAssign() {
   CHECK(b.empty());
 
   // 移动赋值：堆 ← 堆。
-  extened::KInlineVector<int, 4> heap_assign_target;
+  go2cpp::KInlineVector<int, 4> heap_assign_target;
   heap_assign_target.push_back(0);
   heap_assign_target = std::move(big);
   CHECK(heap_assign_target.size() == 6u);
@@ -444,7 +444,7 @@ void TestBoundary() {
   std::cout << "\n[5] 边界条件...\n";
 
   // N=1：第 2 个元素触发迁移。
-  extened::KInlineVector<int, 1> one;
+  go2cpp::KInlineVector<int, 1> one;
   CHECK(one.capacity() == 1u);
   one.push_back(10);
   CHECK(!one.using_heap());
@@ -457,7 +457,7 @@ void TestBoundary() {
   CHECK(one[1] == 11);
 
   // pop_back 到空（内联模式）。
-  extened::KInlineVector<int, 2> inline_vec;
+  go2cpp::KInlineVector<int, 2> inline_vec;
   inline_vec.push_back(1);
   inline_vec.push_back(2);
   inline_vec.pop_back();
@@ -467,7 +467,7 @@ void TestBoundary() {
   CHECK(!inline_vec.using_heap());
 
   // pop_back 到空（堆模式）：模式不回退，容量保留。
-  extened::KInlineVector<int, 2> heap_vec;
+  go2cpp::KInlineVector<int, 2> heap_vec;
   for (int i = 0; i < 5; ++i) {
     heap_vec.push_back(i);
   }
@@ -481,7 +481,7 @@ void TestBoundary() {
   CHECK(heap_vec.capacity() == heap_capacity);
 
   // clear 后继续 push（内联模式）：不做任何堆操作。
-  extened::KInlineVector<int, 4> inline_cleared;
+  go2cpp::KInlineVector<int, 4> inline_cleared;
   inline_cleared.push_back(1);
   inline_cleared.push_back(2);
   CHECK(!inline_cleared.using_heap());
@@ -493,7 +493,7 @@ void TestBoundary() {
   CHECK(inline_cleared[0] == 3);
 
   // clear 后继续 push：堆模式保持，元素可正常写入。
-  extened::KInlineVector<int, 2> cleared;
+  go2cpp::KInlineVector<int, 2> cleared;
   cleared.push_back(1);
   cleared.push_back(2);
   cleared.push_back(3);
@@ -506,7 +506,7 @@ void TestBoundary() {
   CHECK(cleared[0] == 9);
 
   // reserve(0) / reserve(N) 在内联模式下无操作。
-  extened::KInlineVector<int, 4> r;
+  go2cpp::KInlineVector<int, 4> r;
   r.reserve(0);
   CHECK(!r.using_heap());
   CHECK(r.capacity() == 4u);
@@ -535,7 +535,7 @@ void TestExceptionSafety() {
   // 情况 A：内联未满时元素构造抛异常。
   ThrowingValue::Reset();
   {
-    extened::KInlineVector<ThrowingValue, 4> vec;
+    go2cpp::KInlineVector<ThrowingValue, 4> vec;
     vec.emplace_back(1);
     vec.emplace_back(2);
     CHECK(vec.size() == 2u);
@@ -568,7 +568,7 @@ void TestExceptionSafety() {
   // 情况 B：内联已满，构造临时元素时抛异常（迁移尚未发生）。
   ThrowingValue::Reset();
   {
-    extened::KInlineVector<ThrowingValue, 2> vec;
+    go2cpp::KInlineVector<ThrowingValue, 2> vec;
     vec.emplace_back(1);
     vec.emplace_back(2);
     CHECK(vec.size() == 2u);
@@ -608,7 +608,7 @@ void TestSelfReferencePush() {
   std::cout << "\n[6b] 自引用 push_back...\n";
 
   // 内联已满 → 迁移路径：必须在迁移前读取 v[0]，否则拿到的是 moved-from 的串。
-  extened::KInlineVector<std::string, 2> full;
+  go2cpp::KInlineVector<std::string, 2> full;
   full.push_back("aaa");
   full.push_back("bbb");
   full.push_back(full[0]);
@@ -619,7 +619,7 @@ void TestSelfReferencePush() {
   CHECK(full[2] == "aaa");
 
   // 内联未满：直接构造到新槽位，不涉及迁移。
-  extened::KInlineVector<std::string, 4> roomy;
+  go2cpp::KInlineVector<std::string, 4> roomy;
   roomy.push_back("x");
   roomy.push_back(roomy[0]);
   CHECK(roomy.size() == 2u);
@@ -627,7 +627,7 @@ void TestSelfReferencePush() {
   CHECK(roomy[1] == "x");
 
   // 堆模式：交给 std::vector，标准保证自引用安全。
-  extened::KInlineVector<std::string, 1> heap;
+  go2cpp::KInlineVector<std::string, 1> heap;
   heap.push_back("p");
   heap.push_back("q");  // 触发迁移
   heap.push_back(heap[0]);
@@ -645,7 +645,7 @@ void TestRandomModel() {
   std::uniform_int_distribution<int> values(-1000, 1000);
   std::uniform_int_distribution<int> extras(0, 16);
 
-  extened::KInlineVector<int, 3> vec;
+  go2cpp::KInlineVector<int, 3> vec;
   std::vector<int> model;
   std::size_t mismatches = 0;
 
@@ -685,8 +685,8 @@ void TestRandomModel() {
 }
 
 /// @brief 工厂函数：验证返回值（NRVO 或移动）跨过内联容量的场景。
-extened::KInlineVector<int, 4> MakeSequence(int count) {
-  extened::KInlineVector<int, 4> result;
+go2cpp::KInlineVector<int, 4> MakeSequence(int count) {
+  go2cpp::KInlineVector<int, 4> result;
   for (int i = 0; i < count; ++i) {
     result.push_back(i);
   }
@@ -732,7 +732,7 @@ void TestMigrationException() {
   std::cout << "\n[9] 迁移异常回滚（基本保证）...\n";
   ThrowingMove::Reset();
   {
-    extened::KInlineVector<ThrowingMove, 2> vec;
+    go2cpp::KInlineVector<ThrowingMove, 2> vec;
     vec.emplace_back(1);
     vec.emplace_back(2);
     CHECK(vec.size() == 2u);
@@ -769,7 +769,7 @@ void TestTrivialFastPath() {
   std::cout << "\n[10] trivial 迁移 / 自引用 / 拷贝移动...\n";
 
   // 迁移 8 个 Point（N=4），逐元素校验 memmove 路径的值与顺序。
-  extened::KInlineVector<Point, 4> polygon;
+  go2cpp::KInlineVector<Point, 4> polygon;
   for (int i = 0; i < 8; ++i) {
     polygon.push_back(Point{static_cast<double>(i), static_cast<double>(i) * 2.0});
   }
@@ -781,7 +781,7 @@ void TestTrivialFastPath() {
   }
 
   // int 自引用 push：迁移必须发生在参数被读取之前（临时对象路径）。
-  extened::KInlineVector<int, 4> ints;
+  go2cpp::KInlineVector<int, 4> ints;
   for (int i = 0; i < 4; ++i) {
     ints.push_back(i * 10);
   }
@@ -796,7 +796,7 @@ void TestTrivialFastPath() {
   CHECK(ints[3] == 30);
 
   // Point 自引用 push。
-  extened::KInlineVector<Point, 2> points;
+  go2cpp::KInlineVector<Point, 2> points;
   points.push_back(Point{1.0, 2.0});
   points.push_back(Point{3.0, 4.0});
   points.push_back(points[0]);
@@ -806,24 +806,24 @@ void TestTrivialFastPath() {
   CHECK(points[2].y == 2.0);
 
   // 拷贝构造（trivial 走 uninitialized_copy）：值独立。
-  extened::KInlineVector<Point, 4> heap_copy = polygon;
+  go2cpp::KInlineVector<Point, 4> heap_copy = polygon;
   CHECK(heap_copy.size() == 8u);
   CHECK(heap_copy[7].y == 14.0);
   heap_copy[0].x = 99.0;
   CHECK(polygon[0].x == 0.0);
 
   // 移动构造（内联 uninitialized_copy 路径）：值接管、源为空。
-  extened::KInlineVector<Point, 4> small;
+  go2cpp::KInlineVector<Point, 4> small;
   small.push_back(Point{5.0, 6.0});
   small.push_back(Point{7.0, 8.0});
-  extened::KInlineVector<Point, 4> moved(std::move(small));
+  go2cpp::KInlineVector<Point, 4> moved(std::move(small));
   CHECK(moved.size() == 2u);
   CHECK(moved[0].x == 5.0);
   CHECK(moved[1].y == 8.0);
   CHECK(small.empty());
 
   // clear / pop_back 后重用（trivial 跳过析构）。
-  extened::KInlineVector<int, 4> reuse;
+  go2cpp::KInlineVector<int, 4> reuse;
   for (int i = 0; i < 4; ++i) {
     reuse.push_back(i);
   }
@@ -847,8 +847,8 @@ void TestTrivialFastPath() {
 /// @brief 11. 对齐：alignas(T) 保证每个内联槽位满足 T 的对齐要求。
 void TestAlignment() {
   std::cout << "\n[11] 对齐与内联容量常量...\n";
-  CHECK((extened::KInlineVector<int, 4>::kInlineCapacity == 4u));
-  extened::KInlineVector<AlignedBlob, 3> blobs;
+  CHECK((go2cpp::KInlineVector<int, 4>::kInlineCapacity == 4u));
+  go2cpp::KInlineVector<AlignedBlob, 3> blobs;
   for (int i = 0; i < 3; ++i) {
     blobs.push_back(AlignedBlob{i});
   }
@@ -868,7 +868,7 @@ void TestAlignment() {
 /// @brief 12. move-only 类型：迁移与容器移动都不得要求拷贝。
 void TestMoveOnly() {
   std::cout << "\n[12] move-only 类型（unique_ptr）...\n";
-  extened::KInlineVector<std::unique_ptr<int>, 2> vec;
+  go2cpp::KInlineVector<std::unique_ptr<int>, 2> vec;
   vec.push_back(std::make_unique<int>(1));
   vec.push_back(std::make_unique<int>(2));
   CHECK(!vec.using_heap());
@@ -879,7 +879,7 @@ void TestMoveOnly() {
   CHECK(*vec[0] == 1);
   CHECK(*vec[2] == 3);
 
-  extened::KInlineVector<std::unique_ptr<int>, 2> moved(std::move(vec));
+  go2cpp::KInlineVector<std::unique_ptr<int>, 2> moved(std::move(vec));
   CHECK(moved.size() == 3u);
   CHECK(*moved[1] == 2);
   CHECK(vec.empty());
@@ -893,7 +893,7 @@ void TestJobjectLikeKvp() {
   // 2 字段：零分配、零迁移。
   std::size_t before = g_new_calls.load(std::memory_order_relaxed);
   {
-    extened::KInlineVector<kvp, 5> object;
+    go2cpp::KInlineVector<kvp, 5> object;
     object.push_back(kvp("id", "1"));
     object.push_back(kvp("name", "demo"));
     CHECK(object.size() == 2u);
@@ -906,7 +906,7 @@ void TestJobjectLikeKvp() {
   // 5 字段：恰好塞满 N=5，仍然零分配。
   before = g_new_calls.load(std::memory_order_relaxed);
   {
-    extened::KInlineVector<kvp, 5> object;
+    go2cpp::KInlineVector<kvp, 5> object;
     for (int i = 0; i < 5; ++i) {
       object.push_back(kvp("k" + std::to_string(i), "v" + std::to_string(i)));
     }
@@ -919,7 +919,7 @@ void TestJobjectLikeKvp() {
   // 6 字段：第 6 个触发迁移，恰好一次堆分配。
   before = g_new_calls.load(std::memory_order_relaxed);
   {
-    extened::KInlineVector<kvp, 5> object;
+    go2cpp::KInlineVector<kvp, 5> object;
     for (int i = 0; i < 6; ++i) {
       object.push_back(kvp("k" + std::to_string(i), "v" + std::to_string(i)));
     }
@@ -934,7 +934,7 @@ void TestJobjectLikeKvp() {
 /// @brief 14. 大 N 与 reserve：N=16 零分配、reserve(100) 一次迁移。
 void TestLargeNAndReserve() {
   std::cout << "\n[14] 大 N 与 reserve...\n";
-  extened::KInlineVector<int, 16> big;
+  go2cpp::KInlineVector<int, 16> big;
   const std::size_t before = g_new_calls.load(std::memory_order_relaxed);
   for (int i = 0; i < 16; ++i) {
     big.push_back(i);
@@ -961,7 +961,7 @@ void TestRealWorldScenarios() {
   // 场景 1：8 个顶点的小多边形，内联零分配。
   const std::size_t before_vertices = g_new_calls.load(std::memory_order_relaxed);
   {
-    extened::KInlineVector<Point, 8> polygon;
+    go2cpp::KInlineVector<Point, 8> polygon;
     for (int i = 0; i < 8; ++i) {
       polygon.push_back(Point{static_cast<double>(i), static_cast<double>(i) * 2.0});
     }
@@ -977,7 +977,7 @@ void TestRealWorldScenarios() {
   CHECK(vertex_allocations == 0u);
 
   // 场景 2：短消息列表，超过 4 条后转堆。
-  extened::KInlineVector<std::string, 4> inbox;
+  go2cpp::KInlineVector<std::string, 4> inbox;
   for (int i = 0; i < 4; ++i) {
     inbox.emplace_back("msg-" + std::to_string(i));
   }
@@ -989,12 +989,12 @@ void TestRealWorldScenarios() {
   CHECK(inbox.back() == "msg-4");
 
   // 场景 3：默认配置分发，拷贝后互不影响。
-  extened::KInlineVector<int, 8> defaults;
+  go2cpp::KInlineVector<int, 8> defaults;
   for (int i = 0; i < 5; ++i) {
     defaults.push_back(i * 10);
   }
-  extened::KInlineVector<int, 8> profile_a = defaults;
-  extened::KInlineVector<int, 8> profile_b;
+  go2cpp::KInlineVector<int, 8> profile_a = defaults;
+  go2cpp::KInlineVector<int, 8> profile_b;
   profile_b = defaults;
   profile_a[0] = 999;
   CHECK(profile_a[0] == 999);
@@ -1003,11 +1003,11 @@ void TestRealWorldScenarios() {
   CHECK(profile_b[4] == 40);
 
   // 场景 4：工厂函数返回（NRVO 或移动），分别覆盖内联与堆两种结果。
-  extened::KInlineVector<int, 4> inline_seq = MakeSequence(3);
+  go2cpp::KInlineVector<int, 4> inline_seq = MakeSequence(3);
   CHECK(inline_seq.size() == 3u);
   CHECK(!inline_seq.using_heap());
   CHECK(inline_seq[2] == 2);
-  extened::KInlineVector<int, 4> heap_seq = MakeSequence(6);
+  go2cpp::KInlineVector<int, 4> heap_seq = MakeSequence(6);
   CHECK(heap_seq.size() == 6u);
   CHECK(heap_seq.using_heap());
   CHECK(heap_seq[5] == 5);
@@ -1015,7 +1015,7 @@ void TestRealWorldScenarios() {
   // 场景 5：批量导入时跳过坏记录，异常后容器仍可用。
   ThrowingValue::Reset();
   {
-    extened::KInlineVector<ThrowingValue, 3> batch;
+    go2cpp::KInlineVector<ThrowingValue, 3> batch;
     int accepted = 0;
     for (int i = 0; i < 5; ++i) {
       ThrowingValue::throw_enabled = (i == 3);

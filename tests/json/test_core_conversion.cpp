@@ -1,6 +1,6 @@
 /**
  * @file test_core_conversion.cpp
- * @brief `extened::core` 转换表与 `Text` 的回归测试（迁移自 week1 `csvp::conversion`）。
+ * @brief `go2cpp::core` 转换表与 `Text` 的回归测试（迁移自 week1 `csvp::conversion`）。
  *
  * 覆盖：
  * - 内置 5 种转换器的成功/失败/边界（int 溢出、double 溢出与下溢、bool 大小写、
@@ -300,7 +300,7 @@ void TestItemValueBranches() {
   CHECK(std::get<Text>(value).view() == "hello");
   CHECK(std::get<Text>(value).borrowed());
 
-  CHECK(Convert(go2cpp::reflect::kDecimalType, "1.25", value));
+  CHECK(Convert(go2cpp::json::core::kDecimalType, "1.25", value));
   CHECK(value.index() == 1);
   CHECK(std::holds_alternative<Decimal>(value));
   CHECK(std::get<Decimal>(value).ToString() == "1.25");
@@ -311,7 +311,7 @@ void TestBuiltinTable() {
   CHECK(go2cpp::json::core::FindConverter(go2cpp::reflect::kInt32Type) != nullptr);
   CHECK(go2cpp::json::core::FindConverter(go2cpp::reflect::kDoubleType) != nullptr);
   CHECK(go2cpp::json::core::FindConverter(go2cpp::reflect::kStringType) != nullptr);
-  CHECK(go2cpp::json::core::FindConverter(go2cpp::reflect::kDecimalType) != nullptr);
+  CHECK(go2cpp::json::core::FindConverter(go2cpp::json::core::kDecimalType) != nullptr);
 
   // 已知限制（与 week1 一致）：week1 只有 5 个内置转换器，其余内置类型没有。
   CHECK(go2cpp::json::core::FindConverter(go2cpp::reflect::kInt64Type) == nullptr);
@@ -330,7 +330,7 @@ void TestConvertFailureKeepsOutput() {
   CHECK(value.index() == 2);
   CHECK(std::get<std::int64_t>(value) == 42);
 
-  CHECK(!Convert(go2cpp::reflect::kDecimalType, "1.2.3", value));
+  CHECK(!Convert(go2cpp::json::core::kDecimalType, "1.2.3", value));
   CHECK(std::get<std::int64_t>(value) == 42);
 
   CHECK(!Convert(go2cpp::reflect::kDoubleType, "1e400", value));
@@ -354,7 +354,7 @@ void TestRegisterConverter() {
   TypeId id = go2cpp::reflect::TypeRegistry::Instance().Register("test.Version", sizeof(Version));
 
   // 首次注册。
-  go2cpp::ErrorPtr error = extened::NewError("占位");
+  go2cpp::ErrorPtr error = go2cpp::NewError("占位");
   CHECK(go2cpp::json::core::RegisterConverter(id, &ConvertVersion, error));
   CHECK(error == nullptr);
   CHECK(go2cpp::json::core::FindConverter(id) == &ConvertVersion);
@@ -409,7 +409,7 @@ void TestRegisterConverterErrors() {
   CHECK(go2cpp::json::core::FindConverter(go2cpp::reflect::kInt32Type) != &ConvertVersion);
 
   // 成功注册会清空调用方传入的旧错误。
-  error = extened::NewError("旧错误");
+  error = go2cpp::NewError("旧错误");
   const TypeId id = go2cpp::reflect::TypeRegistry::Instance().Register("test.Other", 8);
   CHECK(go2cpp::json::core::RegisterConverter(id, &ConvertVersion, error));
   CHECK(error == nullptr);
@@ -528,7 +528,7 @@ void TestRandomConvert() {
   std::mt19937_64 rng(0x12345678ULL);
   const TypeId ids[] = {go2cpp::reflect::kBoolType, go2cpp::reflect::kInt32Type,
                         go2cpp::reflect::kDoubleType, go2cpp::reflect::kStringType,
-                        go2cpp::reflect::kDecimalType};
+                        go2cpp::json::core::kDecimalType};
   const char alphabet[] = {'0', '1', '7', '9', '+', '-', '.', 'e', 't', 'r', 'u', 'a', 'l',
                            's', 'f', 'n', 'o', 'y'};
   constexpr std::size_t kAlphabetSize = sizeof(alphabet) / sizeof(alphabet[0]);
@@ -570,7 +570,7 @@ void TestRandomConvert() {
         CHECK(std::get<Text>(value).view() == text);
         break;
       }
-      case go2cpp::reflect::kDecimalType: {
+      case go2cpp::json::core::kDecimalType: {
         Decimal expected;
         CHECK(ok == Decimal::Parse(text, expected));
         if (ok) {
@@ -595,7 +595,7 @@ void ScenarioCsvRow() {
   const std::string_view fields[] = {"1001", "12.50", "3", "true", "键盘"};
   ItemValue row[5];
   CHECK(Convert(go2cpp::reflect::kInt32Type, fields[0], row[0]));
-  CHECK(Convert(go2cpp::reflect::kDecimalType, fields[1], row[1]));
+  CHECK(Convert(go2cpp::json::core::kDecimalType, fields[1], row[1]));
   CHECK(Convert(go2cpp::reflect::kInt32Type, fields[2], row[2]));
   CHECK(Convert(go2cpp::reflect::kBoolType, fields[3], row[3]));
   CHECK(Convert(go2cpp::reflect::kStringType, fields[4], row[4]));
@@ -624,7 +624,7 @@ void ScenarioJsonObject() {
       {"port", go2cpp::reflect::kInt32Type, "8080"},
       {"ratio", go2cpp::reflect::kDoubleType, "0.75"},
       {"enabled", go2cpp::reflect::kBoolType, "true"},
-      {"limit", go2cpp::reflect::kDecimalType, "1.5e2"},
+      {"limit", go2cpp::json::core::kDecimalType, "1.5e2"},
       {"mode", go2cpp::reflect::kStringType, "fast"},
   };
   int converted = 0;
@@ -637,7 +637,7 @@ void ScenarioJsonObject() {
   CHECK(converted == 5);
 
   ItemValue limit;
-  CHECK(Convert(go2cpp::reflect::kDecimalType, "1.5e2", limit));
+  CHECK(Convert(go2cpp::json::core::kDecimalType, "1.5e2", limit));
   CHECK(std::get<Decimal>(limit).ToString() == "150");
 }
 
