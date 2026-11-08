@@ -70,14 +70,11 @@ else()
     target_include_directories(go2cpp_os_monitor
         PUBLIC
             $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-            $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
-            # nlohmann/json.hpp 位于 go2cpp/third_party，monitor.hpp 经
-            # go2cpp/tools/json.hpp 间接包含它。
-            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party>)
+            $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
     target_compile_features(go2cpp_os_monitor PUBLIC cxx_std_17)
     target_compile_options(go2cpp_os_monitor PRIVATE -Wall -Wextra -Wpedantic)
     target_link_libraries(go2cpp_os_monitor
-        PUBLIC go2cpp_network go2cpp_scheduler go2cpp_channel
+        PUBLIC go2cpp_network go2cpp_scheduler go2cpp_channel go2cpp_json
         PRIVATE Threads::Threads)
     set_target_properties(go2cpp_os_monitor PROPERTIES
         EXPORT_NAME os_monitor

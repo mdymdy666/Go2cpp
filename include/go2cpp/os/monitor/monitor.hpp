@@ -15,7 +15,9 @@
 #include <string>
 #include <vector>
 
-#include "go2cpp/tools/json.hpp"
+// 序列化用自研 JSON：写侧 JsonBuilder，读侧只读 Value（Document 句柄）。
+#include "go2cpp/json/json_build.hpp"
+#include "go2cpp/json/parser.hpp"
 
 namespace go2cpp::os::monitor {
 
@@ -445,43 +447,43 @@ public:
     virtual std::string reason() const { return {}; }
 };
 
-// ---- JSON 序列化（nlohmann::json ADL）----
-void to_json(Json& j, const CpuCore& value);
-void from_json(const Json& j, CpuCore& value);
-void to_json(Json& j, const CpuLoad& value);
-void from_json(const Json& j, CpuLoad& value);
-void to_json(Json& j, const MemInfo& value);
-void from_json(const Json& j, MemInfo& value);
-void to_json(Json& j, const DiskStat& value);
-void from_json(const Json& j, DiskStat& value);
-void to_json(Json& j, const NetDevStat& value);
-void from_json(const Json& j, NetDevStat& value);
-void to_json(Json& j, const NetEbpfStat& value);
-void from_json(const Json& j, NetEbpfStat& value);
-void to_json(Json& j, const SyscallLatency& value);
-void from_json(const Json& j, SyscallLatency& value);
-void to_json(Json& j, const SyscallStats& value);
-void from_json(const Json& j, SyscallStats& value);
-void to_json(Json& j, const SchedTaskStat& value);
-void from_json(const Json& j, SchedTaskStat& value);
-void to_json(Json& j, const SchedStats& value);
-void from_json(const Json& j, SchedStats& value);
-void to_json(Json& j, const FutexTaskStat& value);
-void from_json(const Json& j, FutexTaskStat& value);
-void to_json(Json& j, const FutexStats& value);
-void from_json(const Json& j, FutexStats& value);
-void to_json(Json& j, const TcpConnStat& value);
-void from_json(const Json& j, TcpConnStat& value);
-void to_json(Json& j, const TcpStats& value);
-void from_json(const Json& j, TcpStats& value);
-void to_json(Json& j, const FileIoTaskStat& value);
-void from_json(const Json& j, FileIoTaskStat& value);
-void to_json(Json& j, const FileIoStats& value);
-void from_json(const Json& j, FileIoStats& value);
-void to_json(Json& j, const HostInfo& value);
-void from_json(const Json& j, HostInfo& value);
-void to_json(Json& j, const Snapshot& value);
-void from_json(const Json& j, Snapshot& value);
+// ---- JSON 序列化（自研 go2cpp::json：JsonBuilder 写 / Value 读）----
+void ToJson(go2cpp::json::JsonBuilder& builder, const CpuCore& value);
+void FromJson(const go2cpp::json::Value& value, CpuCore& out);
+void ToJson(go2cpp::json::JsonBuilder& builder, const CpuLoad& value);
+void FromJson(const go2cpp::json::Value& value, CpuLoad& out);
+void ToJson(go2cpp::json::JsonBuilder& builder, const MemInfo& value);
+void FromJson(const go2cpp::json::Value& value, MemInfo& out);
+void ToJson(go2cpp::json::JsonBuilder& builder, const DiskStat& value);
+void FromJson(const go2cpp::json::Value& value, DiskStat& out);
+void ToJson(go2cpp::json::JsonBuilder& builder, const NetDevStat& value);
+void FromJson(const go2cpp::json::Value& value, NetDevStat& out);
+void ToJson(go2cpp::json::JsonBuilder& builder, const NetEbpfStat& value);
+void FromJson(const go2cpp::json::Value& value, NetEbpfStat& out);
+void ToJson(go2cpp::json::JsonBuilder& builder, const SyscallLatency& value);
+void FromJson(const go2cpp::json::Value& value, SyscallLatency& out);
+void ToJson(go2cpp::json::JsonBuilder& builder, const SyscallStats& value);
+void FromJson(const go2cpp::json::Value& value, SyscallStats& out);
+void ToJson(go2cpp::json::JsonBuilder& builder, const SchedTaskStat& value);
+void FromJson(const go2cpp::json::Value& value, SchedTaskStat& out);
+void ToJson(go2cpp::json::JsonBuilder& builder, const SchedStats& value);
+void FromJson(const go2cpp::json::Value& value, SchedStats& out);
+void ToJson(go2cpp::json::JsonBuilder& builder, const FutexTaskStat& value);
+void FromJson(const go2cpp::json::Value& value, FutexTaskStat& out);
+void ToJson(go2cpp::json::JsonBuilder& builder, const FutexStats& value);
+void FromJson(const go2cpp::json::Value& value, FutexStats& out);
+void ToJson(go2cpp::json::JsonBuilder& builder, const TcpConnStat& value);
+void FromJson(const go2cpp::json::Value& value, TcpConnStat& out);
+void ToJson(go2cpp::json::JsonBuilder& builder, const TcpStats& value);
+void FromJson(const go2cpp::json::Value& value, TcpStats& out);
+void ToJson(go2cpp::json::JsonBuilder& builder, const FileIoTaskStat& value);
+void FromJson(const go2cpp::json::Value& value, FileIoTaskStat& out);
+void ToJson(go2cpp::json::JsonBuilder& builder, const FileIoStats& value);
+void FromJson(const go2cpp::json::Value& value, FileIoStats& out);
+void ToJson(go2cpp::json::JsonBuilder& builder, const HostInfo& value);
+void FromJson(const go2cpp::json::Value& value, HostInfo& out);
+void ToJson(go2cpp::json::JsonBuilder& builder, const Snapshot& value);
+void FromJson(const go2cpp::json::Value& value, Snapshot& out);
 
 /** @brief Snapshot 序列化为紧凑 JSON 字符串。 */
 std::string SnapshotToJson(const Snapshot& snapshot);
