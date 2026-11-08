@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <chrono>
 #include <limits>
+#include <type_traits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -19,6 +20,23 @@
 
 namespace go2cpp::os::monitor {
 namespace {
+
+/// 把标量写进当前对象/数组（与 monitor.cpp 的 Put 同构；各 TU 独立）。
+template <typename T>
+void Put(go2cpp::json::JsonBuilder& builder, const char* key, const T& value) {
+    builder.Key(key);
+    if constexpr (std::is_same_v<T, bool>) {
+        builder.Bool(value);
+    } else if constexpr (std::is_same_v<T, std::string>) {
+        builder.String(value);
+    } else if constexpr (std::is_floating_point_v<T>) {
+        builder.Double(value);
+    } else if constexpr (std::is_signed_v<T>) {
+        builder.Int(value);
+    } else {
+        builder.Uint(value);
+    }
+}
 
 /// 构造一个 JSON 响应。
 http::Response JsonResponse(http::Status status, std::string body) {
@@ -264,8 +282,12 @@ bool Manager::Start() {
                 // 用 JSON 序列化而不是字符串拼接：解析错误信息里可能带
                 // 双引号/反斜杠/控制字符，拼接会产出非法 JSON，客户端连
                 // 错误原因都解析不了。
-                const Json body{{"ok", false}, {"error", error}};
-                return JsonResponse(http::Status::BadRequest, body.dump());
+                go2cpp::json::JsonBuilder body;
+                body.BeginObject();
+                Put(body, "ok", false);
+                Put(body, "error", error);
+                body.EndObject();
+                return JsonResponse(http::Status::BadRequest, body.Take());
             }
             if (snapshot.host.empty()) {
                 snapshot.host = "unknown";
@@ -284,163 +306,193 @@ bool Manager::Start() {
         [this](const http::Request& request) {
             const std::size_t n = QuerySize(request.query(), "n", 10);
             const auto snapshots = impl_->Latest(n);
-            Json body = Json::array();
+            go2cpp::json::JsonBuilder body;
+            body.BeginArray();
             for (const auto& snapshot : snapshots) {
-                body.push_back(snapshot);
+                ToJson(body, snapshot);
             }
-            return JsonResponse(http::Status::OK, body.dump());
+            body.EndArray();
+            return JsonResponse(http::Status::OK, body.Take());
         });
     impl_->server->route(
         http::Method::Get, "/api/query/stats",
         [this](const http::Request& request) {
             (void)request;
             const auto summaries = impl_->Summaries();
-            Json body = Json::array();
+            go2cpp::json::JsonBuilder body;
+            body.BeginArray();
             for (const auto& summary : summaries) {
-                body.push_back(Json{{"host", summary.host},
-                                    {"timestamp_ms", summary.timestamp_ms},
-                                    {"score", summary.score},
-                                    {"cpu_percent", summary.cpu_percent},
-                                    {"mem_used_percent", summary.mem_used_percent},
-                                    {"disk_util_percent",
-                                     summary.disk_util_percent},
-                                    {"load1", summary.load1},
-                                    {"net_rcv_rate", summary.net_rcv_rate},
-                                    {"net_snd_rate", summary.net_snd_rate},
-                                    {"ebpf_active", summary.ebpf_active}});
+                body.BeginObject();
+                Put(body, "host", summary.host);
+                Put(body, "timestamp_ms", summary.timestamp_ms);
+                Put(body, "score", summary.score);
+                Put(body, "cpu_percent", summary.cpu_percent);
+                Put(body, "mem_used_percent", summary.mem_used_percent);
+                Put(body, "disk_util_percent", summary.disk_util_percent);
+                Put(body, "load1", summary.load1);
+                Put(body, "net_rcv_rate", summary.net_rcv_rate);
+                Put(body, "net_snd_rate", summary.net_snd_rate);
+                Put(body, "ebpf_active", summary.ebpf_active);
+                body.EndObject();
             }
-            return JsonResponse(http::Status::OK, body.dump());
+            body.EndArray();
+            return JsonResponse(http::Status::OK, body.Take());
         });
     impl_->server->route(
         http::Method::Get, "/api/query/kernel",
         [this](const http::Request& request) {
             (void)request;
             const auto summaries = impl_->KernelSummaries();
-            Json body = Json::array();
+            go2cpp::json::JsonBuilder body;
+            body.BeginArray();
             for (const auto& summary : summaries) {
-                Json syscall_top = Json::array();
-                for (const auto& item : summary.syscalls.top) {
-                    syscall_top.push_back(Json{{"name", item.name},
-                                               {"id", item.id},
-                                               {"count", item.count},
-                                               {"p50_us", item.p50_us},
-                                               {"p99_us", item.p99_us},
-                                               {"max_us", item.max_us}});
-                }
-                Json sched_top = Json::array();
-                for (const auto& item : summary.sched.top) {
-                    sched_top.push_back(Json{{"pid", item.pid},
-                                             {"comm", item.comm},
-                                             {"wait_count", item.wait_count},
-                                             {"wait_max_us", item.wait_max_us}});
-                }
-                Json futex_top = Json::array();
-                for (const auto& item : summary.futex.top) {
-                    futex_top.push_back(Json{{"pid", item.pid},
-                                             {"comm", item.comm},
-                                             {"wait_count", item.wait_count},
-                                             {"wake_count", item.wake_count},
-                                             {"wait_max_us",
-                                              item.wait_max_us}});
-                }
-                Json tcp_top = Json::array();
-                for (const auto& item : summary.tcp.top) {
-                    tcp_top.push_back(Json{{"local", item.local},
-                                           {"remote", item.remote},
-                                           {"retransmits", item.retransmits},
-                                           {"rtt_samples", item.rtt_samples},
-                                           {"rtt_p99_us", item.rtt_p99_us}});
-                }
-                Json fileio_top = Json::array();
-                for (const auto& item : summary.fileio.top) {
-                    fileio_top.push_back(Json{{"pid", item.pid},
-                                              {"comm", item.comm},
-                                              {"read_count", item.read_count},
-                                              {"write_count", item.write_count},
-                                              {"read_max_us", item.read_max_us},
-                                              {"write_max_us",
-                                               item.write_max_us}});
-                }
-                const double syscall_p50 = KernelHistPercentile(
+                body.BeginObject();
+                Put(body, "host", summary.host);
+                Put(body, "timestamp_ms", summary.timestamp_ms);
 
-                    summary.syscalls.hist, summary.syscalls.total, 0.50);
-                const double syscall_p99 = KernelHistPercentile(
-                    summary.syscalls.hist, summary.syscalls.total, 0.99);
-                body.push_back(Json{
-                    {"host", summary.host},
-                    {"timestamp_ms", summary.timestamp_ms},
-                    {"syscall",
-                     Json{{"active", summary.syscalls.active},
-                          {"total", summary.syscalls.total},
-                          {"p50_us", syscall_p50},
-                          {"p99_us", syscall_p99},
-                          {"top", syscall_top}}},
-                    {"sched",
-                     Json{{"active", summary.sched.active},
-                          {"switches", summary.sched.switches},
-                          {"wait_count", summary.sched.wait_count},
-                          {"wait_p50_us", summary.sched.wait_p50_us},
-                          {"wait_p99_us", summary.sched.wait_p99_us},
-                          {"wait_max_us", summary.sched.wait_max_us},
-                          {"top", sched_top}}},
-                    {"futex",
-                     Json{{"active", summary.futex.active},
-                          {"wait_count", summary.futex.wait_count},
-                          {"wake_count", summary.futex.wake_count},
-                          {"wait_wake_ratio",
-                           summary.futex.wait_wake_ratio},
-                          {"wait_p50_us", summary.futex.wait_p50_us},
-                          {"wait_p99_us", summary.futex.wait_p99_us},
-                          {"wait_max_us", summary.futex.wait_max_us},
-                          {"top", futex_top}}},
-                    {"tcp",
-                     Json{{"active", summary.tcp.active},
-                          {"reason", summary.tcp.reason},
-                          {"rtt_source", summary.tcp.rtt_source},
-                          {"retransmits", summary.tcp.retransmits},
-                          {"retransmits_per_sec",
-                           summary.tcp.retransmits_per_sec},
-                          {"rtt_samples", summary.tcp.rtt_samples},
-                          {"rtt_p50_us", summary.tcp.rtt_p50_us},
-                          {"rtt_p99_us", summary.tcp.rtt_p99_us},
-                          {"rtt_avg_us", summary.tcp.rtt_avg_us},
-                          {"rtt_max_us", summary.tcp.rtt_max_us},
-                          {"rtt_weighting", summary.tcp.rtt_weighting},
-                          {"conn_rtt_samples",
-                           summary.tcp.conn_rtt_samples},
-                          {"conn_rtt_p50_us",
-                           summary.tcp.conn_rtt_p50_us},
-                          {"conn_rtt_p99_us",
-                           summary.tcp.conn_rtt_p99_us},
-                          {"top", tcp_top}}},
-                    {"fileio",
-                     Json{{"active", summary.fileio.active},
-                          {"reason", summary.fileio.reason},
-                          {"read_count", summary.fileio.read_count},
-                          {"write_count", summary.fileio.write_count},
-                          {"read_p50_us", summary.fileio.read_p50_us},
-                          {"read_p99_us", summary.fileio.read_p99_us},
-                          {"write_p50_us",
-                           summary.fileio.write_p50_us},
-                          {"write_p99_us",
-                           summary.fileio.write_p99_us},
-                          {"read_iops", summary.fileio.read_iops},
-                          {"write_iops", summary.fileio.write_iops},
-                          {"readv_count", summary.fileio.readv_count},
-                          {"writev_count", summary.fileio.writev_count},
-                          {"uring_read_count",
-                           summary.fileio.uring_read_count},
-                          {"uring_write_count",
-                           summary.fileio.uring_write_count},
-                          {"uring_read_pending",
-                           summary.fileio.uring_read_pending},
-                          {"uring_write_pending",
-                           summary.fileio.uring_write_pending},
-                          {"coverage", summary.fileio.coverage},
-                          {"coverage_gap", summary.fileio.coverage_gap},
-                          {"top", fileio_top}}}});
+                body.Key("syscall");
+                body.BeginObject();
+                Put(body, "active", summary.syscalls.active);
+                Put(body, "total", summary.syscalls.total);
+                Put(body, "p50_us", KernelHistPercentile(
+                                        summary.syscalls.hist,
+                                        summary.syscalls.total, 0.50));
+                Put(body, "p99_us", KernelHistPercentile(
+                                        summary.syscalls.hist,
+                                        summary.syscalls.total, 0.99));
+                body.Key("top");
+                body.BeginArray();
+                for (const auto& item : summary.syscalls.top) {
+                    body.BeginObject();
+                    Put(body, "name", item.name);
+                    Put(body, "id", item.id);
+                    Put(body, "count", item.count);
+                    Put(body, "p50_us", item.p50_us);
+                    Put(body, "p99_us", item.p99_us);
+                    Put(body, "max_us", item.max_us);
+                    body.EndObject();
+                }
+                body.EndArray();
+                body.EndObject();
+
+                body.Key("sched");
+                body.BeginObject();
+                Put(body, "active", summary.sched.active);
+                Put(body, "switches", summary.sched.switches);
+                Put(body, "wait_count", summary.sched.wait_count);
+                Put(body, "wait_p50_us", summary.sched.wait_p50_us);
+                Put(body, "wait_p99_us", summary.sched.wait_p99_us);
+                Put(body, "wait_max_us", summary.sched.wait_max_us);
+                body.Key("top");
+                body.BeginArray();
+                for (const auto& item : summary.sched.top) {
+                    body.BeginObject();
+                    Put(body, "pid", item.pid);
+                    Put(body, "comm", item.comm);
+                    Put(body, "wait_count", item.wait_count);
+                    Put(body, "wait_max_us", item.wait_max_us);
+                    body.EndObject();
+                }
+                body.EndArray();
+                body.EndObject();
+
+                body.Key("futex");
+                body.BeginObject();
+                Put(body, "active", summary.futex.active);
+                Put(body, "wait_count", summary.futex.wait_count);
+                Put(body, "wake_count", summary.futex.wake_count);
+                Put(body, "wait_wake_ratio", summary.futex.wait_wake_ratio);
+                Put(body, "wait_p50_us", summary.futex.wait_p50_us);
+                Put(body, "wait_p99_us", summary.futex.wait_p99_us);
+                Put(body, "wait_max_us", summary.futex.wait_max_us);
+                body.Key("top");
+                body.BeginArray();
+                for (const auto& item : summary.futex.top) {
+                    body.BeginObject();
+                    Put(body, "pid", item.pid);
+                    Put(body, "comm", item.comm);
+                    Put(body, "wait_count", item.wait_count);
+                    Put(body, "wake_count", item.wake_count);
+                    Put(body, "wait_max_us", item.wait_max_us);
+                    body.EndObject();
+                }
+                body.EndArray();
+                body.EndObject();
+
+                body.Key("tcp");
+                body.BeginObject();
+                Put(body, "active", summary.tcp.active);
+                Put(body, "reason", summary.tcp.reason);
+                Put(body, "rtt_source", summary.tcp.rtt_source);
+                Put(body, "retransmits", summary.tcp.retransmits);
+                Put(body, "retransmits_per_sec",
+                    summary.tcp.retransmits_per_sec);
+                Put(body, "rtt_samples", summary.tcp.rtt_samples);
+                Put(body, "rtt_p50_us", summary.tcp.rtt_p50_us);
+                Put(body, "rtt_p99_us", summary.tcp.rtt_p99_us);
+                Put(body, "rtt_avg_us", summary.tcp.rtt_avg_us);
+                Put(body, "rtt_max_us", summary.tcp.rtt_max_us);
+                Put(body, "rtt_weighting", summary.tcp.rtt_weighting);
+                Put(body, "conn_rtt_samples", summary.tcp.conn_rtt_samples);
+                Put(body, "conn_rtt_p50_us", summary.tcp.conn_rtt_p50_us);
+                Put(body, "conn_rtt_p99_us", summary.tcp.conn_rtt_p99_us);
+                body.Key("top");
+                body.BeginArray();
+                for (const auto& item : summary.tcp.top) {
+                    body.BeginObject();
+                    Put(body, "local", item.local);
+                    Put(body, "remote", item.remote);
+                    Put(body, "retransmits", item.retransmits);
+                    Put(body, "rtt_samples", item.rtt_samples);
+                    Put(body, "rtt_p99_us", item.rtt_p99_us);
+                    body.EndObject();
+                }
+                body.EndArray();
+                body.EndObject();
+
+                body.Key("fileio");
+                body.BeginObject();
+                Put(body, "active", summary.fileio.active);
+                Put(body, "reason", summary.fileio.reason);
+                Put(body, "read_count", summary.fileio.read_count);
+                Put(body, "write_count", summary.fileio.write_count);
+                Put(body, "read_p50_us", summary.fileio.read_p50_us);
+                Put(body, "read_p99_us", summary.fileio.read_p99_us);
+                Put(body, "write_p50_us", summary.fileio.write_p50_us);
+                Put(body, "write_p99_us", summary.fileio.write_p99_us);
+                Put(body, "read_iops", summary.fileio.read_iops);
+                Put(body, "write_iops", summary.fileio.write_iops);
+                Put(body, "readv_count", summary.fileio.readv_count);
+                Put(body, "writev_count", summary.fileio.writev_count);
+                Put(body, "uring_read_count",
+                    summary.fileio.uring_read_count);
+                Put(body, "uring_write_count",
+                    summary.fileio.uring_write_count);
+                Put(body, "uring_read_pending",
+                    summary.fileio.uring_read_pending);
+                Put(body, "uring_write_pending",
+                    summary.fileio.uring_write_pending);
+                Put(body, "coverage", summary.fileio.coverage);
+                Put(body, "coverage_gap", summary.fileio.coverage_gap);
+                body.Key("top");
+                body.BeginArray();
+                for (const auto& item : summary.fileio.top) {
+                    body.BeginObject();
+                    Put(body, "pid", item.pid);
+                    Put(body, "comm", item.comm);
+                    Put(body, "read_count", item.read_count);
+                    Put(body, "write_count", item.write_count);
+                    Put(body, "read_max_us", item.read_max_us);
+                    Put(body, "write_max_us", item.write_max_us);
+                    body.EndObject();
+                }
+                body.EndArray();
+                body.EndObject();
+
+                body.EndObject();
             }
-            return JsonResponse(http::Status::OK, body.dump());
+            body.EndArray();
+            return JsonResponse(http::Status::OK, body.Take());
         });
     impl_->server->route(
         http::Method::Get, "/api/health",
@@ -453,11 +505,14 @@ bool Manager::Start() {
                 received = impl_->received;
                 rejected = impl_->rejected;
             }
-            Json body{{"status", "ok"},
-                      {"received", received},
-                      {"rejected", rejected},
-                      {"stored", impl_->store->size()}};
-            return JsonResponse(http::Status::OK, body.dump());
+            go2cpp::json::JsonBuilder body;
+            body.BeginObject();
+            Put(body, "status", std::string("ok"));
+            Put(body, "received", received);
+            Put(body, "rejected", rejected);
+            Put(body, "stored", impl_->store->size());
+            body.EndObject();
+            return JsonResponse(http::Status::OK, body.Take());
         });
 
     impl_->scheduler = std::make_unique<Scheduler>(3);

@@ -26,6 +26,19 @@ endif()
 
 add_library(go2cpp_error ${CMAKE_CURRENT_SOURCE_DIR}/src/tools/error.cpp)
 
+# 自研 JSON 引擎（include/go2cpp/json + src/json）：monitor 的 Snapshot
+# 序列化与 tools/json.hpp 的解析入口都基于它，不再依赖 third_party/nlohmann。
+add_library(go2cpp_json
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/json/core/conversion.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/json/core/decimal.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/json/escape.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/json/parser.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/json/pointer.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/json/reader.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/json/scan.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/json/writer.cpp)
+target_link_libraries(go2cpp_json PUBLIC go2cpp_error)
+
 # 跨平台基础件（platform/ 三件：WakeEvent / LastError / SteadyClock）
 # 差异见 docs/plans/cross-platform-plan.md §1.3；Windows 需链接 ws2_32（WSAGetLastError）。
 add_library(go2cpp_platform
@@ -261,16 +274,13 @@ add_library(go2cpp_rand ${CMAKE_CURRENT_SOURCE_DIR}/src/math/rand.cpp)
 # os 模块：文件/目录/环境变量/参数 + 多进程/IPC（R1-R31）。走裸 syscall
 # 绕过 Hook（见 os/proc.hpp 的边界论证），依赖 config 与 io（IOManager 异步适配）。
 add_library(go2cpp_os
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/os/proc.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/os/dir.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/os/file.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/os/os.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/os/config.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/os/raw_io.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/os/io_capability.cpp
-    $<$<NOT:$<PLATFORM_ID:Windows>>:${CMAKE_CURRENT_SOURCE_DIR}/src/os/proc.cpp>
-    $<$<PLATFORM_ID:Windows>:${CMAKE_CURRENT_SOURCE_DIR}/src/os/proc_win32.cpp>
-    $<$<PLATFORM_ID:Windows>:${CMAKE_CURRENT_SOURCE_DIR}/src/os/proc_win32_misc.cpp>
-    $<$<PLATFORM_ID:Windows>:${CMAKE_CURRENT_SOURCE_DIR}/src/os/proc_win32_impl.cpp>
     ${CMAKE_CURRENT_SOURCE_DIR}/src/os/channel.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/os/shm.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/os/mq.cpp
@@ -355,6 +365,7 @@ add_library(go2cpp_runtime INTERFACE)
 add_library(go2cpp::runtime ALIAS go2cpp_runtime)
 
 set_target_properties(go2cpp_error PROPERTIES EXPORT_NAME error)
+set_target_properties(go2cpp_json PROPERTIES EXPORT_NAME json)
 set_target_properties(go2cpp_control_flow PROPERTIES EXPORT_NAME control_flow)
 set_target_properties(go2cpp_context PROPERTIES EXPORT_NAME context)
 set_target_properties(go2cpp_channel PROPERTIES EXPORT_NAME channel)
@@ -380,6 +391,7 @@ set_target_properties(go2cpp_runtime PROPERTIES EXPORT_NAME runtime)
 # are not a second library or ABI; they only make add_subdirectory consumers
 # use the same names as find_package consumers.
 add_library(go2cpp::error ALIAS go2cpp_error)
+add_library(go2cpp::json ALIAS go2cpp_json)
 add_library(go2cpp::control_flow ALIAS go2cpp_control_flow)
 add_library(go2cpp::context ALIAS go2cpp_context)
 add_library(go2cpp::channel ALIAS go2cpp_channel)
@@ -440,12 +452,14 @@ if (NOT WIN32)
     endif()
 endif()
 target_link_libraries(go2cpp_debug PUBLIC
-    go2cpp_scheduler go2cpp_fiber go2cpp_sync go2cpp_io go2cpp_debug_event)
+    go2cpp_scheduler go2cpp_fiber go2cpp_sync go2cpp_io go2cpp_debug_event
+    go2cpp_json)
 set_target_properties(go2cpp_debug PROPERTIES EXPORT_NAME debug)
 add_library(go2cpp::debug ALIAS go2cpp_debug)
 
 set(GO2CPP_MODULE_TARGETS
     go2cpp_error
+    go2cpp_json
     go2cpp_platform
     go2cpp_control_flow
     go2cpp_context
