@@ -782,4 +782,8 @@ else()
 endif()
 
 # AtomicRename/DeleteFileIfExists（platform/ 跨平台文件操作）
-target_link_libraries(go2cpp_bento_app PRIVATE go2cpp_platform)
+# 注意：go2cpp_bento_app 只在 GO2CPP_WITH_BENTO=ON 时存在，必须加守卫，
+# 否则默认配置（BENTO=OFF）会因 target 不存在而配置失败。
+if(TARGET go2cpp_bento_app)
+    target_link_libraries(go2cpp_bento_app PRIVATE go2cpp_platform)
+endif()
