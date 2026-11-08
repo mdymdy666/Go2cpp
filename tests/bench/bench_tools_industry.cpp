@@ -20,7 +20,7 @@
 #include "go2cpp/compress/compress.hpp"
 #include "go2cpp/encoding/base64.hpp"
 #include "go2cpp/reflect/reflect.hpp"
-#include "nlohmann/json.hpp"
+#include "go2cpp/json.hpp"
 #include "rapidjson/document.h"
 #include "rapidjson/stringbuffer.h"
 #include "rapidjson/writer.h"
@@ -333,7 +333,7 @@ void BenchReflect(int iters) {
     const std::string batch_text = "[]";
     (void)batch;
 
-    // 纯解析器：同一份 JSON 文本（nlohmann/rapidjson 同输入）。
+    // 纯解析器：同一份 JSON 文本（go2cpp::Json / rapidjson 同输入）。
     const std::string doc = R"({"v":1,"id":101,"type":"LoginRequest","payload":{"user":"alice","token":"7f3a9c2e5b8d1f4a6c0e2b9d7f5a3c1e","timestamp":1730600000123,"remember":true}})";
     go2cpp::reflect::JsonValue value;
     const double parse_ns = TimeNs([&] {
@@ -366,27 +366,27 @@ void BenchReflect(int iters) {
     }, iters);
     Report("protobuf_login_parse", pbp_ns, static_cast<double>(pb_bytes.size()), iters);
 
-    // nlohmann / rapidjson 对同一登录对象的生成 + 解析。
-    nlohmann::json nj;
+    // go2cpp::Json / rapidjson 对同一登录对象的生成 + 解析。
+    go2cpp::Json nj;
     nj["user"] = login.user;
     nj["token"] = login.token;
     nj["timestamp"] = login.timestamp;
     nj["remember"] = login.remember;
     const std::string ntext = nj.dump();
     const double nj_dump_ns = TimeNs([&] {
-        nlohmann::json out;
+        go2cpp::Json out;
         out["user"] = login.user;
         out["token"] = login.token;
         out["timestamp"] = login.timestamp;
         out["remember"] = login.remember;
         (void)out.dump();
     }, iters);
-    Report("nlohmann_dump_login", nj_dump_ns, static_cast<double>(ntext.size()), iters);
-    const double nj_parse_ns = TimeNs([&] { (void)nlohmann::json::parse(ntext); }, iters);
-    Report("nlohmann_parse_login", nj_parse_ns, static_cast<double>(ntext.size()), iters);
+    Report("go2cpp_dump_login", nj_dump_ns, static_cast<double>(ntext.size()), iters);
+    const double nj_parse_ns = TimeNs([&] { (void)go2cpp::Json::parse(ntext); }, iters);
+    Report("go2cpp_parse_login", nj_parse_ns, static_cast<double>(ntext.size()), iters);
 
-    const double nj_doc_parse_ns = TimeNs([&] { (void)nlohmann::json::parse(doc); }, iters / 4);
-    Report("nlohmann_parse_doc", nj_doc_parse_ns, static_cast<double>(doc.size()), iters / 4);
+    const double nj_doc_parse_ns = TimeNs([&] { (void)go2cpp::Json::parse(doc); }, iters / 4);
+    Report("go2cpp_parse_doc", nj_doc_parse_ns, static_cast<double>(doc.size()), iters / 4);
 
     rapidjson::Document rd;
     rd.Parse(doc.c_str());

@@ -1,7 +1,7 @@
 /**
  * @file tests/bench/ops_bench.cpp
  * @brief 周边模块（logging / config / os / container）的**汇编级**基准，
- *        以及与工业库（spdlog / fmt / nlohmann::json / 原生 syscall / std 容器）
+ *        以及与工业库（spdlog / fmt / rapidjson / 原生 syscall / std 容器）
  *        的同口径对比。
  *
  * ## 口径
@@ -41,7 +41,7 @@
 #include <vector>
 
 #if defined(OPS_BENCH_INDUSTRY)
-#include <nlohmann/json.hpp>
+#include "go2cpp/json.hpp"
 #include <spdlog/pattern_formatter.h>
 #include <spdlog/sinks/base_sink.h>
 #include <spdlog/spdlog.h>
@@ -314,7 +314,7 @@ void BenchJsonNlohmann(std::size_t iterations) {
     const std::string text = MakeJsonText();
     std::size_t checksum = 0;
     for (int i = 0; i < 100; ++i) {
-        auto parsed = nlohmann::json::parse(text);
+        auto parsed = go2cpp::Json::parse(text);
         checksum += parsed["scheduler"]["key7"].get<std::string>().size();
     }
     double best = 1e30;
@@ -322,14 +322,14 @@ void BenchJsonNlohmann(std::size_t iterations) {
         checksum = 0;
         const double start = NowNs();
         for (std::size_t i = 0; i < iterations; ++i) {
-            auto parsed = nlohmann::json::parse(text);
+            auto parsed = go2cpp::Json::parse(text);
             checksum += parsed["scheduler"]["key7"].get<std::string>().size();
             checksum += parsed["log"]["log_key3"].get<std::string>().size();
             checksum += parsed["timer"].contains("timer_key9") ? 1u : 0u;
         }
         best = std::min(best, NowNs() - start);
     }
-    Report("json_nlohmann", best, iterations, text.size(), checksum);
+    Report("json_go2cpp", best, iterations, text.size(), checksum);
 }
 #endif  // OPS_BENCH_INDUSTRY
 
