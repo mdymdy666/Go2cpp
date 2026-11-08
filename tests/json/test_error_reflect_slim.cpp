@@ -11,6 +11,7 @@
 #include <cstddef>
 
 #include "go2cpp/reflect/field.hpp"
+#include "go2cpp/reflect/reflect.hpp"  // 聚合头：ReadJson/WriteJson/DeserializeCompact 的定义
 #include <cstdint>
 #include <cstdio>
 #include <memory>
