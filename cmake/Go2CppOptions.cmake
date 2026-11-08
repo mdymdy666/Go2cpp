@@ -96,6 +96,13 @@ option(GO2CPP_DIAGNOSTIC_QUIC
        "Enable the QUIC stream transport for Doctor (requires picoquic)" OFF)
 if (GO2CPP_DIAGNOSTIC)
     add_compile_definitions(GO2CPP_DIAGNOSTIC=1)
+    # Doctor 的 mutex-unlock 依赖 Mutex 记录 owner gid。Release（NDEBUG）默认
+    # 把持锁检测编译期关闭（见 include/go2cpp/sync.hpp 的
+    # GO2CPP_HELD_PARK_DETECT_RUNTIME），这会让 owner_known 恒为 false、
+    # owner-gone 判定永不可达，mutex-unlock 只能退回安全的 owner-unknown 拒绝。
+    # 诊断构建本身的用途就是调试，这里显式保留运行时检测；代价是 Mutex
+    # 加解锁热路径多一次 TLS 读 + 可预测分支（非诊断构建不受影响）。
+    add_compile_definitions(GO2CPP_HELD_PARK_DETECT_RUNTIME=1)
 endif()
 if (GO2CPP_DIAGNOSTIC_QUIC AND NOT GO2CPP_DIAGNOSTIC)
     message(FATAL_ERROR "GO2CPP_DIAGNOSTIC_QUIC=ON 需要同时设置 GO2CPP_DIAGNOSTIC=ON")
