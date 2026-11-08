@@ -420,15 +420,21 @@ add_library(go2cpp::debug_event ALIAS go2cpp_debug_event)
 #
 # 依赖方向：debug -> {scheduler,fiber,sync,io,debug_event}；被观测模块只依赖
 # 零依赖的 debug_event（且仅在 GO2CPP_DEBUG_DUMP=ON 时建立链接）。
+# Windows：debug_dump.cpp 不依赖 /proc（跨平台）；debug_server.cpp（Unix socket +
+# /proc 内省）与 diagnostic_agent.cpp（/proc）依赖 Linux 专属接口，Windows 上排除。
+# 见 docs/reports/cross-platform-syscall-audit.md TOP5（/proc 无对应）。
 add_library(go2cpp_debug
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/debug/debug_dump.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/debug/debug_server.cpp)
-# Doctor（在线诊断）：默认 OFF 时不编译该源文件，go2cpp_debug 中不存在
-# DiagnosticAgent 符号；打开后由同一个 target 承载（不新增对外 target，
-# 避免 install(EXPORT) 的 ABI 面扩大）。
-if (GO2CPP_DIAGNOSTIC)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/debug/debug_dump.cpp)
+if (NOT WIN32)
     target_sources(go2cpp_debug PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/debug/diagnostic_agent.cpp)
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/debug/debug_server.cpp)
+    # Doctor（在线诊断）：默认 OFF 时不编译该源文件，go2cpp_debug 中不存在
+    # DiagnosticAgent 符号；打开后由同一个 target 承载（不新增对外 target，
+    # 避免 install(EXPORT) 的 ABI 面扩大）。
+    if (GO2CPP_DIAGNOSTIC)
+        target_sources(go2cpp_debug PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/debug/diagnostic_agent.cpp)
+    endif()
 endif()
 target_link_libraries(go2cpp_debug PUBLIC
     go2cpp_scheduler go2cpp_fiber go2cpp_sync go2cpp_io go2cpp_debug_event)
