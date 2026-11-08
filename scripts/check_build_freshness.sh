@@ -148,7 +148,9 @@ EXE_LIST=""
 LIB_LIST=""
 if [ "$ARTIFACT_DIR_OK" -eq 1 ]; then
     EXE_LIST="$(find "$BUILD_DIR" -maxdepth 4 -type f -name 'go2cpp_tests' -printf '%T@ %p\n' 2>/dev/null | sort -k1,1n)"
-    LIB_LIST="$(find "$BUILD_DIR" -maxdepth 4 -type f -name 'libgo2cpp_*.so*' -printf '%T@ %p\n' 2>/dev/null | sort -k1,1n)"
+    # 关键产物同时收集 .so 与 .a：bento/distributed 等是静态库，
+    # 只查 .so 会把「静态库产物已更新」误判为 STALE。
+    LIB_LIST="$(find "$BUILD_DIR" -maxdepth 4 -type f \( -name 'libgo2cpp_*.so*' -o -name 'libgo2cpp_*.a' \) -printf '%T@ %p\n' 2>/dev/null | sort -k1,1n)"
 fi
 ARTIFACT_LIST="$(printf '%s\n%s\n' "$EXE_LIST" "$LIB_LIST" | grep -c . || true)"
 ARTIFACT_NEWEST_TS=""
