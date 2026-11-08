@@ -24,6 +24,10 @@
 #include "go2cpp/config/env.hpp"
 #include "go2cpp/fiber.hpp"
 
+#if defined(_WIN32)
+#include <windows.h>
+#endif
+
 #include "go2cpp/debug/debug_resources.hpp"
 #include "go2cpp/error/error_fiber.hpp"
 #include "go2cpp/error/error_scope.hpp"
@@ -3085,6 +3089,23 @@ struct MigrationObjectSpan {
 };
 
 std::string MigrationReadSelfExecutablePath() {
+#if defined(_WIN32)
+    // Windows：/proc 不存在，用 GetModuleFileNameW（等价于 /proc/self/exe）。
+    wchar_t wbuf[4096];
+    const DWORD n = ::GetModuleFileNameW(nullptr, wbuf, 4096);
+    if (n == 0 || n >= 4096) {
+        return {};
+    }
+    const int need = ::WideCharToMultiByte(CP_UTF8, 0, wbuf, static_cast<int>(n),
+                                           nullptr, 0, nullptr, nullptr);
+    if (need <= 0) {
+        return {};
+    }
+    std::string out(static_cast<std::size_t>(need), '\0');
+    ::WideCharToMultiByte(CP_UTF8, 0, wbuf, static_cast<int>(n), out.data(), need,
+                          nullptr, nullptr);
+    return out;
+#else
     char buffer[4096];
     const ssize_t length = ::readlink("/proc/self/exe", buffer, sizeof(buffer) - 1);
     if (length <= 0) {
@@ -3092,6 +3113,7 @@ std::string MigrationReadSelfExecutablePath() {
     }
     buffer[length] = '\0';
     return std::string(buffer, static_cast<std::size_t>(length));
+#endif
 }
 
 std::string MigrationNormalizeModulePath(const std::string& path) {
@@ -3218,6 +3240,27 @@ bool MigrationReadBuildIdHash(const std::string& path, std::uint64_t* hash) {
 
 bool MigrationReadMappedRanges(
     std::vector<std::pair<std::uint64_t, std::uint64_t>>* ranges) {
+#if defined(_WIN32)
+    // Windows：/proc/self/maps 不存在，用 VirtualQuery 枚举提交区。
+    // 契约差异：Linux 能拿到「映射文件路径」，Windows 只能拿到基址/大小/保护属性。
+    if (ranges == nullptr) {
+        return false;
+    }
+    MEMORY_BASIC_INFORMATION mbi{};
+    std::uintptr_t addr = 0;
+    while (::VirtualQuery(reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi)) != 0) {
+        if (mbi.State == MEM_COMMIT && mbi.RegionSize > 0) {
+            ranges->emplace_back(static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(mbi.BaseAddress)),
+                                 static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(mbi.BaseAddress) + mbi.RegionSize));
+        }
+        const std::uintptr_t next = reinterpret_cast<std::uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+        if (next <= addr) {
+            break;  // 防止溢出死循环
+        }
+        addr = next;
+    }
+    return !ranges->empty();
+#else
     std::ifstream maps("/proc/self/maps");
     if (!maps || ranges == nullptr) {
         return false;
@@ -3231,6 +3274,8 @@ bool MigrationReadMappedRanges(
         }
     }
     return true;
+
+#endif  // !defined(_WIN32)
 }
 
 bool MigrationInMappedRanges(
