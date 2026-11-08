@@ -209,6 +209,16 @@ std::chrono::milliseconds Remaining(Clock::time_point deadline) {
                     std::chrono::milliseconds(1));
 }
 
+/// 生成连接会话 ID：热切换时保持不变，只有新建 P2PChannel 才会变。
+/// @details 低 16 位是进程内自增计数（保证同一纳秒内创建的两个通道不撞），
+///          高位来自 steady_clock 纳秒。不用于安全用途，只作「同一条流」的标识。
+std::uint64_t NextSessionId() noexcept {
+    static std::atomic<std::uint64_t> counter{0};
+    const std::uint64_t tick = static_cast<std::uint64_t>(NowNanos());
+    const std::uint64_t index = counter.fetch_add(1, std::memory_order_relaxed);
+    return (tick << 16U) ^ index ^ 0x9E3779B97F4A7C15ULL;
+}
+
 std::chrono::milliseconds ClampPoll(std::chrono::milliseconds remaining, int limit_ms) {
     if (remaining.count() > limit_ms) {
         return std::chrono::milliseconds(limit_ms);
@@ -240,7 +250,8 @@ const char* P2PStateName(P2PState state) noexcept {
 
 class P2PChannel::Impl {
 public:
-    explicit Impl(P2PConfig config) : m_config(std::move(config)) {
+    explicit Impl(P2PConfig config)
+        : m_config(std::move(config)), m_ice(m_config.ice_switchover) {
         // 先发布初始快照：Send/Recv/state() 可在任何时刻无锁读取。
         PublishState(P2PState::kIdle, Endpoint());
         if (m_config.transport) {
@@ -448,6 +459,8 @@ public:
             }
         }
         SortEndpointsByRemotePriority(&direct_targets, remote);
+        // 注册「本地候选 × 远端直连候选」候选对，供连接建立后的热切换使用。
+        RegisterCandidatePairs(direct_targets, remote);
 
         // 没有可用的中继候选时，把整个预算都给直连；否则直连先用 70%，
         // 剩下 30% 留给中继降级。
@@ -534,13 +547,20 @@ public:
             // 每轮只取一次时钟；当 keepalive 与 peer_timeout 都关闭时
             // （纯数据面压测）完全跳过 steady_clock::now() 的 vDSO 调用。
             std::int64_t now_ns = 0;
-            if (m_track_activity) {
+            if (m_need_clock) {
                 now_ns = NowNanos();
+            }
+            if (m_track_activity) {
                 MaybeSendKeepalive(now_ns);
                 if (PeerTimedOut(now_ns)) {
                     SetFailed("对端静默超过 peer_timeout");
                     return 0;
                 }
+            }
+            // 候选对探测/切换只在 >=2 个直连对时存在（单对零开销）。
+            if (m_ice_active.load(std::memory_order_relaxed)) {
+                MaybeSendIceProbes(now_ns);
+                EvaluateSwitchover(now_ns);
             }
             if (left.count() <= 0) {
                 return 0;
@@ -564,7 +584,7 @@ public:
             const auto* bytes = m_recv_buffer.data();
             const std::size_t received_bytes = static_cast<std::size_t>(received);
             if (LooksLikeStun(bytes, received_bytes)) {
-                HandleStun(bytes, received_bytes, source, relayed);
+                HandleStun(bytes, received_bytes, source, relayed, now_ns);
                 ensure_deadline();
                 left = Remaining(deadline);
                 continue;
@@ -596,7 +616,7 @@ public:
                 left = Remaining(deadline);
                 continue;
             }
-            if (!SourceMatchesPeer(source)) {
+            if (!AcceptSource(source, now_ns)) {
                 BumpLocal(m_stats.dropped_packets);
                 ensure_deadline();
                 left = Remaining(deadline);
@@ -671,12 +691,42 @@ public:
         out.sequence_gaps = m_stats.sequence_gaps.load(std::memory_order_relaxed);
         out.rtt_ms = m_stats.rtt_ms.load(std::memory_order_relaxed);
         out.rtt_avg_ms = m_stats.rtt_avg_ms.load(std::memory_order_relaxed);
+        out.ice_probes_sent = m_stats.ice_probes_sent.load(std::memory_order_relaxed);
+        out.ice_pair_switches =
+            m_stats.ice_pair_switches.load(std::memory_order_relaxed);
         return out;
     }
 
     std::string LastError() const {
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_error;
+    }
+
+    std::uint64_t SessionId() const {
+        return m_session_id.load(std::memory_order_relaxed);
+    }
+
+    Endpoint SelectedPairRemote() const {
+        const ConnectionSnapshot& snapshot = CurrentSnapshot();
+        if (snapshot.state != P2PState::kConnected) {
+            return Endpoint();
+        }
+        return snapshot.peer;
+    }
+
+    std::vector<IcePairSnapshot> CandidatePairs() const {
+        return m_ice.Snapshot(NowNanos());
+    }
+
+    bool EvaluateIceSwitchover() {
+        if (!m_ice_active.load(std::memory_order_relaxed)) {
+            return false;
+        }
+        return EvaluateSwitchover(NowNanos());
+    }
+
+    std::uint64_t SwitchGeneration() const {
+        return m_ice_generation.load(std::memory_order_relaxed);
     }
 
     void Close() {
@@ -764,6 +814,227 @@ private:
         if (current != P2PState::kClosed) {
             PublishStateIfOpen(P2PState::kFailed, CurrentSnapshot().peer);
         }
+    }
+
+    /// @brief 组合候选对优先级（RFC 8445 §6.1.2.3）。
+    /// @details `2^32×MIN + 2×MAX + (G>D)`：本地优先级为 G、远端为 D。两边对等
+    ///          时用同一公式，保证「双方算出的相对顺序一致」，否则会互相把对方
+    ///          往不同路径上拽。
+    static std::uint64_t PairPriority(std::uint32_t local_priority,
+                                      std::uint32_t remote_priority) noexcept {
+        const std::uint64_t high = std::max<std::uint64_t>(local_priority, remote_priority);
+        const std::uint64_t low = std::min<std::uint64_t>(local_priority, remote_priority);
+        return (low << 32U) + (high << 1U) + (local_priority > remote_priority ? 1U : 0U);
+    }
+
+    /// @brief 查某个远端地址在远端候选列表里的优先级；未知返回 0。
+    std::uint32_t RemotePriorityOf(const std::vector<Candidate>& remote,
+                                   const Endpoint& endpoint) const {
+        for (const Candidate& candidate : remote) {
+            if (candidate.endpoint == endpoint) {
+                return candidate.priority;
+            }
+        }
+        return 0;
+    }
+
+    /**
+     * @brief 注册「本地候选 × 远端直连候选」候选对，并决定热切换是否参与收发路径。
+     *
+     * @param direct_targets [in] 远端非 relay 候选地址（调用方已按优先级排序）。
+     * @param remote         [in] 远端候选全集，用来查组合优先级。
+     *
+     * ## 定位
+     * 候选对是热切换的唯一数据来源：漏注册会让最优路径永远没资格被选中，
+     * 多注册只会多几个探测包。`m_ice_active` 只在这里置位，一旦为 true 就
+     * 固定不变，收发热路径用一次原子读做门控。
+     *
+     * ## 步骤
+     * step1. 清空上一轮候选对（重复 Connect 不残留）；
+     * step2. 取本地候选快照；没有本地候选（纯中继/未 gather）直接返回；
+     * step3. 每个远端直连候选注册一条（本地候选取优先级最高的那条，因为
+     *    同一 socket 下「不同本地候选 + 同一远端」是同一物理路径）；
+     *    relay 本地候选跳过：它的 local 是 TURN 映射地址，本端 socket 没绑定；
+     * step4. 只有 >= 2 对才启用：单对没有可切换目标，保持旧路径零额外开销。
+     *
+     * ## 并发/失败语义
+     * - 调用约束：只在 Connect 线程调用；与 GatherCandidates 不并发。
+     * - 原子性：`m_ice_active` 是 release store，读侧 relaxed 即可（只需要
+     *   「看到 true 时候选对已经注册完」这一个方向）。
+     * - 失败语义：`AddPair` 失败（重复/超上限）被忽略；注册数为 1 时清空并
+     *   关闭功能，不留半套状态。
+     */
+    void RegisterCandidatePairs(const std::vector<Endpoint>& direct_targets,
+                                const std::vector<Candidate>& remote) {
+        // step1: 幂等：每次 Connect 都从零开始注册。
+        m_ice.Clear();
+        m_ice_active.store(false, std::memory_order_relaxed);
+        if (!m_config.ice_switchover.enabled) {
+            return;
+        }
+        // step2: 本地候选快照（持锁拷贝，之后不再碰 m_local_candidates）。
+        std::vector<Candidate> locals;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            locals = m_local_candidates;
+        }
+        if (locals.empty() || direct_targets.empty()) {
+            return;
+        }
+        // step3: 组合注册。**按远端去重**：本模块所有本地候选共享同一个
+        // socket（`SendTo` 的源地址由内核路由决定，候选里的本地端点只是标称），
+        // 因此「同一远端 + 不同本地候选」在物理上是同一条路径。若逐对注册，
+        // 切换会选中 remote 相同、仅 local 不同的那条——`peer` 根本没变，
+        // 表现为「代数涨了但地址没变」的假切换。这里每个远端只保留本地
+        // 优先级最高的那条，与「候选对 = 一条实际路径」的语义对齐。
+        for (const Endpoint& target : direct_targets) {
+            const Candidate* best_local = nullptr;
+            for (const Candidate& local : locals) {
+                if (local.type == CandidateType::kRelay) {
+                    continue;
+                }
+                if (best_local == nullptr || local.priority > best_local->priority) {
+                    best_local = &local;
+                }
+            }
+            if (best_local == nullptr) {
+                continue;
+            }
+            const std::uint32_t remote_priority = RemotePriorityOf(remote, target);
+            (void)m_ice.AddPair(best_local->endpoint, target,
+                                PairPriority(best_local->priority, remote_priority));
+        }
+        // step4: 单对场景关闭功能，行为与未引入热切换时逐字节一致。
+        const bool active = m_ice.size() >= 2U;
+        if (!active) {
+            m_ice.Clear();
+            return;
+        }
+        m_ice_active.store(true, std::memory_order_release);
+    }
+
+    /**
+     * @brief 周期性向候选对发 STUN Binding Request，刷新 writable/receiving。
+     *
+     * @param now_ns [in] 当前 steady_clock 纳秒时间戳（调用方已取时钟）。
+     *
+     * ## 定位
+     * 「当前对已死」「备用对可用」两个判断都依赖持续探测；不探测就只能等上层
+     * 发现断流再重连，等于没有迁移能力。探测包同时兼任 NAT 映射保活。
+     *
+     * ## 步骤
+     * step1. 门控在调用方（`m_ice_active`，候选对 < 2 时为 false）：单对场景
+     *    连这个函数都不会被调用，由既有 keepalive 负责保活；
+     * step2. 由 controller 决定这一轮探测谁（失败对按 backoff 降频）；
+     * step3. 逐目标发检查；只有真正发出去了才记 `OnCheckSent`，发送失败下一轮重试。
+     */
+    void MaybeSendIceProbes(std::int64_t now_ns) {
+        const std::vector<Endpoint> targets = m_ice.DueProbeTargets(now_ns);
+        for (const Endpoint& target : targets) {
+            std::array<std::uint8_t, 64> wire{};
+            std::array<std::uint8_t, kStunTransactionIdSize> transaction_id{};
+            const std::size_t wire_size =
+                BuildBindingRequestWire(wire.data(), wire.size(), &transaction_id);
+            if (wire_size == 0 || !SendDirect(target, wire.data(), wire_size)) {
+                continue;
+            }
+            m_ice.OnCheckSent(target, now_ns);
+            Bump(m_stats.ice_probes_sent);
+        }
+    }
+
+    /**
+     * @brief 评估并执行候选对热切换（只换 peer，不重建连接）。
+     *
+     * @param now_ns [in] 当前 steady_clock 纳秒时间戳。
+     *
+     * @return
+     * - true：选定对已变且 `peer` 已更新——调用方**必须**重新读 `PeerEndpoint()`，
+     *   不要缓存旧快照里的地址；
+     * - false：没换（含冷却期阻塞）——调用方**不要**做任何补救动作。
+     *
+     * ## 定位
+     * 「网络切换不重连」的唯一提交点。这里若顺手改了 `P2PState` 或重置序列号，
+     * 上层会把迁移误判成断线重连（mux 重建、WS 重握手），功能等于白做。
+     *
+     * ## 步骤
+     * step1. 只有直连态参与（中继/失败/关闭态一律不评估）；
+     * step2. 交给 controller 判定并拿事件（防抖已在 controller 内完成）；
+     * step3. 真正切换时只发布「同状态 + 新 peer」的快照；
+     * step4. 收包/保活计时重置到 now，新路径从零开始计；
+     * step5. 代数与统计更新，序列号**不**重置（否则对端看到假缺口）。
+     *
+     * ## 并发/失败语义
+     * - 调用约束：Recv 线程或显式 `EvaluateIceSwitchover()` 调用；与 Send 并发
+     *   安全（peer 通过不可变原子快照发布）。
+     * - 原子性：controller 先改选定对，这里随后发布 peer；两步之间 Send 仍用旧
+     *   peer，最多丢一两个包——这正是正常迁移语义。
+     * - 不变量：返回 true 后 `PeerEndpoint() == event.to` 且 `state()` 仍是 kConnected。
+     */
+    bool EvaluateSwitchover(std::int64_t now_ns) {
+        // step1: 只对直连态生效。
+        if (CurrentSnapshot().state != P2PState::kConnected) {
+            return false;
+        }
+        // step2: controller 的决策已含 receiving 宽限期与切换冷却期。
+        const IceSwitchEvent event = m_ice.Evaluate(now_ns);
+        if (event.decision != IceSwitchDecision::kSwitch &&
+            event.decision != IceSwitchDecision::kSwitchBack) {
+            return false;
+        }
+        if (!event.to.valid()) {
+            return false;
+        }
+        // step3: 状态保持 kConnected —— 这就是「上层流不变」的实现点。
+        PublishStateIfOpen(P2PState::kConnected, event.to);
+        // step4: 新路径的计时从 now 起算。
+        m_last_receive_ns.store(now_ns, std::memory_order_relaxed);
+        m_last_keepalive_ns.store(now_ns, std::memory_order_relaxed);
+        m_has_pending_keepalive.store(false, std::memory_order_relaxed);
+        // step5: 代数与统计（不碰 m_last_data_sequence）。
+        m_ice_generation.store(event.generation, std::memory_order_relaxed);
+        Bump(m_stats.ice_pair_switches);
+        return true;
+    }
+
+    /**
+     * @brief 业务包来源校验：只接受「选定对」或「已确认可写的备用对」。
+     *
+     * @param source [in] 收到的数据报源地址。
+     * @param now_ns [in] 当前时间戳；<=0 表示调用方没取时钟（冷路径自己取）。
+     *
+     * @return true 允许递交给上层；false 丢弃（由调用方计入 dropped_packets）。
+     *
+     * ## 定位
+     * 防注入的第二道闸：候选对来自信令交换，第三方地址不在集合里。放宽成
+     * 「任意已注册对」会让从未验证过的地址注入业务数据；收紧成「只有选定对」
+     * 则对端切换后本端会持续丢包（双方收敛慢一个探测周期）。
+     *
+     * ## 步骤
+     * step1. 命中当前选定 peer 直接通过（热路径：无锁、无时钟）；
+     * step2. 热切换未启用时一律拒绝（与旧行为一致）；
+     * step3. 备用对只认 writable，并顺手刷新它的 receiving 时刻。
+     *
+     * ## 并发/失败语义
+     * - 调用约束：Recv 线程；与 Send 并发安全。
+     * - 不变量：不会把任何未注册/不可写的源判为合法。
+     */
+    bool AcceptSource(const Endpoint& source, std::int64_t now_ns) {
+        // step1: 快路径。
+        if (source == CurrentSnapshot().peer) {
+            return true;
+        }
+        // step2: 功能关闭时行为与旧版本一致（只有 peer）。
+        if (!m_ice_active.load(std::memory_order_relaxed)) {
+            return false;
+        }
+        // step3: 备用对必须已通过检查证明可写。
+        if (!m_ice.IsWritable(source)) {
+            return false;
+        }
+        const std::int64_t stamp = now_ns > 0 ? now_ns : NowNanos();
+        m_ice.OnPacketReceived(source, stamp);
+        return true;
     }
 
     void TouchPeer(std::int64_t now_ns) noexcept {
@@ -874,19 +1145,54 @@ private:
         return source == CurrentSnapshot().peer;
     }
 
+    /**
+     * @brief 处理数据面里混入的 STUN Binding 包（连接建立后的检查/响应）。
+     *
+     * @param data   [in] 收到的数据报首地址；长度不足时内部直接返回。
+     * @param length [in] 数据报字节数。
+     * @param source [in] 数据报源端点（已由 `Endpoint::FromSockaddr` 归一化）。
+     * @param relayed [in] 是否走中继接收；中继路径回包也必须走中继。
+     * @param now_ns [in] 当前 steady_clock 纳秒时间戳；<=0 表示调用方没取时钟。
+     *
+     * ## 定位
+     * 这是「对端探测 → 本端确认该对可写」的唯一入口。放宽成任意源会让第三方
+     * 一个伪造源地址就注入/反射（历史上出过 peer 劫持回归，见
+     * `tests/p2p/test_p2p_peer_validation.cpp`）；收紧成只有选定 peer 则对端切换
+     * 后本端永远发现不了新路径。
+     *
+     * ## 步骤
+     * step1. 视图解析（0 分配）；不是 Binding 直接丢弃；
+     * step2. Request：只接受选定 peer 或已注册候选对；后者回 Success 即证明
+     *        双向可达，把它标记为可写；
+     * step3. Success Response：来自已注册对时刷新其 writable/receiving。
+     *
+     * ## 并发/失败语义
+     * - 调用约束：只在 Recv 线程调用；`m_ice` 内部加锁，与
+     *   `CandidatePairs()` 的并发读安全。
+     * - 失败语义：解析失败/类别不认识一律静默丢弃（不抛、不写 error）——
+     *   数据面被任意包刷错误串会让 LastError 失去诊断价值。
+     * - 不变量：返回后不会有任何未经验证的源被登记进候选对。
+     */
     void HandleStun(const std::uint8_t* data, std::size_t length, const Endpoint& source,
-                    bool relayed) {
-        // 数据面里混入的 STUN 包：视图解析（0 分配）+ 栈上直接写 Success 回包，
-        // 不再构造 StunMessage / vector 属性（旧实现每包 10+ 次分配）。
+                    bool relayed, std::int64_t now_ns) {
+        // step1: 视图解析（0 分配）+ 栈上直接写 Success 回包，不构造
+        // StunMessage / vector 属性（旧实现每包 10+ 次分配）。
         const auto message = ParseStunMessageView(data, length);
         if (!message.has_value() || message->method() != kStunMethodBinding) {
             return;
         }
+        const bool ice_active = m_ice_active.load(std::memory_order_relaxed);
         if (message->klass() == StunClass::kRequest) {
-            // 连接后只回应已确认 peer 的检查；任意源都能触发回包会变成
-            // UDP 反射/探测点。
+            // step2: 连接后只回应「已确认的 peer」或「已注册的候选对」；任意源
+            // 都能触发回包会变成 UDP 反射/探测点。
             if (!SourceMatchesPeer(source)) {
-                return;
+                if (!ice_active || !m_ice.IsKnownPair(source)) {
+                    return;
+                }
+                // 对端主动探测到这条备用路径：收到请求即证明它可达，回 Success
+                // 之后该对就是可写的（ICE 的 consent 语义），双方各自收敛。
+                const std::int64_t stamp = now_ns > 0 ? now_ns : NowNanos();
+                m_ice.OnCheckSucceeded(source, stamp, 0.0);
             }
             // 连接后收到对端重传的检查包：回一个 Success，避免对端超时重试。
             std::array<std::uint8_t, 128> wire{};
@@ -900,8 +1206,15 @@ private:
             }
             return;
         }
+        // step3: Success Response 是「该对可写」的证据。本端只向已注册对发过
+        // 检查，凭空出现的 Success 不可能来自第三方（它得先看到请求），
+        // 因此不必再校验 transaction id。
         if (message->klass() == StunClass::kSuccessResponse) {
             Bump(m_stats.connectivity_checks_received);
+            if (ice_active) {
+                const std::int64_t stamp = now_ns > 0 ? now_ns : NowNanos();
+                m_ice.OnCheckSucceeded(source, stamp, 0.0);
+            }
         }
     }
 
@@ -1122,22 +1435,64 @@ private:
         return true;
     }
 
-    /// @brief 连接成功：发布新快照并重置时间戳/序列基线。
+    /**
+     * @brief 连接成功：发布新快照、重置时间戳/序列基线，并登记热切换的选定对。
+     *
+     * @param peer    [in] 选定的对端端点（直连为对端候选地址，中继为中继出口地址）。
+     * @param relayed [in] 是否走中继；中继路径不参与候选对热切换。
+     *
+     * ## 定位
+     * 唯一的「连接成功提交点」。会话 ID 在这里生成，热切换时**不会**重新生成——
+     * 它是「上层流未重建」的可观测证据；若在换 peer 时也生成，mux/WS 会把迁移
+     * 误判为新连接并重建流，功能就白做了。
+     *
+     * ## 步骤
+     * step1. 首次连接生成会话 ID，发布状态快照；
+     * step2. 重置收包/keepalive/序列基线，避免沿用旧路径的陈旧时间戳；
+     * step3. 直连时把该对登记为候选对里的选定对（中继不登记）。
+     *
+     * ## 并发/失败语义
+     * - 调用约束：Connect 线程调用；状态先发布再做登记，读路径无锁。
+     * - 失败语义：`Select()` 失败（地址不在候选对里）不报错，controller 保持
+     *   「无选定对」，`Evaluate()` 恒返回 kNone —— 自动退化为不做切换。
+     * - 不变量：返回后 state 是 kConnected 或 kRelayed，且（直连时）
+     *   `SessionId() != 0`。
+     */
     void Establish(const Endpoint& peer, bool relayed) {
         const std::int64_t now_ns = NowNanos();
+        // step1: 会话 ID 只在首次连接时生成；热切换绝不改写它。
+        if (m_session_id.load(std::memory_order_relaxed) == 0) {
+            m_session_id.store(NextSessionId(), std::memory_order_relaxed);
+        }
         PublishStateIfOpen(relayed ? P2PState::kRelayed : P2PState::kConnected, peer);
+        // step2: 新路径从「现在」起算，旧路径的收包时刻不能当本路径的证据。
         m_last_receive_ns.store(now_ns, std::memory_order_relaxed);
         m_last_keepalive_ns.store(now_ns, std::memory_order_relaxed);
         m_has_pending_keepalive.store(false, std::memory_order_relaxed);
         m_last_data_sequence.store(0, std::memory_order_relaxed);
+        // step3: 只有直连有候选对；中继的 peer 是 TURN 出口，不参与切换。
+        if (!relayed && m_ice_active.load(std::memory_order_relaxed)) {
+            (void)m_ice.Select(peer, now_ns);
+        }
         std::lock_guard<std::mutex> lock(m_mutex);
         m_error.clear();
     }
 
     P2PConfig m_config;
-    /// keepalive / peer_timeout 都关闭时，Recv 循环不必每轮取 steady_clock。
+    /// keepalive / peer_timeout / 候选对探测都关闭时，Recv 循环不必每轮取
+    /// steady_clock（数据快路径上一次 vDSO 也要 ~15ns，每包都取很可观）。
     const bool m_track_activity = m_config.keepalive_interval.count() > 0 ||
                                   m_config.peer_timeout.count() > 0;
+    /// 是否需要在 Recv 循环里取时钟：候选对探测也依赖时间推进。
+    const bool m_need_clock = m_track_activity || m_config.ice_switchover.enabled;
+    /// 候选对热切换决策器；候选对注册后只由 Recv 线程驱动。
+    IcePairController m_ice;
+    /// 是否让候选对参与收发路径（>=2 个直连对才为 true，注册后不再改变）。
+    std::atomic<bool> m_ice_active{false};
+    /// 连接会话 ID：热切换保持不变，只有新建通道才会变。
+    std::atomic<std::uint64_t> m_session_id{0};
+    /// 最近一次热切换后的代数（供上层观测「切过但没重建」）。
+    std::atomic<std::uint64_t> m_ice_generation{0};
     std::shared_ptr<DatagramTransport> m_transport;
     /// 保护 error / 候选集合 / 快照历史；收发热路径不再使用它。
     mutable std::mutex m_mutex;
@@ -1166,6 +1521,8 @@ private:
         std::atomic<std::uint32_t> sequence_gaps{0};
         std::atomic<double> rtt_ms{0.0};
         std::atomic<double> rtt_avg_ms{0.0};
+        std::atomic<std::uint64_t> ice_probes_sent{0};
+        std::atomic<std::uint64_t> ice_pair_switches{0};
     };
     AtomicStats m_stats;
     /// steady_clock 纳秒时间戳（原子：收包线程写、任意线程读）。
@@ -1248,6 +1605,26 @@ P2PStats P2PChannel::Stats() const {
 
 std::string P2PChannel::LastError() const {
     return m_impl->LastError();
+}
+
+std::uint64_t P2PChannel::SessionId() const {
+    return m_impl->SessionId();
+}
+
+Endpoint P2PChannel::SelectedPairRemote() const {
+    return m_impl->SelectedPairRemote();
+}
+
+std::vector<IcePairSnapshot> P2PChannel::CandidatePairs() const {
+    return m_impl->CandidatePairs();
+}
+
+bool P2PChannel::EvaluateIceSwitchover() {
+    return m_impl->EvaluateIceSwitchover();
+}
+
+std::uint64_t P2PChannel::SwitchGeneration() const {
+    return m_impl->SwitchGeneration();
 }
 
 void P2PChannel::Close() {

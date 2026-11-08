@@ -36,6 +36,15 @@
  *          单包上限 `kP2PMaxPayload`（1200 字节，避免 IP 分片）；更大的消息
  *          需要上层自行分片（例如复用 Bento 的可靠层）。
  *
+ *          **连接迁移（热切换）**：连接建立后所有「本地候选 × 远端候选」被注册成
+ *          候选对（`IcePairController`）；`Recv()` 会周期性向它们发 STUN
+ *          检查刷新 `writable`/`receiving`，当当前选定对超过
+ *          `ice_switchover.no_receive_timeout` 没有收到任何包时，切到优先级
+ *          最高的可写对——**只换 `peer` 地址，不改状态、不重建传输、
+ *          `SessionId()` 不变**。默认不回切（避免抖动），可通过
+ *          `ice_switchover.allow_switch_back` 打开。完整契约见
+ *          `docs/modules/ice-switchover.md`。
+ *
  *          **弱网**：没有重传/拥塞控制/FEC，只提供 keepalive（保活 NAT 映射 +
  *          RTT 测量）、序列号缺口统计与对端静默超时。可靠传输应由上层负责。
  *
@@ -53,6 +62,7 @@
 
 #include "go2cpp/p2p/candidate.hpp"
 #include "go2cpp/p2p/endpoint.hpp"
+#include "go2cpp/p2p/ice_pair.hpp"
 #include "go2cpp/p2p/signaling.hpp"
 #include "go2cpp/p2p/transport.hpp"
 
@@ -91,6 +101,10 @@ struct P2PStats {
     std::uint32_t sequence_gaps = 0;  ///< 数据序列号缺口累计（近似丢包）。
     double rtt_ms = 0.0;              ///< 最近一次 keepalive 往返。
     double rtt_avg_ms = 0.0;          ///< keepalive RTT 滑动平均。
+    /// 候选对主动探测（STUN 检查）发送数；单对连接恒为 0。
+    std::uint64_t ice_probes_sent = 0;
+    /// 候选对热切换次数（含回切）；每次真正更换选定对 +1。
+    std::uint64_t ice_pair_switches = 0;
 };
 
 struct P2PConfig {
@@ -130,6 +144,12 @@ struct P2PConfig {
     std::size_t receive_buffer_bytes = 4U << 20U;
     /// 最多保留的本地候选数。
     std::size_t max_local_candidates = 16;
+    /**
+     * @brief 候选对热切换（连接迁移）配置。
+     * @details 关闭时不会注册候选对、不发探测包，`Recv()` 里也不走
+     *          「备用对是否可写」的判定，行为与未引入该功能的版本一致。
+     */
+    IceSwitchoverConfig ice_switchover;
 };
 
 /**
@@ -204,6 +224,31 @@ public:
 
     /// 最近一次失败原因。
     std::string LastError() const;
+
+    /**
+     * @brief 连接会话 ID。
+     * @details **热切换不改变它**，只有重建 `P2PChannel` 才会变。上层（mux/
+     *          WebSocket/RPC 流）用它确认「还是同一条连接」：候选对切换只换
+     *          底层传输，会话 ID 必须保持。未连接时返回 0。
+     */
+    std::uint64_t SessionId() const;
+
+    /// 当前选定候选对的远端端点；未连接或走中继时返回无效端点。
+    Endpoint SelectedPairRemote() const;
+
+    /// 候选对快照（含 `writable`/`receiving` 的当前判定），按优先级降序。
+    std::vector<IcePairSnapshot> CandidatePairs() const;
+
+    /**
+     * @brief 手动驱动一次热切换评估。
+     * @return 本次是否真的换了选定对（切换或回切）。
+     * @note 正常情况下由 `Recv()` 内部驱动；导出它是给「长时间无收发但仍需
+     *       及时迁移」的事件循环，以及单元测试使用。
+     */
+    bool EvaluateIceSwitchover();
+
+    /// 热切换代数（每次真正切换 +1；未启用或未连接恒为 0）。
+    std::uint64_t SwitchGeneration() const;
 
     /// 关闭通道（释放中继 allocation）；可重复调用。
     void Close();

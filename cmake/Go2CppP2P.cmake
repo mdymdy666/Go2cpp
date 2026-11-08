@@ -28,6 +28,8 @@ if (GO2CPP_WITH_P2P)
         # ICE 候选与信令
         ${CMAKE_CURRENT_SOURCE_DIR}/src/p2p/candidate.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/p2p/signaling.cpp
+        # 候选对（pair）状态与热切换（连接迁移）
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/p2p/ice_pair.cpp
         # 简化 TURN（自定义中继协议 + Allocation/Send/Data 数据面）
         ${CMAKE_CURRENT_SOURCE_DIR}/src/p2p/relay_protocol.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/p2p/turn_server.cpp
@@ -66,9 +68,12 @@ if (GO2CPP_WITH_P2P)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/p2p/test_p2p_interprocess.cpp)
         add_executable(p2p_test_peer_validation
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/p2p/test_p2p_peer_validation.cpp)
+        add_executable(p2p_test_ice_switchover
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/p2p/test_ice_switchover.cpp)
         foreach(p2p_test IN ITEMS
                 p2p_test_stun p2p_test_p2p p2p_test_tcp_punch
-                p2p_test_p2p_interprocess p2p_test_peer_validation)
+                p2p_test_p2p_interprocess p2p_test_peer_validation
+                p2p_test_ice_switchover)
             target_link_libraries(${p2p_test} PRIVATE go2cpp_p2p)
             target_include_directories(${p2p_test} PRIVATE
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/p2p)
